@@ -32,9 +32,6 @@ pub enum UwfError {
     #[cfg(windows)]
     #[error("WMI 错误: {0}")]
     Wmi(Box<wmi::WMIError>),
-
-    #[error("{0}")]
-    Other(String),
 }
 
 #[cfg(windows)]

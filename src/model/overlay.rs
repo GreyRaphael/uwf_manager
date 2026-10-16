@@ -8,8 +8,8 @@ pub enum OverlayType {
 }
 
 impl OverlayType {
-    // as_u32/from_u32 由阶段 2 设置弹窗与阶段 3 WMI 映射使用，届时移除该 allow
-    #[allow(dead_code)]
+    // WMI 类型码互转仅 Windows 后端使用
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn as_u32(self) -> u32 {
         match self {
             OverlayType::Ram => 0,
@@ -17,7 +17,7 @@ impl OverlayType {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_u32(value: u32) -> Self {
         match value {
             0 => OverlayType::Ram,

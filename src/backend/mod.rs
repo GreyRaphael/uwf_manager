@@ -5,6 +5,8 @@
 //! 自动跟随一次全量刷新（先刷新后 OpOk，日志末条保留动作文案）。
 
 mod mock;
+#[cfg(windows)]
+mod windows;
 
 pub use mock::MockUwfBackend;
 
@@ -18,7 +20,9 @@ use crate::model::*;
 /// UWF 后端接口（PLAN v2 §6.1）。业务规则 R1-R6 见各方法注释。
 ///
 /// 全部方法 `&mut self`：Mock 需要可变状态，WMI 实现内部无状态。
-pub trait UwfBackend: Send + 'static {
+/// 注意**不要求 `Send`**：`WMIConnection` 为 `!Send`（COM 套间约束，
+/// PLAN D4），后端实例由工厂在后端线程内构造，Box 永不跨线程。
+pub trait UwfBackend: 'static {
     // ── Filter（单实例，无会话分裂）──
     fn get_filter_state(&mut self) -> Result<FilterState>;
     /// 下次启动生效（R1 同）
@@ -130,31 +134,45 @@ pub enum BackendEvent {
 }
 
 /// 后端来源标识（标题栏徽标）
-// `Windows` 变体在阶段 3 接入 WMI 后端后移除该 allow
-#[allow(dead_code)]
+// Windows 变体仅 Windows 构建构造；Linux 下视为保留变体
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Windows,
     Mock,
 }
 
-/// 创建平台后端。
+/// 后端工厂：在后端线程内构造后端实例。
 ///
-/// 阶段 1-2：全平台返回 Mock；阶段 3 接入后，Windows 且未指定 `--mock`
-/// 时返回 `WindowsWmiBackend`。
-pub fn create_backend(force_mock: bool) -> (Box<dyn UwfBackend>, BackendKind) {
+/// 工厂本身可安全跨线程（`Send`），但产出的 `Box<dyn UwfBackend>` 不可——
+/// WMI 连接必须在使用它的线程内创建（COM 套间）。
+pub type BackendFactory = Box<dyn FnOnce() -> Box<dyn UwfBackend> + Send>;
+
+/// 创建平台后端工厂：Windows 且未指定 `--mock` 时用 WMI 后端，其余一律 Mock。
+pub fn create_backend_factory(force_mock: bool) -> (BackendFactory, BackendKind) {
+    #[cfg(windows)]
+    if !force_mock {
+        return (
+            Box::new(|| Box::new(self::windows::WindowsWmiBackend::new())),
+            BackendKind::Windows,
+        );
+    }
     let _ = force_mock;
-    (Box::new(MockUwfBackend::demo()), BackendKind::Mock)
+    (
+        Box::new(|| Box::new(MockUwfBackend::demo())),
+        BackendKind::Mock,
+    )
 }
 
-/// 启动后端线程（actor）：独占 backend，顺序执行命令，`Quit` 退出。
+/// 启动后端线程（actor）：工厂在本线程内构造 backend（WMI 连接随之在
+/// 本线程建立），顺序执行命令，`Quit` 退出。
 pub fn spawn_backend_thread(
-    backend: Box<dyn UwfBackend>,
+    factory: BackendFactory,
     rx: Receiver<BackendCmd>,
     tx: Sender<BackendEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut backend = backend;
+        let mut backend = factory();
         while let Ok(cmd) = rx.recv() {
             if matches!(cmd, BackendCmd::Quit) {
                 break;
