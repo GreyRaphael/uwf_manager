@@ -1,5 +1,6 @@
 //! Ratatui 界面层：布局主框架与各视图。
 
+pub mod components;
 pub mod text;
 mod theme;
 mod views;
@@ -9,7 +10,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::App;
+use crate::app::{App, Tab};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -30,13 +31,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     views::render_tabs(frame, app, tabs_area);
     match app.tab {
-        crate::app::Tab::Dashboard => views::dashboard::render(frame, app, body_area),
-        crate::app::Tab::Volumes => views::volumes::render(frame, app, body_area),
-        crate::app::Tab::Exclusions => views::exclusions::render(frame, app, body_area),
-        crate::app::Tab::Commit => views::commit::render(frame, app, body_area),
+        Tab::Dashboard => views::dashboard::render(frame, app, body_area),
+        Tab::Volumes => views::volumes::render(frame, app, body_area),
+        Tab::Exclusions => views::exclusions::render(frame, app, body_area),
+        Tab::Commit => views::commit::render(frame, app, body_area),
     }
     render_log(frame, app, log_area);
     render_hotkeys(frame, hotkey_area);
+
+    // 模态浮层最后渲染（置于所有视图之上）
+    if let Some(modal) = &app.modal {
+        components::render_modal(frame, modal, area);
+    }
 }
 
 /// 底部操作日志（最近一条）

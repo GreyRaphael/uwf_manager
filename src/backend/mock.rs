@@ -64,8 +64,6 @@ impl MockUwfBackend {
             .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))
     }
 
-    // 阶段 2 提交/排除命令接线后经 trait 调用，届时移除该 allow
-    #[allow(dead_code)]
     fn known_volume(&self, drive_letter: &str) -> Result<()> {
         let upper = drive_letter.to_ascii_uppercase();
         if self.volumes.iter().any(|v| v.letter == upper) {

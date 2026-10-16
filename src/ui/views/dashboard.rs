@@ -35,7 +35,10 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled("[E] 启用   [D] 禁用", theme::dim()),
+                Span::styled(
+                    "[E] 启用  [D] 禁用  [R] 重置配置  [S] Overlay 配置  [F10] 重启  [F11] 关机",
+                    theme::dim(),
+                ),
                 Span::styled(
                     if app.pending { "   ⏳ 执行中…" } else { "" },
                     theme::warn(),

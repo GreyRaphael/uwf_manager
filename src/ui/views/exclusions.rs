@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let files = List::new(file_items)
         .block(
             Block::bordered()
-                .title(format!("[文件排除项] 视图: {session_label}"))
+                .title(format!("[文件排除项] {session_label}  [A] 添加 [I] 导入 [X] 导出"))
                 .border_style(theme::focus_border(files_focused)),
         )
         .highlight_style(theme::selected())
@@ -35,7 +35,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let registry = List::new(registry_items)
         .block(
             Block::bordered()
-                .title("[注册表排除项]  [S] 切换当前/下次".to_string())
+                .title("[注册表排除项]  [R] 添加 [D] 删除  [S] 视图".to_string())
                 .border_style(theme::focus_border(registry_focused)),
         )
         .highlight_style(theme::selected())

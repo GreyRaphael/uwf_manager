@@ -1,6 +1,7 @@
-//! 主应用状态机：事件循环、按键路由、后端回包应用。
+//! 主应用状态机：事件循环、按键路由、模态管理、后端回包应用。
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,12 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendKind, FullSnapshot};
 use crate::model::OverlayRuntime;
-use crate::ui;
+use crate::ui::components::confirm::{ConfirmAction, ConfirmOutcome, ConfirmState};
+use crate::ui::components::file_picker::{
+    FilePickerState, PickerAction, PickerMode, PickerOutcome,
+};
+use crate::ui::components::input_dialog::{InputAction, InputOutcome, InputState};
+use crate::ui::components::overlay_settings::{OverlayOutcome, OverlaySettingsState};
 
 /// Overlay 轮询周期（与原版 MainForm 的 2 秒后台线程一致）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
@@ -62,6 +68,22 @@ pub enum ExclusionFocus {
     Registry,
 }
 
+/// 当前打开的模态弹窗
+pub enum Modal {
+    OverlaySettings(OverlaySettingsState),
+    Input(InputState),
+    FilePicker(FilePickerState),
+    Confirm(ConfirmState),
+    Help,
+}
+
+/// 已确认、等待后端回包的电源动作（决定回包后是退出还是继续演示）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerAction {
+    Restart,
+    Shutdown,
+}
+
 #[derive(Debug)]
 pub struct StatusEntry {
     pub time: String,
@@ -86,6 +108,8 @@ pub struct App {
     pub log: VecDeque<StatusEntry>,
     /// 有变更类命令在途（此时忽略后续变更键，显示 ⏳）
     pub pending: bool,
+    pub modal: Option<Modal>,
+    power_action_pending: Option<PowerAction>,
     last_overlay_tick: Instant,
     cmd_tx: Sender<BackendCmd>,
     evt_rx: Receiver<BackendEvent>,
@@ -117,6 +141,8 @@ impl App {
             registry_exclusion_state,
             log: VecDeque::new(),
             pending: true, // 启动即有一次 RefreshAll 在途
+            modal: None,
+            power_action_pending: None,
             last_overlay_tick: Instant::now(),
             cmd_tx,
             evt_rx,
@@ -138,13 +164,23 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         while !self.should_quit {
             self.drain_backend_events();
-            terminal.draw(|frame| ui::render(frame, self))?;
+            terminal.draw(|frame| crate::ui::render(frame, self))?;
 
-            let timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
+            // 变更在途时缩短 poll 超时（50ms），使 OpOk/OpErr 反馈即时上屏；
+            // 否则按键处理完最多 2 秒（下个 tick）才可见结果
+            let tick_timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
+            let timeout = if self.pending {
+                tick_timeout.min(Duration::from_millis(50))
+            } else {
+                tick_timeout
+            };
             if event::poll(timeout).context("读取终端事件失败")?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
+                // 先 drain 后端回包再处理按键：避免唤醒 poll 的按键读到
+                // 尚未应用的旧快照（如启动后立即按 [S] 弹窗预填为空）
+                self.drain_backend_events();
                 self.on_key(key);
             }
 
@@ -179,9 +215,11 @@ impl App {
             BackendEvent::OpOk(msg) => {
                 self.pending = false;
                 self.log(true, &msg);
+                self.on_power_action_ok();
             }
             BackendEvent::OpErr(msg) => {
                 self.pending = false;
+                self.power_action_pending = None;
                 self.log(false, &msg);
             }
             BackendEvent::NotInstalled => {
@@ -189,6 +227,21 @@ impl App {
                 self.not_installed = true;
                 self.log(false, "UWF 功能未安装或未启用");
             }
+        }
+    }
+
+    /// 电源动作回包处理：真实系统（Windows）退出 TUI 让位重启/关机；
+    /// Mock 下重启不回真机——restart 后留在界面展示 next→current 的生效结果，
+    /// shutdown 则退出以模拟关机。
+    fn on_power_action_ok(&mut self) {
+        let Some(power) = self.power_action_pending.take() else {
+            return;
+        };
+        match (power, self.backend_kind) {
+            (PowerAction::Restart, BackendKind::Mock) => {
+                self.log(true, "（模拟）已重启：下次会话配置已生效");
+            }
+            _ => self.should_quit = true,
         }
     }
 
@@ -235,7 +288,13 @@ impl App {
             .and_then(|i| self.snapshot.volumes.get(i))
     }
 
+    // ── 按键路由 ──
+
     fn on_key(&mut self, key: KeyEvent) {
+        if self.modal.is_some() {
+            self.on_modal_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Tab => self.tab = self.tab.next(),
@@ -243,12 +302,13 @@ impl App {
             KeyCode::Char(c @ '1'..='4') => {
                 self.tab = Tab::from_index(c as usize - '1' as usize);
             }
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::F(5) => self.send(BackendCmd::RefreshAll),
             _ => match self.tab {
                 Tab::Dashboard => self.on_dashboard_key(key),
                 Tab::Volumes => self.on_volumes_key(key),
                 Tab::Exclusions => self.on_exclusions_key(key),
-                Tab::Commit => {}
+                Tab::Commit => self.on_commit_key(key),
             },
         }
     }
@@ -257,14 +317,46 @@ impl App {
         match key.code {
             KeyCode::Char('e') | KeyCode::Char('E') => self.send_mutation(BackendCmd::EnableFilter),
             KeyCode::Char('d') | KeyCode::Char('D') => self.send_mutation(BackendCmd::DisableFilter),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                    "重置配置确认",
+                    "将重置全部 UWF 配置（筛选器 / Overlay / 卷保护 / 排除项），\n下次重启后恢复默认值。确定继续？",
+                    ConfirmAction::ResetSettings,
+                )));
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.modal = Some(Modal::OverlaySettings(OverlaySettingsState::from_snapshot(
+                    &self.snapshot,
+                )));
+            }
+            KeyCode::F(10) => {
+                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                    "重启系统确认",
+                    "系统将立即重启，未保存的工作将丢失。\n确定继续？",
+                    ConfirmAction::Restart,
+                )));
+            }
+            KeyCode::F(11) => {
+                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                    "关机确认",
+                    "系统将立即关机，未保存的工作将丢失。\n确定继续？",
+                    ConfirmAction::Shutdown,
+                )));
+            }
             _ => {}
         }
     }
 
     fn on_volumes_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => move_selection(self.volumes_state.selected_mut(), self.snapshot.volumes.len(), -1),
-            KeyCode::Down => move_selection(self.volumes_state.selected_mut(), self.snapshot.volumes.len(), 1),
+            KeyCode::Up => {
+                let len = self.snapshot.volumes.len();
+                move_selection(self.volumes_state.selected_mut(), len, -1);
+            }
+            KeyCode::Down => {
+                let len = self.snapshot.volumes.len();
+                move_selection(self.volumes_state.selected_mut(), len, 1);
+            }
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 if let Some(drive) = self.selected_volume().map(|v| v.drive_letter.clone()) {
                     self.send_mutation(BackendCmd::Protect(drive));
@@ -304,8 +396,202 @@ impl App {
                 self.exclusion_session_current = !self.exclusion_session_current;
                 self.clamp_selections();
             }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.modal = Some(Modal::Input(InputState::new(
+                    "添加文件排除",
+                    "输入绝对路径（如 C:\\Windows\\Temp），或按 [F2] 打开文件选择器",
+                    InputAction::AddFileExclusion,
+                    true,
+                )));
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.modal = Some(Modal::Input(InputState::new(
+                    "添加注册表排除",
+                    "输入注册表键路径（如 HKLM\\SOFTWARE\\Example）",
+                    InputAction::AddRegistryExclusion,
+                    false,
+                )));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => self.delete_selected_exclusion(),
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                    PickerMode::File,
+                    PickerAction::ImportExclusions,
+                )));
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => self.export_exclusions(),
             _ => {}
         }
+    }
+
+    fn on_commit_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                    PickerMode::File,
+                    PickerAction::CommitFile,
+                )));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                    PickerMode::File,
+                    PickerAction::CommitFileDeletion,
+                )));
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.modal = Some(Modal::Input(InputState::new(
+                    "注册表提交",
+                    "输入注册表完整路径（如 HKLM\\SOFTWARE\\Example\\ValueName）",
+                    InputAction::CommitRegistry,
+                    false,
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    // ── 模态按键与结果执行 ──
+
+    fn on_modal_key(&mut self, key: KeyEvent) {
+        let Some(modal) = self.modal.take() else { return };
+        match modal {
+            Modal::Help => {
+                if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+                    self.modal = Some(Modal::Help);
+                }
+            }
+            Modal::Confirm(mut state) => match state.on_key(key) {
+                ConfirmOutcome::Stay => self.modal = Some(Modal::Confirm(state)),
+                ConfirmOutcome::Cancel => {}
+                ConfirmOutcome::Confirm(action) => self.execute_confirm(action),
+            },
+            Modal::Input(mut state) => match state.on_key(key) {
+                InputOutcome::Stay => self.modal = Some(Modal::Input(state)),
+                InputOutcome::Cancel => {}
+                InputOutcome::Submit(action, text) => self.execute_input(action, text),
+                InputOutcome::Browse(InputAction::AddFileExclusion) => {
+                    self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                        PickerMode::Any,
+                        PickerAction::AddFileExclusion,
+                    )));
+                }
+                InputOutcome::Browse(_) => {}
+            },
+            Modal::FilePicker(mut state) => match state.on_key(key) {
+                PickerOutcome::Stay => self.modal = Some(Modal::FilePicker(state)),
+                PickerOutcome::Cancel => {}
+                PickerOutcome::Pick(action, path) => self.execute_pick(action, path),
+            },
+            Modal::OverlaySettings(mut state) => match state.on_key(key) {
+                OverlayOutcome::Stay => self.modal = Some(Modal::OverlaySettings(state)),
+                OverlayOutcome::Cancel => {}
+                OverlayOutcome::Submit { overlay_type, max_mb, warning_mb, critical_mb } => {
+                    self.send_mutation(BackendCmd::SetOverlayConfig {
+                        overlay_type,
+                        max_mb,
+                        warning_mb,
+                        critical_mb,
+                    });
+                }
+            },
+        }
+    }
+
+    fn execute_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::ResetSettings => self.send_mutation(BackendCmd::ResetSettings),
+            ConfirmAction::Restart => {
+                self.power_action_pending = Some(PowerAction::Restart);
+                self.send_mutation(BackendCmd::RestartSystem);
+            }
+            ConfirmAction::Shutdown => {
+                self.power_action_pending = Some(PowerAction::Shutdown);
+                self.send_mutation(BackendCmd::ShutdownSystem);
+            }
+            ConfirmAction::CommitFileDeletion(path) => {
+                self.send_mutation(BackendCmd::CommitFileDeletion(
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+
+    fn execute_input(&mut self, action: InputAction, text: String) {
+        match action {
+            InputAction::AddFileExclusion => {
+                self.send_mutation(BackendCmd::AddFileExclusion(text));
+            }
+            InputAction::AddRegistryExclusion => {
+                self.send_mutation(BackendCmd::AddRegistryExclusion(text));
+            }
+            InputAction::CommitRegistry => {
+                self.send_mutation(BackendCmd::CommitRegistry(text));
+            }
+        }
+    }
+
+    fn execute_pick(&mut self, action: PickerAction, path: PathBuf) {
+        let path_str = path.to_string_lossy().into_owned();
+        match action {
+            PickerAction::CommitFile => self.send_mutation(BackendCmd::CommitFile(path_str)),
+            PickerAction::AddFileExclusion => {
+                self.send_mutation(BackendCmd::AddFileExclusion(path_str));
+            }
+            PickerAction::ImportExclusions => {
+                self.send_mutation(BackendCmd::ImportExclusions { path });
+            }
+            PickerAction::CommitFileDeletion => {
+                // R3：两步语义（先删文件再固化），必须确认
+                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                    "删除提交确认",
+                    format!(
+                        "将立即删除文件:\n{}\n并固化该删除（重启后依然生效）。确定继续？",
+                        path.display()
+                    ),
+                    ConfirmAction::CommitFileDeletion(path),
+                )));
+            }
+        }
+    }
+
+    fn delete_selected_exclusion(&mut self) {
+        match self.exclusion_focus {
+            ExclusionFocus::Files => {
+                let item = self
+                    .file_exclusion_state
+                    .selected()
+                    .and_then(|i| self.visible_file_exclusions().get(i))
+                    .map(|e| e.display());
+                if let Some(item) = item {
+                    self.send_mutation(BackendCmd::RemoveFileExclusion(item));
+                }
+            }
+            ExclusionFocus::Registry => {
+                let item = self
+                    .registry_exclusion_state
+                    .selected()
+                    .and_then(|i| self.visible_registry_exclusions().get(i))
+                    .cloned();
+                if let Some(item) = item {
+                    self.send_mutation(BackendCmd::RemoveRegistryExclusion(item));
+                }
+            }
+        }
+    }
+
+    /// 导出当前视图排除列表：文件名格式与原版一致
+    /// （EXCLUSIONLIST_yyyy_MM_dd_HH_mm_ss.txt，写入当前目录）
+    fn export_exclusions(&mut self) {
+        let filename = chrono::Local::now()
+            .format("EXCLUSIONLIST_%Y_%m_%d_%H_%M_%S.txt")
+            .to_string();
+        let path = std::env::current_dir()
+            .map(|dir| dir.join(&filename))
+            .unwrap_or_else(|_| PathBuf::from(&filename));
+        self.send_mutation(BackendCmd::ExportExclusions {
+            path,
+            current_session: self.exclusion_session_current,
+        });
     }
 }
 
