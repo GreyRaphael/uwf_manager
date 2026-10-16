@@ -1,0 +1,24 @@
+[package]
+name = "uwf_manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+crossterm = "0.29"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+wmi = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+embed-resource = "3"
