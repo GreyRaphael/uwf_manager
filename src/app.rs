@@ -612,3 +612,268 @@ fn move_selection(selected: &mut Option<usize>, len: usize, delta: isize) {
     let current = selected.unwrap_or(0) as isize;
     *selected = Some(((current + delta).rem_euclid(len)) as usize);
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::model::{FileExclusion, FilterState, OverlayConfig, OverlayType, VolumeInfo};
+
+    /// 与 `MockUwfBackend::demo()` 对齐的快照数据（供 app/ui 测试共用）
+    pub(crate) fn demo_snapshot() -> FullSnapshot {
+        FullSnapshot {
+            filter_state: Some(FilterState { current_enabled: true, next_enabled: true }),
+            overlay_config_current: Some(OverlayConfig {
+                current_session: true,
+                overlay_type: OverlayType::Ram,
+                max_size_mb: 2048,
+            }),
+            overlay_config_next: Some(OverlayConfig {
+                current_session: false,
+                overlay_type: OverlayType::Ram,
+                max_size_mb: 2048,
+            }),
+            overlay_runtime: Some(OverlayRuntime {
+                available_space_mb: 1536,
+                consumption_mb: 512,
+                warning_threshold_mb: 1536,
+                critical_threshold_mb: 1843,
+            }),
+            volumes: vec![
+                VolumeInfo {
+                    drive_letter: "C:".into(),
+                    current_protected: true,
+                    next_protected: true,
+                },
+                VolumeInfo {
+                    drive_letter: "D:".into(),
+                    current_protected: false,
+                    next_protected: false,
+                },
+            ],
+            file_exclusions_current: vec![],
+            file_exclusions_next: vec![FileExclusion::new(
+                "C:".into(),
+                "\\Windows\\Temp".into(),
+            )],
+            registry_exclusions_current: vec![],
+            registry_exclusions_next: vec!["HKLM\\SOFTWARE\\UwfManagerDemo".into()],
+        }
+    }
+
+    fn test_app(kind: BackendKind) -> (App, Receiver<BackendCmd>) {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (_evt_tx, evt_rx) = std::sync::mpsc::channel();
+        (App::new(cmd_tx, evt_rx, kind), cmd_rx)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, event::KeyModifiers::NONE)
+    }
+
+    /// 注入快照并清除启动 pending（等价于启动 RefreshAll 已回包）
+    fn ready_app(kind: BackendKind) -> (App, Receiver<BackendCmd>) {
+        let (mut app, cmd_rx) = test_app(kind);
+        app.apply_event(BackendEvent::Snapshot(Box::new(demo_snapshot())));
+        (app, cmd_rx)
+    }
+
+    #[test]
+    fn tab_navigation_wraps() {
+        assert_eq!(Tab::Dashboard.next(), Tab::Volumes);
+        assert_eq!(Tab::Commit.next(), Tab::Dashboard);
+        assert_eq!(Tab::Dashboard.prev(), Tab::Commit);
+        assert_eq!(Tab::from_index(5), Tab::Volumes); // 取模回绕
+    }
+
+    #[test]
+    fn selection_helpers_clamp_and_wrap() {
+        let mut sel = Some(5);
+        clamp(&mut sel, 3);
+        assert_eq!(sel, Some(2));
+        let mut sel = None;
+        clamp(&mut sel, 3);
+        assert_eq!(sel, Some(0));
+        let mut sel = Some(0);
+        clamp(&mut sel, 0);
+        assert_eq!(sel, None);
+        let mut sel = Some(0);
+        move_selection(&mut sel, 3, -1);
+        assert_eq!(sel, Some(2)); // 顶部上移回绕到底部
+        move_selection(&mut sel, 3, 1);
+        assert_eq!(sel, Some(0)); // 底部下移回绕到顶部
+        let mut sel = Some(0);
+        move_selection(&mut sel, 0, 1);
+        assert_eq!(sel, None); // 空列表无选中
+    }
+
+    #[test]
+    fn not_installed_event_shows_guide_and_snapshot_recovers() {
+        let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
+        assert!(app.pending); // 启动即 RefreshAll 在途
+        app.apply_event(BackendEvent::NotInstalled);
+        assert!(app.not_installed);
+        assert!(!app.pending);
+        assert!(app.log.back().is_some_and(|e| !e.ok));
+        // 重新检测成功（Snapshot）后自动恢复
+        app.apply_event(BackendEvent::Snapshot(Box::new(demo_snapshot())));
+        assert!(!app.not_installed);
+    }
+
+    #[test]
+    fn mutation_gated_while_pending() {
+        let (mut app, cmd_rx) = test_app(BackendKind::Mock);
+        // 启动 pending 期间变更键被忽略
+        app.on_dashboard_key(key(KeyCode::Char('e')));
+        assert!(cmd_rx.try_recv().is_err());
+
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.on_dashboard_key(key(KeyCode::Char('e')));
+        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::EnableFilter));
+        assert!(app.pending);
+        // 在途期间第二条变更被忽略（PLAN §6.5 单变更在途）
+        app.on_dashboard_key(key(KeyCode::Char('d')));
+        assert!(cmd_rx.try_recv().is_err());
+        // 回包解除 pending 后恢复可发
+        app.apply_event(BackendEvent::OpOk("ok".into()));
+        assert!(!app.pending);
+        app.on_dashboard_key(key(KeyCode::Char('d')));
+        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::DisableFilter));
+    }
+
+    #[test]
+    fn global_keys_tab_help_refresh_quit() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.tab, Tab::Volumes);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Exclusions);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Volumes);
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Some(Modal::Help)));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        app.on_key(key(KeyCode::F(5)));
+        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::RefreshAll));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn volumes_protect_selected_drive() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Volumes;
+        // 下移选中 D:（索引 1）
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('p')));
+        match cmd_rx.try_recv().unwrap() {
+            BackendCmd::Protect(drive) => assert_eq!(drive, "D:"),
+            other => panic!("期望 Protect，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exclusions_toggle_session_and_delete_selected() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Exclusions;
+        assert!(!app.exclusion_session_current); // 默认下次生效视图
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.exclusion_session_current);
+        app.on_key(key(KeyCode::Char('s')));
+
+        // 焦点文件栏，删除选中 → RemoveFileExclusion（display 形式绝对路径）
+        app.on_key(key(KeyCode::Char('d')));
+        match cmd_rx.try_recv().unwrap() {
+            BackendCmd::RemoveFileExclusion(path) => {
+                assert_eq!(path, "C:\\Windows\\Temp")
+            }
+            other => panic!("期望 RemoveFileExclusion，实际 {other:?}"),
+        }
+        app.pending = false;
+
+        // 切到注册表栏删除
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Char('d')));
+        match cmd_rx.try_recv().unwrap() {
+            BackendCmd::RemoveRegistryExclusion(key) => {
+                assert_eq!(key, "HKLM\\SOFTWARE\\UwfManagerDemo")
+            }
+            other => panic!("期望 RemoveRegistryExclusion，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restart_flow_mock_stays_windows_quits() {
+        // Mock：重启不回真机，留在界面展示 next→current 生效
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.on_key(key(KeyCode::F(10)));
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::RestartSystem));
+        app.apply_event(BackendEvent::OpOk("系统即将重启".into()));
+        assert!(!app.should_quit);
+        assert!(app.log.back().is_some_and(|e| e.text.contains("（模拟）已重启")));
+
+        // Windows：真实重启，退出 TUI 让位
+        let (mut app, cmd_rx) = ready_app(BackendKind::Windows);
+        app.on_key(key(KeyCode::F(10)));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::RestartSystem));
+        app.apply_event(BackendEvent::OpOk("系统即将重启".into()));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn commit_registry_input_flow() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Commit;
+        app.on_key(key(KeyCode::Char('r')));
+        assert!(matches!(app.modal, Some(Modal::Input(_))));
+        for c in "HKLM\\SOFTWARE\\X\\Val".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        match cmd_rx.try_recv().unwrap() {
+            BackendCmd::CommitRegistry(path) => assert_eq!(path, "HKLM\\SOFTWARE\\X\\Val"),
+            other => panic!("期望 CommitRegistry，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_settings_locked_when_filter_enabled() {
+        // demo 快照筛选器当前启用 → R1 锁定类型/上限，选中行落到阈值
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        app.on_dashboard_key(key(KeyCode::Char('s')));
+        let Some(Modal::OverlaySettings(state)) = &app.modal else {
+            panic!("期望 OverlaySettings 弹窗");
+        };
+        assert!(state.lock_type_size);
+        assert_eq!(state.selected, 2);
+
+        // 当前禁用 → 不锁定
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        let mut snapshot = demo_snapshot();
+        snapshot.filter_state = Some(FilterState { current_enabled: false, next_enabled: false });
+        app.apply_event(BackendEvent::Snapshot(Box::new(snapshot)));
+        app.on_dashboard_key(key(KeyCode::Char('s')));
+        let Some(Modal::OverlaySettings(state)) = &app.modal else {
+            panic!("期望 OverlaySettings 弹窗");
+        };
+        assert!(!state.lock_type_size);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn commit_file_deletion_requires_confirm() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.execute_pick(PickerAction::CommitFileDeletion, PathBuf::from("C:\\data\\a.txt"));
+        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
+        app.on_key(key(KeyCode::Enter));
+        match cmd_rx.try_recv().unwrap() {
+            BackendCmd::CommitFileDeletion(path) => assert_eq!(path, "C:\\data\\a.txt"),
+            other => panic!("期望 CommitFileDeletion，实际 {other:?}"),
+        }
+    }
+}
