@@ -29,12 +29,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(inner);
 
-    views::render_tabs(frame, app, tabs_area);
-    match app.tab {
-        Tab::Dashboard => views::dashboard::render(frame, app, body_area),
-        Tab::Volumes => views::volumes::render(frame, app, body_area),
-        Tab::Exclusions => views::exclusions::render(frame, app, body_area),
-        Tab::Commit => views::commit::render(frame, app, body_area),
+    // D6：UWF 未安装时以引导页取代正常视图（[F5] 重新检测，检测到后自动恢复）
+    if app.not_installed {
+        views::not_installed::render(frame, tabs_area, body_area);
+    } else {
+        views::render_tabs(frame, app, tabs_area);
+        match app.tab {
+            Tab::Dashboard => views::dashboard::render(frame, app, body_area),
+            Tab::Volumes => views::volumes::render(frame, app, body_area),
+            Tab::Exclusions => views::exclusions::render(frame, app, body_area),
+            Tab::Commit => views::commit::render(frame, app, body_area),
+        }
     }
     render_log(frame, app, log_area);
     render_hotkeys(frame, hotkey_area);

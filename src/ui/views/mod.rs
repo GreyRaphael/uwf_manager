@@ -3,6 +3,7 @@
 pub mod commit;
 pub mod dashboard;
 pub mod exclusions;
+pub mod not_installed;
 pub mod volumes;
 
 use ratatui::Frame;

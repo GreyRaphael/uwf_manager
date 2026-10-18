@@ -9,6 +9,8 @@ mod mock;
 mod windows;
 
 pub use mock::MockUwfBackend;
+#[cfg(windows)]
+pub(crate) use windows::is_elevated;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};

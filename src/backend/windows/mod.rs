@@ -13,6 +13,9 @@
 //! - R5：注册表提交作用于当前会话实例（路径拆分在后端线程已完成）
 
 mod classes;
+mod elevate;
+
+pub(crate) use elevate::is_elevated;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
