@@ -15,7 +15,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use crate::app::Modal;
 
 /// 将模态渲染在屏幕中央的浮层上
-pub fn render_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
+pub fn render_modal(frame: &mut Frame, modal: &mut Modal, area: Rect) {
     match modal {
         Modal::Confirm(state) => confirm::render(frame, state, area),
         Modal::Input(state) => input_dialog::render(frame, state, area),

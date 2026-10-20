@@ -290,23 +290,15 @@ fn handle_cmd(
             max_mb,
             warning_mb,
             critical_mb,
-        } => {
-            mutate_with(id, backend, tx, |b| {
-                // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定其余两项）
-                let locked = b.get_filter_state()?.current_enabled;
-                if !locked {
-                    b.set_overlay_type(overlay_type)?;
-                    b.set_overlay_max_size(max_mb)?;
-                }
-                b.set_warning_threshold(warning_mb)?;
-                b.set_critical_threshold(critical_mb)?;
-                Ok(if locked {
-                    "Overlay 阈值已保存（类型/上限已锁定）".to_string()
-                } else {
-                    "Overlay 配置已保存（下次启动生效）".to_string()
-                })
-            })
-        }
+        } => set_overlay_config(
+            id,
+            backend,
+            tx,
+            overlay_type,
+            max_mb,
+            warning_mb,
+            critical_mb,
+        ),
         BackendCmd::Protect(drive) => mutate(
             id,
             backend,
@@ -422,6 +414,69 @@ fn mutate(
         action(b)?;
         Ok(ok_msg.into())
     });
+}
+
+/// P1-17：Overlay 配置是多步 WMI 写入；中途失败时前面的步骤已经生效。
+/// 失败也必须刷新，并在错误文案中列出“已应用”的步骤。
+fn set_overlay_config(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    tx: &Sender<BackendEvent>,
+    overlay_type: OverlayType,
+    max_mb: u32,
+    warning_mb: u32,
+    critical_mb: u32,
+) {
+    let mut applied: Vec<&'static str> = Vec::new();
+    let result = (|| -> Result<String> {
+        // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定其余两项）
+        let locked = backend.get_filter_state()?.current_enabled;
+        if !locked {
+            backend.set_overlay_type(overlay_type)?;
+            applied.push("类型");
+            backend.set_overlay_max_size(max_mb)?;
+            applied.push("上限");
+        }
+        backend.set_warning_threshold(warning_mb)?;
+        applied.push("预警阈值");
+        backend.set_critical_threshold(critical_mb)?;
+        applied.push("临界阈值");
+        Ok(if locked {
+            "Overlay 阈值已保存（类型/上限已锁定）".to_string()
+        } else {
+            "Overlay 配置已保存（下次启动生效）".to_string()
+        })
+    })();
+
+    match result {
+        Ok(msg) => {
+            let outcome = match refresh_all(id, backend, tx) {
+                Ok(()) => Outcome::Ok(msg),
+                Err(UwfError::NotInstalled) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: "状态刷新失败：UWF 功能未安装或未启用".into(),
+                },
+                Err(e) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: format!("操作已成功，但状态刷新失败：{e}"),
+                },
+            };
+            send_finished(tx, id, outcome);
+        }
+        Err(e) => {
+            // 让 UI 看到实际状态，而不是停留在旧的 Overlay 值。
+            let refresh_warning = refresh_all(id, backend, tx).err();
+            let mut msg = if applied.is_empty() {
+                e.to_string()
+            } else {
+                format!("{e}；已应用: {}", applied.join("、"))
+            };
+            if let Some(w) = refresh_warning {
+                msg.push_str(&format!("；状态刷新失败：{w}"));
+            }
+            send_finished(tx, id, Outcome::Err(msg));
+        }
+    }
 }
 
 /// 电源动作出口：动作成功后**不做全量刷新**。
@@ -568,15 +623,18 @@ pub fn split_absolute_path(path: &str) -> Result<(String, String)> {
     let bytes = path.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         let drive = path[..2].to_ascii_uppercase();
-        let rel = &path[2..];
-        let rel = if rel.is_empty() {
-            "\\".to_string()
-        } else if rel.starts_with('\\') {
-            rel.to_string()
-        } else {
-            format!("\\{rel}")
-        };
-        return Ok((drive, rel));
+        let rest = &path[2..];
+        if rest.is_empty() {
+            return Ok((drive, "\\".to_string()));
+        }
+        // 只接受真正的绝对路径：C:\foo 或 C:/foo。
+        // C:foo 是“C 盘当前目录下的 foo”，不能静默改写成 C:\foo。
+        if !(rest.starts_with('\\') || rest.starts_with('/')) {
+            return Err(UwfError::InvalidPath(format!(
+                "必须是绝对路径（如 C:\\Windows\\Temp）: {path}"
+            )));
+        }
+        return Ok((drive, rest.replace('/', "\\")));
     }
     #[cfg(not(windows))]
     if let Some(rest) = path.strip_prefix('/') {
@@ -617,9 +675,16 @@ mod tests {
         // 小写盘符归一化为大写
         let (drive, _) = split_absolute_path("d:\\data").unwrap();
         assert_eq!(drive, "D:");
-        // 缺前导反斜杠时补齐
-        let (_, rel) = split_absolute_path("C:foo").unwrap();
-        assert_eq!(rel, "\\foo");
+        // C:foo 是 drive-relative，不是绝对路径，必须拒绝
+        assert!(split_absolute_path("C:foo").is_err());
+        // 正斜杠统一成反斜杠
+        let (drive, rel) = split_absolute_path("C:/Windows/a").unwrap();
+        assert_eq!((drive.as_str(), rel.as_str()), ("C:", "\\Windows\\a"));
+        // 只有盘符时表示根目录
+        let (drive, rel) = split_absolute_path("C:").unwrap();
+        assert_eq!((drive.as_str(), rel.as_str()), ("C:", "\\"));
+        // 非法盘符路径
+        assert!(split_absolute_path("C::\\foo").is_err());
         // 相对路径报错
         assert!(matches!(
             split_absolute_path("Windows\\a.txt"),

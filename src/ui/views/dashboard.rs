@@ -43,7 +43,9 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                     theme::dim(),
                 ),
                 Span::styled(
-                    if app.is_busy() {
+                    if app.backend_lost {
+                        "   ⚠ 后端已断开"
+                    } else if app.is_busy() {
                         "   ⏳ 执行中…"
                     } else {
                         ""

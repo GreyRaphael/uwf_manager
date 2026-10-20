@@ -2,11 +2,10 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::{ListState, TableState};
 
@@ -21,6 +20,13 @@ use crate::ui::components::file_picker::{
 };
 use crate::ui::components::input_dialog::{InputAction, InputOutcome, InputState};
 use crate::ui::components::overlay_settings::{OverlayOutcome, OverlaySettingsState};
+
+/// UI 线程统一事件：终端输入与后端回包走同一个 channel，
+/// 后端回包可立即唤醒 `recv_timeout`，不再依赖 50ms 短轮询。
+pub enum UiEvent {
+    Terminal(Event),
+    Backend(BackendEvent),
+}
 
 /// Overlay 轮询周期（与原版 MainForm 的 2 秒后台线程一致）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
@@ -107,6 +113,8 @@ pub struct App {
     pub backend_kind: BackendKind,
     /// D6：UWF 功能未安装（由 `BackendEvent::NotInstalled` 置位）
     pub not_installed: bool,
+    /// 后端线程已退出（channel 断开或 send 失败）；管理键应被禁用
+    pub backend_lost: bool,
     pub snapshot: FullSnapshot,
     pub volumes_state: TableState,
     /// 排除项视图：true = 当前生效，false = 下次生效（原版默认下次）
@@ -114,6 +122,9 @@ pub struct App {
     pub exclusion_focus: ExclusionFocus,
     pub file_exclusion_state: ListState,
     pub registry_exclusion_state: ListState,
+    /// 刷新/排序后用于恢复选中身份的稳定 key
+    selected_file_key: Option<(String, String)>,
+    selected_registry_key: Option<String>,
     pub modal: Option<Modal>,
     pub log: VecDeque<StatusEntry>,
     /// 当前在途的变更请求；只有匹配 id 的 Finished 才能清除
@@ -125,13 +136,13 @@ pub struct App {
     next_request_id: RequestId,
     last_overlay_tick: Instant,
     cmd_tx: Sender<BackendCommand>,
-    evt_rx: Receiver<BackendEvent>,
+    ui_rx: Receiver<UiEvent>,
 }
 
 impl App {
     pub fn new(
         cmd_tx: Sender<BackendCommand>,
-        evt_rx: Receiver<BackendEvent>,
+        ui_rx: Receiver<UiEvent>,
         backend_kind: BackendKind,
     ) -> Self {
         let mut volumes_state = TableState::default();
@@ -145,12 +156,15 @@ impl App {
             should_quit: false,
             backend_kind,
             not_installed: false,
+            backend_lost: false,
             snapshot: FullSnapshot::default(),
             volumes_state,
             exclusion_session_current: false,
             exclusion_focus: ExclusionFocus::Files,
             file_exclusion_state,
             registry_exclusion_state,
+            selected_file_key: None,
+            selected_registry_key: None,
             log: VecDeque::new(),
             mutation: None,
             initial_load: Some(0),
@@ -159,7 +173,7 @@ impl App {
             last_overlay_tick: Instant::now(),
             modal: None,
             cmd_tx,
-            evt_rx,
+            ui_rx,
         }
     }
 
@@ -190,6 +204,7 @@ impl App {
         };
         if !self.send(id, BackendCmd::RefreshAll) {
             self.initial_load = None;
+            self.backend_lost = true;
             self.log(false, "后端线程已退出，无法加载 UWF 状态");
         }
     }
@@ -198,6 +213,7 @@ impl App {
     pub fn refresh_all(&mut self) {
         let id = self.next_request_id();
         if !self.send(id, BackendCmd::RefreshAll) {
+            self.backend_lost = true;
             self.log(false, "后端线程已退出，无法刷新");
         }
     }
@@ -205,6 +221,7 @@ impl App {
     fn send_overlay_refresh(&mut self) {
         let id = self.next_request_id();
         if !self.send(id, BackendCmd::RefreshOverlayRuntime) {
+            self.backend_lost = true;
             self.log(false, "后端线程已退出，无法刷新 Overlay 状态");
         }
     }
@@ -212,12 +229,17 @@ impl App {
     /// 变更类命令：同刻只允许一条在途（PLAN §6.5）。
     /// 返回 id 仅当命令真正发送成功；调用方据此才 arm 电源动作。
     fn begin_mutation(&mut self, cmd: BackendCmd) -> Option<RequestId> {
+        if self.backend_lost {
+            self.log(false, "后端线程已退出，请重启应用");
+            return None;
+        }
         if self.mutation.is_some() {
             self.log(false, "有操作正在执行，请稍后再试");
             return None;
         }
         let id = self.next_request_id();
         if !self.send(id, cmd) {
+            self.backend_lost = true;
             self.log(false, "后端线程已退出，操作未发送");
             return None;
         }
@@ -233,25 +255,22 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         while !self.should_quit {
-            self.drain_backend_events();
             terminal.draw(|frame| crate::ui::render(frame, self))?;
 
-            // 变更在途时缩短 poll 超时（50ms），使 OpOk/OpErr 反馈即时上屏；
-            // 否则按键处理完最多 2 秒（下个 tick）才可见结果
-            let tick_timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
-            let timeout = if self.is_busy() {
-                tick_timeout.min(Duration::from_millis(50))
-            } else {
-                tick_timeout
-            };
-            if event::poll(timeout).context("读取终端事件失败")?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                // 先 drain 后端回包再处理按键：避免唤醒 poll 的按键读到
-                // 尚未应用的旧快照（如启动后立即按 [S] 弹窗预填为空）
-                self.drain_backend_events();
-                self.on_key(key);
+            let timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
+            match self.ui_rx.recv_timeout(timeout) {
+                Ok(evt) => {
+                    self.handle_ui_event(evt);
+                    // 一次处理当前所有已就绪事件，避免后端回包积压。
+                    while let Ok(evt) = self.ui_rx.try_recv() {
+                        self.handle_ui_event(evt);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.handle_disconnected();
+                    break;
+                }
             }
 
             if self.last_overlay_tick.elapsed() >= OVERLAY_POLL {
@@ -262,9 +281,22 @@ impl App {
         Ok(())
     }
 
-    fn drain_backend_events(&mut self) {
-        while let Ok(evt) = self.evt_rx.try_recv() {
-            self.apply_event(evt);
+    fn handle_ui_event(&mut self, evt: UiEvent) {
+        match evt {
+            UiEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                self.on_key(key)
+            }
+            UiEvent::Terminal(_) => {}
+            UiEvent::Backend(evt) => self.apply_event(evt),
+        }
+    }
+
+    fn handle_disconnected(&mut self) {
+        if !self.backend_lost {
+            self.backend_lost = true;
+            self.mutation = None;
+            self.initial_load = None;
+            self.log(false, "后端线程已退出，请重启应用");
         }
     }
 
@@ -278,6 +310,7 @@ impl App {
                 // 查询回包永远不解除 mutation 锁；只有匹配 id 的 Finished 可以。
                 self.not_installed = false;
                 self.clamp_selections();
+                self.restore_selection();
                 let warnings = self.snapshot.warnings.clone();
                 for warning in &warnings {
                     self.log_warn(warning);
@@ -365,6 +398,40 @@ impl App {
         });
     }
 
+    /// 记录当前选中项的稳定 key（文件用盘符+相对路径，注册表用完整 key）。
+    fn remember_selection(&mut self) {
+        self.selected_file_key = self
+            .file_exclusion_state
+            .selected()
+            .and_then(|i| self.visible_file_exclusions().get(i))
+            .map(|e| (e.drive_letter.clone(), e.file_rel_path.clone()));
+        self.selected_registry_key = self
+            .registry_exclusion_state
+            .selected()
+            .and_then(|i| self.visible_registry_exclusions().get(i))
+            .cloned();
+    }
+
+    /// 快照/排序变化后按 key 恢复选中；key 不存在时保留 clamp 后的索引。
+    fn restore_selection(&mut self) {
+        if let Some((drive, rel)) = self.selected_file_key.clone()
+            && let Some(i) = self
+                .visible_file_exclusions()
+                .iter()
+                .position(|e| e.drive_letter == drive && e.file_rel_path == rel)
+        {
+            self.file_exclusion_state.select(Some(i));
+        }
+        if let Some(key) = self.selected_registry_key.clone()
+            && let Some(i) = self
+                .visible_registry_exclusions()
+                .iter()
+                .position(|k| k == &key)
+        {
+            self.registry_exclusion_state.select(Some(i));
+        }
+    }
+
     /// 快照更新后收敛各列表选中位置
     fn clamp_selections(&mut self) {
         let volumes_len = self.snapshot.volumes.len();
@@ -411,6 +478,15 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
                 KeyCode::Char('?') => self.modal = Some(Modal::Help),
                 _ => {}
+            }
+            return;
+        }
+
+        if self.backend_lost {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                _ => self.log(false, "后端线程已退出，请重启应用"),
             }
             return;
         }
@@ -532,10 +608,12 @@ impl App {
                         move_selection(self.registry_exclusion_state.selected_mut(), len, delta);
                     }
                 }
+                self.remember_selection();
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.exclusion_session_current = !self.exclusion_session_current;
                 self.clamp_selections();
+                self.remember_selection();
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 if !self.ensure_mutable_exclusions() {
@@ -638,13 +716,12 @@ impl App {
                 InputOutcome::Stay => self.modal = Some(Modal::Input(state)),
                 InputOutcome::Cancel => {}
                 InputOutcome::Submit(action, text) => self.execute_input(action, text),
-                InputOutcome::Browse(InputAction::AddFileExclusion) => {
+                InputOutcome::Browse => {
                     self.modal = Some(Modal::FilePicker(FilePickerState::new(
                         PickerMode::Any,
                         PickerAction::AddFileExclusion,
                     )));
                 }
-                InputOutcome::Browse(_) => {}
             },
             Modal::FilePicker(mut state) => match state.on_key(key) {
                 PickerOutcome::Stay => self.modal = Some(Modal::FilePicker(state)),
@@ -798,6 +875,7 @@ fn move_selection(selected: &mut Option<usize>, len: usize, delta: isize) {
 pub(crate) mod tests {
     use super::*;
     use crate::model::{FileExclusion, FilterState, OverlayConfig, OverlayType, VolumeInfo};
+    use crossterm::event;
 
     /// 与 `MockUwfBackend::demo()` 对齐的快照数据（供 app/ui 测试共用）
     pub(crate) fn demo_snapshot() -> FullSnapshot {
@@ -844,8 +922,10 @@ pub(crate) mod tests {
 
     fn test_app(kind: BackendKind) -> (App, Receiver<BackendCommand>) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (_evt_tx, evt_rx) = std::sync::mpsc::channel();
-        (App::new(cmd_tx, evt_rx, kind), cmd_rx)
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        // 测试不运行事件循环；保留 sender，避免 App 把通道断开误判为后端退出。
+        std::mem::forget(ui_tx);
+        (App::new(cmd_tx, ui_rx, kind), cmd_rx)
     }
 
     fn recv_cmd(rx: &Receiver<BackendCommand>) -> BackendCmd {
@@ -1239,5 +1319,37 @@ pub(crate) mod tests {
         };
         app.apply_event(BackendEvent::OverlayRuntime { id: 3, runtime });
         assert_eq!(app.snapshot.overlay_runtime, Some(runtime));
+    }
+    #[test]
+    fn backend_disconnect_marks_lost_and_blocks_mutations() {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (_ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(cmd_tx, ui_rx, BackendKind::Mock);
+        assert!(app.is_busy()); // 启动加载在途
+
+        app.handle_disconnected();
+        assert!(app.backend_lost);
+        assert!(!app.is_busy()); // 不会永久 pending
+
+        app.on_dashboard_key(key(KeyCode::Char('e')));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+    #[test]
+    fn selection_identity_survives_reorder() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        app.selected_file_key = Some(("C:".into(), "\\Windows\\Temp".into()));
+
+        let mut snapshot = demo_snapshot();
+        snapshot.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\Windows\\Temp".into()),
+        ];
+        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+
+        assert_eq!(app.file_exclusion_state.selected(), Some(1));
+        assert_eq!(
+            app.selected_file_key,
+            Some(("C:".into(), "\\Windows\\Temp".into()))
+        );
     }
 }

@@ -30,6 +30,20 @@ use super::UwfBackend;
 /// UWF WMI 命名空间
 const NAMESPACE: &str = "root\\standardcimv2\\embedded";
 
+/// 仅把“命名空间/类不存在”映射为 NotInstalled；权限、RPC、服务异常保留为 Wmi。
+fn map_connect_error(e: wmi::WMIError) -> UwfError {
+    const WBEM_E_INVALID_NAMESPACE: i32 = 0x8004_100E_u32 as i32;
+    const WBEM_E_NOT_FOUND: i32 = 0x8004_1002_u32 as i32;
+    match &e {
+        wmi::WMIError::HResultError { hres }
+            if *hres == WBEM_E_INVALID_NAMESPACE || *hres == WBEM_E_NOT_FOUND =>
+        {
+            UwfError::NotInstalled
+        }
+        _ => UwfError::Wmi(Box::new(e)),
+    }
+}
+
 /// WQL 布尔字面量（显式大写，与原版 C# 插值结果一致）
 fn session_kw(current_session: bool) -> &'static str {
     if current_session { "TRUE" } else { "FALSE" }
@@ -54,10 +68,8 @@ impl WindowsWmiBackend {
     fn con(&mut self) -> Result<&WMIConnection> {
         if self.con.is_none() {
             // 命名空间不存在（UWF 功能未安装）时 ConnectServer 返回错误
-            self.con = Some(
-                WMIConnection::with_namespace_path(NAMESPACE)
-                    .map_err(|_| UwfError::NotInstalled)?,
-            );
+            self.con =
+                Some(WMIConnection::with_namespace_path(NAMESPACE).map_err(map_connect_error)?);
         }
         Ok(self.con.as_ref().expect("connected above"))
     }
@@ -94,12 +106,12 @@ impl WindowsWmiBackend {
 
     /// UWF_Filter 单例；查询失败或为空 → UWF 功能未安装
     fn filter_instance(&mut self) -> Result<UWF_Filter> {
-        let rows: Vec<UWF_Filter> = self.con()?.query().map_err(|_| UwfError::NotInstalled)?;
+        let rows: Vec<UWF_Filter> = self.con()?.query()?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
     fn overlay_instance(&mut self) -> Result<UWF_Overlay> {
-        let rows: Vec<UWF_Overlay> = self.con()?.query().map_err(|_| UwfError::NotInstalled)?;
+        let rows: Vec<UWF_Overlay> = self.con()?.query()?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 

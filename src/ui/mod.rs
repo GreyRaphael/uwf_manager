@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_log(frame, app, log_area);
 
     // 模态浮层最后渲染（置于所有视图之上）
-    if let Some(modal) = &app.modal {
+    if let Some(modal) = &mut app.modal {
         components::render_modal(frame, modal, area);
     }
 }
@@ -92,8 +92,9 @@ mod tests {
 
     fn test_app() -> App {
         let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (_evt_tx, evt_rx) = std::sync::mpsc::channel();
-        App::new(cmd_tx, evt_rx, BackendKind::Mock)
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        std::mem::forget(ui_tx);
+        App::new(cmd_tx, ui_rx, BackendKind::Mock)
     }
 
     /// 渲染整个界面到字符串（逐行拼接 TestBackend 缓冲）

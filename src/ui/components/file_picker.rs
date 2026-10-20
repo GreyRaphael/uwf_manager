@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::ui::theme;
 
@@ -46,7 +46,14 @@ pub struct FilePickerState {
     pub cwd: Option<PathBuf>,
     pub entries: Vec<PickerEntry>,
     pub selected: usize,
+    pub list_state: ListState,
+    /// 可视高度（render 时更新，供 PageUp/PageDown 使用）
+    pub page_size: usize,
     pub error: Option<String>,
+    #[cfg(windows)]
+    drive_rx: Option<std::sync::mpsc::Receiver<Vec<PickerEntry>>>,
+    #[cfg(windows)]
+    loading_drives: bool,
 }
 
 pub enum PickerOutcome {
@@ -66,10 +73,25 @@ impl FilePickerState {
             cwd,
             entries: Vec::new(),
             selected: 0,
+            list_state: ListState::default(),
+            page_size: 10,
             error: None,
+            #[cfg(windows)]
+            drive_rx: None,
+            #[cfg(windows)]
+            loading_drives: false,
         };
         state.reload();
         state
+    }
+
+    fn sync_list_state(&mut self) {
+        if self.entries.is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.selected = self.selected.min(self.entries.len() - 1);
+            self.list_state.select(Some(self.selected));
+        }
     }
 
     /// 重新读取当前目录：目录在前、文件在后，按名称（小写）排序
@@ -80,8 +102,11 @@ impl FilePickerState {
         let Some(cwd) = &self.cwd else {
             #[cfg(windows)]
             {
-                self.entries = list_drives();
+                // 盘符探测放到后台线程，避免网络盘/软驱阻塞 UI。
+                self.start_drive_probe();
+                self.poll_drives();
             }
+            self.sync_list_state();
             return;
         };
         match std::fs::read_dir(cwd) {
@@ -100,6 +125,42 @@ impl FilePickerState {
             }
             Err(e) => {
                 self.error = Some(format!("无法读取目录: {e}"));
+            }
+        }
+        self.sync_list_state();
+    }
+
+    #[cfg(windows)]
+    fn start_drive_probe(&mut self) {
+        if self.drive_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(list_drives());
+        });
+        self.drive_rx = Some(rx);
+        self.loading_drives = true;
+    }
+
+    #[cfg(windows)]
+    fn poll_drives(&mut self) {
+        let Some(rx) = &self.drive_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(drives) => {
+                self.entries = drives;
+                self.drive_rx = None;
+                self.loading_drives = false;
+                self.selected = 0;
+                self.sync_list_state();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.drive_rx = None;
+                self.loading_drives = false;
+                self.error = Some("盘符探测线程异常退出".into());
             }
         }
     }
@@ -142,12 +203,37 @@ impl FilePickerState {
                 if !self.entries.is_empty() {
                     self.selected = (self.selected + self.entries.len() - 1) % self.entries.len();
                 }
+                self.sync_list_state();
                 PickerOutcome::Stay
             }
             KeyCode::Down => {
                 if !self.entries.is_empty() {
                     self.selected = (self.selected + 1) % self.entries.len();
                 }
+                self.sync_list_state();
+                PickerOutcome::Stay
+            }
+            KeyCode::PageUp => {
+                self.selected = self.selected.saturating_sub(self.page_size.max(1));
+                self.sync_list_state();
+                PickerOutcome::Stay
+            }
+            KeyCode::PageDown => {
+                if !self.entries.is_empty() {
+                    self.selected =
+                        (self.selected + self.page_size.max(1)).min(self.entries.len() - 1);
+                }
+                self.sync_list_state();
+                PickerOutcome::Stay
+            }
+            KeyCode::Home => {
+                self.selected = 0;
+                self.sync_list_state();
+                PickerOutcome::Stay
+            }
+            KeyCode::End => {
+                self.selected = self.entries.len().saturating_sub(1);
+                self.sync_list_state();
                 PickerOutcome::Stay
             }
             KeyCode::Backspace | KeyCode::Left => {
@@ -191,7 +277,19 @@ fn list_drives() -> Vec<PickerEntry> {
         .collect()
 }
 
-pub fn render(frame: &mut Frame, state: &FilePickerState, area: Rect) {
+fn entry_label(entry: &PickerEntry) -> String {
+    if entry.is_dir {
+        format!("{}{}", entry.name, std::path::MAIN_SEPARATOR)
+    } else {
+        entry.name.clone()
+    }
+}
+
+pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
+    #[cfg(windows)]
+    if state.cwd.is_none() {
+        state.poll_drives();
+    }
     let rect = centered_rect(72, 70, area);
     let cwd_label = match &state.cwd {
         Some(cwd) => cwd.display().to_string(),
@@ -204,52 +302,98 @@ pub fn render(frame: &mut Frame, state: &FilePickerState, area: Rect) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(block.inner(rect));
     frame.render_widget(block, rect);
 
+    state.page_size = list_area.height.max(1) as usize;
+    state.sync_list_state();
+
     let items: Vec<ListItem> = if state.entries.is_empty() {
-        vec![ListItem::new(Line::styled(
+        #[cfg(windows)]
+        let empty = if state.loading_drives {
+            "正在检测盘符…".to_string()
+        } else {
             state
                 .error
                 .clone()
-                .unwrap_or_else(|| "（空目录）".to_string()),
-            theme::dim(),
-        ))]
+                .unwrap_or_else(|| "（空目录）".to_string())
+        };
+        #[cfg(not(windows))]
+        let empty = state
+            .error
+            .clone()
+            .unwrap_or_else(|| "（空目录）".to_string());
+        vec![ListItem::new(Line::styled(empty, theme::dim()))]
     } else {
         state
             .entries
             .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let sep = std::path::MAIN_SEPARATOR;
-                let line = if entry.is_dir {
-                    Line::from(vec![
-                        Span::styled(
-                            if i == state.selected { "▶ " } else { "  " },
-                            theme::title(),
-                        ),
-                        Span::styled(format!("{}{sep}", entry.name), theme::title()),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::styled(
-                            if i == state.selected { "▶ " } else { "  " },
-                            theme::title(),
-                        ),
-                        Span::raw(&entry.name),
-                    ])
-                };
-                let style = if i == state.selected {
-                    theme::selected()
+            .map(|entry| {
+                let style = if entry.is_dir {
+                    theme::title()
                 } else {
                     ratatui::style::Style::default()
                 };
-                ListItem::new(line).style(style)
+                ListItem::new(Line::from(Span::styled(entry_label(entry), style)))
             })
             .collect()
     };
-    frame.render_widget(List::new(items), list_area);
+    let list = List::new(items)
+        .highlight_style(theme::selected())
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, list_area, &mut state.list_state);
 
     let hint = match state.mode {
         PickerMode::File => "[Enter] 进入/选择  [Backspace] 上级  [Esc] 取消",
         PickerMode::Any => "[Enter] 进入/选择  [Space] 选中此项  [Backspace] 上级  [Esc] 取消",
     };
     frame.render_widget(Paragraph::new(Line::styled(hint, theme::dim())), hint_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn state_with_entries(n: usize) -> FilePickerState {
+        let mut state = FilePickerState::new(PickerMode::File, PickerAction::CommitFile);
+        state.entries = (0..n)
+            .map(|i| PickerEntry {
+                name: format!("f{i:02}"),
+                path: PathBuf::from(format!("/tmp/f{i:02}")),
+                is_dir: false,
+            })
+            .collect();
+        state.selected = 0;
+        state.page_size = 10;
+        state.sync_list_state();
+        state
+    }
+
+    #[test]
+    fn page_home_end_move_selection_and_list_state() {
+        let mut state = state_with_entries(30);
+        state.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(state.selected, 10);
+        assert_eq!(state.list_state.selected(), Some(10));
+
+        state.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(state.selected, 20);
+
+        state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.selected, 29);
+
+        state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn directory_label_has_exactly_one_separator() {
+        let entry = PickerEntry {
+            name: "C:".into(),
+            path: PathBuf::from("C:\\"),
+            is_dir: true,
+        };
+        let label = entry_label(&entry);
+        assert_eq!(label, format!("C:{}", std::path::MAIN_SEPARATOR));
+        assert!(!label.contains("\\\\"));
+    }
 }

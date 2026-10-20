@@ -18,7 +18,8 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::Context;
-use backend::{create_backend_factory, spawn_backend_thread};
+use backend::{BackendEvent, create_backend_factory, spawn_backend_thread};
+use crossterm::event;
 
 fn main() -> anyhow::Result<()> {
     // `--mock`：任意平台强制使用 Mock 后端。
@@ -44,11 +45,29 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+    let (backend_evt_tx, backend_evt_rx) = std::sync::mpsc::channel::<BackendEvent>();
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel();
     let (factory, kind) = create_backend_factory(force_mock);
-    let backend = spawn_backend_thread(factory, cmd_rx, evt_tx);
+    let backend = spawn_backend_thread(factory, cmd_rx, backend_evt_tx);
 
-    let mut app = app::App::new(cmd_tx, evt_rx, kind);
+    // 后端回包转发到 UI 统一 channel；终端读取线程同样汇入，二者都能立即唤醒主循环。
+    let forward_tx = ui_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(evt) = backend_evt_rx.recv() {
+            if forward_tx.send(app::UiEvent::Backend(evt)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        while let Ok(evt) = event::read() {
+            if ui_tx.send(app::UiEvent::Terminal(evt)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut app = app::App::new(cmd_tx, ui_rx, kind);
     app.start_initial_load();
     let result = app.run(&mut terminal);
 
