@@ -104,6 +104,8 @@
 | P1-15 | 中 | NotInstalled 映射过宽，权限/临时 WMI 错误被误报 | [windows/mod.rs](src/backend/windows/mod.rs#L49-L58) |
 | P1-16 | 中 | 选择按索引保存，刷新后可能指向另一项 | [app.rs](src/app.rs#L259-L267) |
 | P1-17 | 中 | 多步 Overlay 配置可能部分成功但只报一个错 | [backend/mod.rs](src/backend/mod.rs#L203-L219) |
+| P1-18 | 中 | Mock 读方法有副作用、删除不校验卷 | [mock.rs](src/backend/mock.rs#L143-L152)、[mock.rs](src/backend/mock.rs#L232-L236) |
+| P1-19 | 中 | 导入/导出编码与覆盖策略 | [backend/mod.rs](src/backend/mod.rs#L334-L390) |
 | P2-1 | 低 | 日志历史完全没展示 | [app.rs](src/app.rs#L22-L25)、[app.rs](src/app.rs#L248-L257) |
 | P2-2 | 低 | `OverlayConfig.current_session` 只写不读 | [overlay.rs](src/model/overlay.rs#L36-L42) |
 | P2-3 | 低 | 三个 WMI `CurrentSession` 字段只写不读 | [classes.rs](src/backend/windows/classes.rs#L30-L60) |
@@ -617,6 +619,12 @@ Ok(msg) => {
 - 系统正在关机/重启时又发起一整轮 WMI 查询，可能卡住、延迟退出，甚至终端来不及 restore；
 - `refresh_all` 失败还会先发 `OpErr`，再发 `OpOk`，日志最终显示成功（见 P1-1）。
 
+> 定级说明（2026-10-20）：本项包含两半。**“动作成功后仍全量刷新”是确定缺陷**，
+> 保留 P0；“必须校验 Restart/Shutdown 的 ReturnValue”是合理的防御性建议，但代码
+> 注释明确写着“与原版一致：不校验”，且 Windows 真机上 `RestartSystem` 是否能在
+> 重启前返回非零尚未验证。修复时保留 ReturnValue 校验，但验收需标注“待 Windows
+> 真机确认”，不要把它当作已经证实的线上后果。
+
 #### 修复方案
 
 1. 恢复 `ReturnValue` 校验：
@@ -932,7 +940,13 @@ let gauge = Gauge::default()
 
 ---
 
-### P1-4：Overlay 锁定字段仍参与解析，缺少业务校验
+### P1-4：Overlay 提交缺少业务校验（编号拆分说明）
+
+> 修订（2026-10-20）：原描述把“锁定 + 上限为空”当作可达缺陷，但 `collect_snapshot`
+> 要么返回全部 `Some`，要么整体失败，`filter_state=Some(current_enabled=true)` 且
+> `overlay_config_next=None` 的合成快照在正常流程中不可达。因此该场景只保留为
+> 防御性处理，不再作为复现依据。真正可达的问题是 **submit 缺少业务校验**：
+> `max_mb > 0`、`warning < critical`、`critical <= max_mb`。
 
 #### 位置
 
@@ -940,18 +954,21 @@ let gauge = Gauge::default()
 
 #### 问题
 
-`submit` 无条件解析 `max_size`：
+`submit` 只做 `u32` 解析，没有校验：
 
-```rust
-max_mb: parse(&self.max_size, "上限")?,
-```
+- 上限为 `0`；
+- `warning >= critical`；
+- `critical > max_mb`。
 
-但 R1 锁定类型/上限时，上限字段不可编辑；如果快照未到齐，`max_size` 为空，用户只改阈值也会被“上限须为整数”挡住。临时测试已复现锁定状态下 Enter 仍返回 `Stay` 且错误包含“上限”。
+用户可以把明显非法的阈值提交给后端；Windows WMI 可能接受后产生不可预期的 Overlay 行为，或只返回一个难以理解的错误码。
+
+另外，锁定类型/上限时 `submit` 仍无条件解析 `max_size`。正常快照下该字段有预填值，因此不构成用户可见故障；但作为防御性处理，锁定时应使用快照中的原始上限，而不是依赖输入框字符串。
 
 #### 修复
 
 1. 快照未加载完成时，不预填空字符串，而是显式禁用保存并提示“正在加载配置”；
-2. 锁定状态下不解析锁定字段，使用保存的原始数值：
+2. 锁定状态下不解析锁定字段，使用保存的原始数值；
+3. 无论是否锁定，都校验 `max_mb > 0`、`warning < critical`、`critical <= max_mb`。
 
 ```rust
 pub struct OverlaySettingsState {
@@ -1001,11 +1018,11 @@ fn submit(&mut self) -> OverlayOutcome {
 
 #### 回归测试
 
-- 锁定 + 上限为空：只改阈值可以保存；
 - 上限为 0：拒绝；
 - warning >= critical：拒绝；
 - critical > max：拒绝；
-- 正常输入：提交。
+- 正常输入：提交；
+- 锁定 + 上限字段为空（防御性合成状态）：使用快照原始上限，不报“上限须为整数”。
 
 ---
 
@@ -1834,6 +1851,8 @@ std::fs::write(path, body)?;
 
 - 删除 dead code（第 6.1 节）；
 - 决定文本层策略（集中或删除承诺）；
+- 修 P1-18：Mock 读方法副作用、未知卷删除；
+- 修 P1-19：BOM/UTF-16 编码、空列表导出、同秒覆盖；
 - 修 `import_export_roundtrip_with_mock`、硬编码个人路径、demo fixture 重复；
 - 更新 README/PLAN 漂移；
 - 更新 smoke 测试的前置条件和临时目录。
@@ -1865,8 +1884,10 @@ std::fs::write(path, body)?;
 | T19 | 选择刷新后保持身份 | App 单测 | 仍选中同一项 |
 | T20 | 文件选择器滚动 | UI 状态测试 | 选中项可见 |
 | T21 | Ctrl+C 输入框 | 组件单测 | 不插入字符 |
+| T22 | Mock 查询无副作用 / 未知卷删除 | Mock 单测 | 连续查询不改变用量；未知卷返回 `VolumeNotFound` |
+| T23 | 导入 BOM / 空列表导出 / 同秒重复导出 | backend 单测 | BOM 首行正确；空导出为 0 字节；不覆盖已有文件 |
 
-建议先为 P0 的 T1–T8 建测试，再补 P1。现有 `app::tests` 中的 `mutation_gated_while_pending`、`restart_flow_mock_stays_windows_quits` 需要相应调整，避免它们固化旧的错误行为。
+建议先为 P0 的 T1–T8 建测试，再补 P1。现有 `app::tests` 中的 `mutation_gated_while_pending`、`restart_flow_mock_stays_windows_quits` 需要相应调整，避免它们固化旧的错误行为；`backend::tests::r6_split_absolute_path` 当前断言 `C:foo -> \foo`，修 P1-14 时必须同步改为拒绝。
 
 ---
 
