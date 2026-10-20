@@ -1,8 +1,8 @@
 //! 后端抽象层：UI 与底层 UWF 实现的隔离边界。
 //!
-//! 线程协议（PLAN v2 §6.5）：UI 线程发送 [`BackendCmd`]，后端线程独占
-//! `dyn UwfBackend` 执行后经 [`BackendEvent`] 回包。变更类命令成功后
-//! 自动跟随一次全量刷新（先刷新后 OpOk，日志末条保留动作文案）。
+//! 线程协议（PLAN v2 §6.5）：UI 线程发送带 [`RequestId`] 的 [`BackendCommand`]，
+//! 后端线程独占 `dyn UwfBackend` 执行后经 [`BackendEvent`] 回包。变更类命令
+//! 成功后自动跟随一次全量刷新，刷新结果通过 [`Outcome`] 与动作结果一起上报。
 
 mod mock;
 #[cfg(windows)]
@@ -15,6 +15,7 @@ pub(crate) use windows::is_elevated;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::error::{Result, UwfError};
 use crate::model::*;
@@ -84,6 +85,16 @@ pub struct FullSnapshot {
     pub registry_exclusions_next: Vec<String>,
 }
 
+/// 请求关联 id：每个 UI → 后端请求唯一，回包必须原样带回。
+pub type RequestId = u64;
+
+/// UI → 后端线程的带 id 命令。
+#[derive(Debug)]
+pub struct BackendCommand {
+    pub id: RequestId,
+    pub cmd: BackendCmd,
+}
+
 /// UI → 后端线程命令（PLAN §6.5 完整协议）
 #[derive(Debug)]
 pub enum BackendCmd {
@@ -126,18 +137,34 @@ pub enum BackendCmd {
     Quit,
 }
 
-/// 后端线程 → UI 事件
+/// 一次变更请求的最终结果。
+#[derive(Debug)]
+pub enum Outcome {
+    /// 动作成功，且随后的状态刷新也成功
+    Ok(String),
+    /// 动作成功，但状态刷新失败：两个事实都要告诉用户
+    OkWithRefreshWarning { message: String, warning: String },
+    /// 动作失败
+    Err(String),
+}
+
+/// 后端线程 → UI 事件。所有事件都携带发起请求时的 [`RequestId`]，
+/// UI 只允许与当前 mutation 匹配的 `Finished` 清除在途锁。
 #[derive(Debug)]
 pub enum BackendEvent {
-    Snapshot(Box<FullSnapshot>),
+    Snapshot {
+        id: RequestId,
+        snapshot: FullSnapshot,
+    },
     /// 2 秒增量回包
-    OverlayRuntime(OverlayRuntime),
-    /// 操作成功（Toast 文案）
-    OpOk(String),
-    /// 操作失败（Toast 文案，含错误码）
-    OpErr(String),
+    OverlayRuntime {
+        id: RequestId,
+        runtime: OverlayRuntime,
+    },
+    /// 变更/查询请求的最终结果
+    Finished { id: RequestId, outcome: Outcome },
     /// UWF 功能未安装（D6 引导页）
-    NotInstalled,
+    NotInstalled { id: RequestId },
 }
 
 /// 后端来源标识（标题栏徽标）
@@ -171,44 +198,79 @@ pub fn create_backend_factory(force_mock: bool) -> (BackendFactory, BackendKind)
     )
 }
 
+/// 后端线程句柄：停止 ack + JoinHandle。
+///
+/// `Quit` 后线程先发 ack 再退出；主线程最多等 `timeout`，避免 WMI 调用
+/// 挂死时无条件 `join` 把 UI 卡住。
+pub struct BackendHandle {
+    join: JoinHandle<()>,
+    stopped: Receiver<()>,
+}
+
+impl BackendHandle {
+    /// 等待后端确认停止；收到 ack 才 join，超时则放弃 join（进程退出会回收线程）。
+    pub fn wait(self, timeout: Duration) {
+        if self.stopped.recv_timeout(timeout).is_ok() {
+            let _ = self.join.join();
+        }
+    }
+}
+
 /// 启动后端线程（actor）：工厂在本线程内构造 backend（WMI 连接随之在
 /// 本线程建立），顺序执行命令，`Quit` 退出。
 pub fn spawn_backend_thread(
     factory: BackendFactory,
-    rx: Receiver<BackendCmd>,
+    rx: Receiver<BackendCommand>,
     tx: Sender<BackendEvent>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+) -> BackendHandle {
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let join = thread::spawn(move || {
         let mut backend = factory();
-        while let Ok(cmd) = rx.recv() {
+        while let Ok(BackendCommand { id, cmd }) = rx.recv() {
             if matches!(cmd, BackendCmd::Quit) {
+                let _ = stop_tx.send(());
                 break;
             }
-            handle_cmd(&mut *backend, cmd, &tx);
+            handle_cmd(id, &mut *backend, cmd, &tx);
         }
-    })
+    });
+    BackendHandle {
+        join,
+        stopped: stop_rx,
+    }
 }
 
-fn handle_cmd(backend: &mut dyn UwfBackend, cmd: BackendCmd, tx: &Sender<BackendEvent>) {
+fn handle_cmd(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    cmd: BackendCmd,
+    tx: &Sender<BackendEvent>,
+) {
     match cmd {
-        BackendCmd::RefreshAll => refresh_all(backend, tx),
+        BackendCmd::RefreshAll => match refresh_all(id, backend, tx) {
+            Ok(()) | Err(UwfError::NotInstalled) => {}
+            Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
+        },
         BackendCmd::RefreshOverlayRuntime => match backend.get_overlay_runtime() {
-            Ok(runtime) => send(tx, BackendEvent::OverlayRuntime(runtime)),
-            Err(e) => send_err(tx, e),
+            Ok(runtime) => send(tx, BackendEvent::OverlayRuntime { id, runtime }),
+            Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
         },
         BackendCmd::EnableFilter => mutate(
+            id,
             backend,
             tx,
             |b| b.enable_filter(),
             "UWF 将在下次系统重启后启用",
         ),
         BackendCmd::DisableFilter => mutate(
+            id,
             backend,
             tx,
             |b| b.disable_filter(),
             "UWF 将在下次系统重启后禁用",
         ),
         BackendCmd::ResetSettings => mutate(
+            id,
             backend,
             tx,
             |b| b.reset_settings(),
@@ -220,7 +282,7 @@ fn handle_cmd(backend: &mut dyn UwfBackend, cmd: BackendCmd, tx: &Sender<Backend
             warning_mb,
             critical_mb,
         } => {
-            mutate_with(backend, tx, |b| {
+            mutate_with(id, backend, tx, |b| {
                 // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定其余两项）
                 let locked = b.get_filter_state()?.current_enabled;
                 if !locked {
@@ -237,70 +299,88 @@ fn handle_cmd(backend: &mut dyn UwfBackend, cmd: BackendCmd, tx: &Sender<Backend
             })
         }
         BackendCmd::Protect(drive) => mutate(
+            id,
             backend,
             tx,
             |b| b.protect_volume(&drive),
             format!("{drive} 保护成功（下次启动生效）"),
         ),
         BackendCmd::Unprotect(drive) => mutate(
+            id,
             backend,
             tx,
             |b| b.unprotect_volume(&drive),
             format!("{drive} 已取消保护（下次启动生效）"),
         ),
-        BackendCmd::AddFileExclusion(path) => mutate_with(backend, tx, |b| {
+        BackendCmd::AddFileExclusion(path) => mutate_with(id, backend, tx, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
             b.add_file_exclusion(&drive, &rel)?;
             Ok(format!("已添加文件排除: {path}"))
         }),
-        BackendCmd::RemoveFileExclusion(path) => mutate_with(backend, tx, |b| {
+        BackendCmd::RemoveFileExclusion(path) => mutate_with(id, backend, tx, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
             b.remove_file_exclusion(&drive, &rel)?;
             Ok(format!("已删除文件排除: {path}"))
         }),
         BackendCmd::AddRegistryExclusion(key) => mutate(
+            id,
             backend,
             tx,
             |b| b.add_registry_exclusion(&key),
             format!("已添加注册表排除: {key}"),
         ),
         BackendCmd::RemoveRegistryExclusion(key) => mutate(
+            id,
             backend,
             tx,
             |b| b.remove_registry_exclusion(&key),
             format!("已删除注册表排除: {key}"),
         ),
-        BackendCmd::CommitFile(path) => mutate_with(backend, tx, |b| {
+        BackendCmd::CommitFile(path) => mutate_with(id, backend, tx, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
             b.commit_file(&drive, &rel)?;
             Ok(format!("{path} 提交成功"))
         }),
-        BackendCmd::CommitFileDeletion(path) => mutate_with(backend, tx, |b| {
+        BackendCmd::CommitFileDeletion(path) => mutate_with(id, backend, tx, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
             b.commit_file_deletion(&drive, &rel)?;
             Ok(format!("{path} 删除提交成功"))
         }),
-        BackendCmd::CommitRegistry(full_path) => mutate_with(backend, tx, |b| {
+        BackendCmd::CommitRegistry(full_path) => mutate_with(id, backend, tx, |b| {
             let (key, value) = split_registry_path(&full_path)?;
             b.commit_registry(&key, &value)?;
             Ok(format!("注册表 {full_path} 提交成功"))
         }),
-        BackendCmd::ImportExclusions { path } => import_exclusions(backend, tx, &path),
+        BackendCmd::ImportExclusions { path } => import_exclusions(id, backend, tx, &path),
         BackendCmd::ExportExclusions {
             path,
             current_session,
-        } => export_exclusions(backend, tx, &path, current_session),
-        BackendCmd::RestartSystem => mutate(backend, tx, |b| b.restart_system(), "系统即将重启"),
-        BackendCmd::ShutdownSystem => mutate(backend, tx, |b| b.shutdown_system(), "系统即将关机"),
+        } => export_exclusions(id, backend, tx, &path, current_session),
+        BackendCmd::RestartSystem => {
+            mutate(id, backend, tx, |b| b.restart_system(), "系统即将重启")
+        }
+        BackendCmd::ShutdownSystem => {
+            mutate(id, backend, tx, |b| b.shutdown_system(), "系统即将关机")
+        }
         BackendCmd::Quit => unreachable!("Quit 由线程循环拦截"),
     }
 }
 
-fn refresh_all(backend: &mut dyn UwfBackend, tx: &Sender<BackendEvent>) {
+fn refresh_all(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    tx: &Sender<BackendEvent>,
+) -> Result<()> {
     match collect_snapshot(backend) {
-        Ok(snapshot) => send(tx, BackendEvent::Snapshot(Box::new(snapshot))),
-        Err(UwfError::NotInstalled) => send(tx, BackendEvent::NotInstalled),
-        Err(e) => send_err(tx, e),
+        Ok(snapshot) => {
+            send(tx, BackendEvent::Snapshot { id, snapshot });
+            Ok(())
+        }
+        Err(UwfError::NotInstalled) => {
+            send(tx, BackendEvent::NotInstalled { id });
+            Err(UwfError::NotInstalled)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -318,15 +398,17 @@ fn collect_snapshot(b: &mut dyn UwfBackend) -> Result<FullSnapshot> {
     })
 }
 
-/// 变更类命令统一出口：失败回 `OpErr`；成功先全量刷新再回 `OpOk`——
-/// 回包按序应用后日志末条保留动作文案（如 "C: 保护成功"）而非刷新提示。
+/// 变更类命令统一出口：失败回 `Finished(Err)`；成功先全量刷新，再回
+/// `Finished::Ok` 或 `Finished::OkWithRefreshWarning`——动作成功与刷新失败
+/// 是两个事实，不能互相覆盖。
 fn mutate(
+    id: RequestId,
     backend: &mut dyn UwfBackend,
     tx: &Sender<BackendEvent>,
     action: impl FnOnce(&mut dyn UwfBackend) -> Result<()>,
     ok_msg: impl Into<String>,
 ) {
-    mutate_with(backend, tx, |b| {
+    mutate_with(id, backend, tx, |b| {
         action(b)?;
         Ok(ok_msg.into())
     });
@@ -334,22 +416,38 @@ fn mutate(
 
 /// 同 [`mutate`]，但成功文案由 action 返回（适用于需先解析/校验的命令）。
 fn mutate_with(
+    id: RequestId,
     backend: &mut dyn UwfBackend,
     tx: &Sender<BackendEvent>,
     action: impl FnOnce(&mut dyn UwfBackend) -> Result<String>,
 ) {
     match action(backend) {
         Ok(msg) => {
-            refresh_all(backend, tx);
-            send(tx, BackendEvent::OpOk(msg));
+            let outcome = match refresh_all(id, backend, tx) {
+                Ok(()) => Outcome::Ok(msg),
+                Err(UwfError::NotInstalled) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: "状态刷新失败：UWF 功能未安装或未启用".into(),
+                },
+                Err(e) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: format!("操作已成功，但状态刷新失败：{e}"),
+                },
+            };
+            send_finished(tx, id, outcome);
         }
-        Err(e) => send_err(tx, e),
+        Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
     }
 }
 
 /// 导入排除列表（原版 button_import_list_Click 语义）：
 /// 逐行解析，`HK` 前缀 → 注册表排除，其余 → 文件排除；统计成败。
-fn import_exclusions(backend: &mut dyn UwfBackend, tx: &Sender<BackendEvent>, path: &PathBuf) {
+fn import_exclusions(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    tx: &Sender<BackendEvent>,
+    path: &PathBuf,
+) {
     let result = (|| -> Result<(usize, usize)> {
         let content = std::fs::read_to_string(path)?;
         let mut ok = 0;
@@ -379,16 +477,27 @@ fn import_exclusions(backend: &mut dyn UwfBackend, tx: &Sender<BackendEvent>, pa
             } else {
                 format!("导入完成：成功 {ok} 项，失败 {failed} 项")
             };
-            refresh_all(backend, tx);
-            send(tx, BackendEvent::OpOk(msg));
+            let outcome = match refresh_all(id, backend, tx) {
+                Ok(()) => Outcome::Ok(msg),
+                Err(UwfError::NotInstalled) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: "状态刷新失败：UWF 功能未安装或未启用".into(),
+                },
+                Err(e) => Outcome::OkWithRefreshWarning {
+                    message: msg,
+                    warning: format!("导入已执行，但状态刷新失败：{e}"),
+                },
+            };
+            send_finished(tx, id, outcome);
         }
-        Err(e) => send_err(tx, e),
+        Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
     }
 }
 
 /// 导出排除列表（原版 button_save_exclusionlist_Click 语义）：
 /// 文件排除（绝对路径形式）在前，注册表排除在后，每行一条。
 fn export_exclusions(
+    id: RequestId,
     backend: &mut dyn UwfBackend,
     tx: &Sender<BackendEvent>,
     path: &PathBuf,
@@ -403,11 +512,12 @@ fn export_exclusions(
         Ok(lines.len())
     })();
     match result {
-        Ok(count) => send(
+        Ok(count) => send_finished(
             tx,
-            BackendEvent::OpOk(format!("已导出 {count} 项至 {}", path.display())),
+            id,
+            Outcome::Ok(format!("已导出 {count} 项至 {}", path.display())),
         ),
-        Err(e) => send_err(tx, e),
+        Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
     }
 }
 
@@ -454,8 +564,8 @@ fn send(tx: &Sender<BackendEvent>, evt: BackendEvent) {
     let _ = tx.send(evt);
 }
 
-fn send_err(tx: &Sender<BackendEvent>, e: UwfError) {
-    send(tx, BackendEvent::OpErr(e.to_string()));
+fn send_finished(tx: &Sender<BackendEvent>, id: RequestId, outcome: Outcome) {
+    send(tx, BackendEvent::Finished { id, outcome });
 }
 
 #[cfg(test)]

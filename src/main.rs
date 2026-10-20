@@ -15,8 +15,10 @@ mod error;
 mod model;
 mod ui;
 
+use std::time::Duration;
+
 use anyhow::Context;
-use backend::{BackendCmd, create_backend_factory, spawn_backend_thread};
+use backend::{create_backend_factory, spawn_backend_thread};
 
 fn main() -> anyhow::Result<()> {
     // `--mock`：任意平台强制使用 Mock 后端（Windows 上免管理员预览界面）
@@ -43,12 +45,15 @@ fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel();
     let (factory, kind) = create_backend_factory(force_mock);
-    let _backend_thread = spawn_backend_thread(factory, cmd_rx, evt_tx);
+    let backend = spawn_backend_thread(factory, cmd_rx, evt_tx);
 
     let mut app = app::App::new(cmd_tx, evt_rx, kind);
-    app.send(BackendCmd::RefreshAll);
+    app.start_initial_load();
     let result = app.run(&mut terminal);
 
+    // 无论 run 正常/异常返回，都通知后端退出；最多等 2 秒，避免 WMI 挂死拖住进程。
+    app.send_quit();
     ratatui::restore();
+    backend.wait(Duration::from_secs(2));
     result.context("应用运行错误")
 }

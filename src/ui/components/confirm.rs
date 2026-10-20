@@ -17,6 +17,8 @@ pub enum ConfirmAction {
     ResetSettings,
     Restart,
     Shutdown,
+    /// 变更在途时的退出确认
+    Quit,
     /// 携带待删除文件的绝对路径
     CommitFileDeletion(PathBuf),
 }

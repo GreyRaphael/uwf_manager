@@ -43,7 +43,7 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                     theme::dim(),
                 ),
                 Span::styled(
-                    if app.pending {
+                    if app.is_busy() {
                         "   ⏳ 执行中…"
                     } else {
                         ""

@@ -32,6 +32,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // D6：UWF 未安装时以引导页取代正常视图（[F5] 重新检测，检测到后自动恢复）
     if app.not_installed {
         views::not_installed::render(frame, tabs_area, body_area);
+        render_hotkeys(frame, hotkey_area, true);
     } else {
         views::render_tabs(frame, app, tabs_area);
         match app.tab {
@@ -40,9 +41,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Exclusions => views::exclusions::render(frame, app, body_area),
             Tab::Commit => views::commit::render(frame, app, body_area),
         }
+        render_hotkeys(frame, hotkey_area, false);
     }
     render_log(frame, app, log_area);
-    render_hotkeys(frame, hotkey_area);
 
     // 模态浮层最后渲染（置于所有视图之上）
     if let Some(modal) = &app.modal {
@@ -69,9 +70,14 @@ fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// 底部全局快捷键栏
-fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect) {
-    frame.render_widget(Paragraph::new(text::HOTKEY_BAR).style(theme::dim()), area);
+/// 底部全局快捷键栏（未安装页使用独立提示，避免误导）
+fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect, not_installed: bool) {
+    let bar = if not_installed {
+        text::NI_HOTKEY_BAR
+    } else {
+        text::HOTKEY_BAR
+    };
+    frame.render_widget(Paragraph::new(bar).style(theme::dim()), area);
 }
 
 #[cfg(test)]
