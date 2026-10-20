@@ -46,8 +46,16 @@ impl MockUwfBackend {
             critical_mb: 1843,
             consumption_mb: 512,
             volumes: vec![
-                MockVolume { letter: "C:".into(), current: true, next: true },
-                MockVolume { letter: "D:".into(), current: false, next: false },
+                MockVolume {
+                    letter: "C:".into(),
+                    current: true,
+                    next: true,
+                },
+                MockVolume {
+                    letter: "D:".into(),
+                    current: false,
+                    next: false,
+                },
             ],
             file_excl_current: vec![],
             file_excl_next: vec![FileExclusion::new("C:".into(), "\\Windows\\Temp".into())],
@@ -154,7 +162,9 @@ impl UwfBackend for MockUwfBackend {
     fn set_overlay_type(&mut self, overlay_type: OverlayType) -> Result<()> {
         // R1：筛选器当前启用时锁定
         if self.filter_current {
-            return Err(UwfError::FilterCurrentlyEnabled { what: "Overlay 类型" });
+            return Err(UwfError::FilterCurrentlyEnabled {
+                what: "Overlay 类型",
+            });
         }
         self.overlay_type_next = overlay_type;
         Ok(())
@@ -162,7 +172,9 @@ impl UwfBackend for MockUwfBackend {
 
     fn set_overlay_max_size(&mut self, size_mb: u32) -> Result<()> {
         if self.filter_current {
-            return Err(UwfError::FilterCurrentlyEnabled { what: "Overlay 最大容量" });
+            return Err(UwfError::FilterCurrentlyEnabled {
+                what: "Overlay 最大容量",
+            });
         }
         self.max_size_next = size_mb;
         Ok(())

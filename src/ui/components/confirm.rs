@@ -34,8 +34,16 @@ pub enum ConfirmOutcome {
 }
 
 impl ConfirmState {
-    pub fn new(title: impl Into<String>, message: impl Into<String>, action: ConfirmAction) -> Self {
-        Self { title: title.into(), message: message.into(), action }
+    pub fn new(
+        title: impl Into<String>,
+        message: impl Into<String>,
+        action: ConfirmAction,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            message: message.into(),
+            action,
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> ConfirmOutcome {
@@ -62,7 +70,9 @@ pub fn render(frame: &mut Frame, state: &ConfirmState, area: Rect) {
         Line::styled("[Enter] 确认    [Esc / N] 取消", theme::dim()),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(block).alignment(Alignment::Center),
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
         rect,
     );
 }

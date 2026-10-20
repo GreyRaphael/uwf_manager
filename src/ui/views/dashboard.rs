@@ -29,7 +29,10 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::raw("  当前状态: "),
                 status_dot(state.current_enabled),
-                Span::raw(format!(" {}      下次启动: ", text::enabled_zh(state.current_enabled))),
+                Span::raw(format!(
+                    " {}      下次启动: ",
+                    text::enabled_zh(state.current_enabled)
+                )),
                 status_dot(state.next_enabled),
                 Span::raw(format!(" {}", text::enabled_zh(state.next_enabled))),
             ]),
@@ -40,7 +43,11 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                     theme::dim(),
                 ),
                 Span::styled(
-                    if app.pending { "   ⏳ 执行中…" } else { "" },
+                    if app.pending {
+                        "   ⏳ 执行中…"
+                    } else {
+                        ""
+                    },
                     theme::warn(),
                 ),
             ]),

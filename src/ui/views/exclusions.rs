@@ -23,15 +23,16 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let files = List::new(file_items)
         .block(
             Block::bordered()
-                .title(format!("[文件排除项] {session_label}  [A] 添加 [I] 导入 [X] 导出"))
+                .title(format!(
+                    "[文件排除项] {session_label}  [A] 添加 [I] 导入 [X] 导出"
+                ))
                 .border_style(theme::focus_border(files_focused)),
         )
         .highlight_style(theme::selected())
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(files, files_area, &mut app.file_exclusion_state);
 
-    let registry_items =
-        items_or_empty(app.visible_registry_exclusions().iter().cloned());
+    let registry_items = items_or_empty(app.visible_registry_exclusions().iter().cloned());
     let registry = List::new(registry_items)
         .block(
             Block::bordered()

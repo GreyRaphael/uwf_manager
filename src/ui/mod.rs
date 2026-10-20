@@ -55,7 +55,11 @@ fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let line = match app.log.back() {
         Some(entry) => ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(
-                format!("{} [{}] ", entry.time, if entry.ok { "成功" } else { "失败" }),
+                format!(
+                    "{} [{}] ",
+                    entry.time,
+                    if entry.ok { "成功" } else { "失败" }
+                ),
                 if entry.ok { theme::ok() } else { theme::err() },
             ),
             ratatui::text::Span::raw(&entry.text),
@@ -67,10 +71,7 @@ fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// 底部全局快捷键栏
 fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect) {
-    frame.render_widget(
-        Paragraph::new(text::HOTKEY_BAR).style(theme::dim()),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text::HOTKEY_BAR).style(theme::dim()), area);
 }
 
 #[cfg(test)]
@@ -117,7 +118,10 @@ mod tests {
         assert!(screen.contains("Mock演示数据"), "缺少后端徽标:\n{screen}");
         assert!(screen.contains("当前状态"), "缺少筛选器状态:\n{screen}");
         assert!(screen.contains("2048MB"), "缺少 Overlay 上限:\n{screen}");
-        assert!(screen.contains("已用:512MB/2048MB"), "缺少 Gauge 文案:\n{screen}");
+        assert!(
+            screen.contains("已用:512MB/2048MB"),
+            "缺少 Gauge 文案:\n{screen}"
+        );
         assert!(screen.contains("C:"), "缺少卷摘要:\n{screen}");
     }
 
@@ -127,11 +131,23 @@ mod tests {
         app.not_installed = true;
         let screen = render_to_string(&mut app, 100, 30);
         // D6 引导页：启用命令完整可见
-        assert!(screen.contains("UWF功能未安装"), "缺少引导页标题:\n{screen}");
-        assert!(screen.contains("Enable-WindowsOptionalFeature"), "缺少启用命令:\n{screen}");
-        assert!(screen.contains("Client-UnifiedWriteFilter"), "缺少功能名:\n{screen}");
+        assert!(
+            screen.contains("UWF功能未安装"),
+            "缺少引导页标题:\n{screen}"
+        );
+        assert!(
+            screen.contains("Enable-WindowsOptionalFeature"),
+            "缺少启用命令:\n{screen}"
+        );
+        assert!(
+            screen.contains("Client-UnifiedWriteFilter"),
+            "缺少功能名:\n{screen}"
+        );
         // 正常 Tab 视图被取代
-        assert!(!screen.contains("[2]卷保护管理"), "引导页不应渲染 Tab 栏:\n{screen}");
+        assert!(
+            !screen.contains("[2]卷保护管理"),
+            "引导页不应渲染 Tab 栏:\n{screen}"
+        );
     }
 
     #[test]

@@ -22,7 +22,9 @@ pub fn render(frame: &mut Frame, _app: &App, area: Rect) {
         ]),
         Line::from(vec![
             ratatui::text::Span::styled("  [R] 注册表提交    ", theme::title()),
-            ratatui::text::Span::raw("输入注册表完整路径（如 HKLM\\SOFTWARE\\X\\Value），提交键值修改"),
+            ratatui::text::Span::raw(
+                "输入注册表完整路径（如 HKLM\\SOFTWARE\\X\\Value），提交键值修改",
+            ),
         ]),
         Line::from(""),
         Line::styled(

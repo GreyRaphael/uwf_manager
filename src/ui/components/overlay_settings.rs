@@ -46,7 +46,12 @@ impl OverlaySettingsState {
             .unwrap_or((OverlayType::Ram, String::new()));
         let (warning, critical) = snapshot
             .overlay_runtime
-            .map(|r| (r.warning_threshold_mb.to_string(), r.critical_threshold_mb.to_string()))
+            .map(|r| {
+                (
+                    r.warning_threshold_mb.to_string(),
+                    r.critical_threshold_mb.to_string(),
+                )
+            })
             .unwrap_or_default();
         let lock_type_size = snapshot
             .filter_state
@@ -121,9 +126,7 @@ impl OverlaySettingsState {
                 self.move_selection(1);
                 OverlayOutcome::Stay
             }
-            KeyCode::Left | KeyCode::Right
-                if self.selected == 0 && self.row_enabled(0) =>
-            {
+            KeyCode::Left | KeyCode::Right if self.selected == 0 && self.row_enabled(0) => {
                 self.overlay_type = match self.overlay_type {
                     OverlayType::Ram => OverlayType::Disk,
                     OverlayType::Disk => OverlayType::Ram,
@@ -154,7 +157,11 @@ pub fn render(frame: &mut Frame, state: &OverlaySettingsState, area: Rect) {
 
     let locked = state.lock_type_size;
     let row = |index: usize, label: &str, value: String, locked_row: bool| -> Line<'static> {
-        let cursor = if state.selected == index { "▶ " } else { "  " };
+        let cursor = if state.selected == index {
+            "▶ "
+        } else {
+            "  "
+        };
         let style = if locked_row {
             theme::dim()
         } else if state.selected == index {
@@ -184,11 +191,17 @@ pub fn render(frame: &mut Frame, state: &OverlaySettingsState, area: Rect) {
         Line::from(""),
     ];
     if locked {
-        lines.push(Line::styled("筛选器当前已启用，仅阈值可改（R1）", theme::warn()));
+        lines.push(Line::styled(
+            "筛选器当前已启用，仅阈值可改（R1）",
+            theme::warn(),
+        ));
     }
     if let Some(error) = &state.error {
         lines.push(Line::styled(error.clone(), theme::err()));
     }
-    lines.push(Line::styled("[↑/↓] 选择  [←/→] 切换类型  [Enter] 保存  [Esc] 取消", theme::dim()));
+    lines.push(Line::styled(
+        "[↑/↓] 选择  [←/→] 切换类型  [Enter] 保存  [Esc] 取消",
+        theme::dim(),
+    ));
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }

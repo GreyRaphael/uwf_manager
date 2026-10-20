@@ -316,7 +316,9 @@ impl App {
     fn on_dashboard_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('e') | KeyCode::Char('E') => self.send_mutation(BackendCmd::EnableFilter),
-            KeyCode::Char('d') | KeyCode::Char('D') => self.send_mutation(BackendCmd::DisableFilter),
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.send_mutation(BackendCmd::DisableFilter)
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.modal = Some(Modal::Confirm(ConfirmState::new(
                     "重置配置确认",
@@ -453,10 +455,15 @@ impl App {
     // ── 模态按键与结果执行 ──
 
     fn on_modal_key(&mut self, key: KeyEvent) {
-        let Some(modal) = self.modal.take() else { return };
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
         match modal {
             Modal::Help => {
-                if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+                if !matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+                ) {
                     self.modal = Some(Modal::Help);
                 }
             }
@@ -485,7 +492,12 @@ impl App {
             Modal::OverlaySettings(mut state) => match state.on_key(key) {
                 OverlayOutcome::Stay => self.modal = Some(Modal::OverlaySettings(state)),
                 OverlayOutcome::Cancel => {}
-                OverlayOutcome::Submit { overlay_type, max_mb, warning_mb, critical_mb } => {
+                OverlayOutcome::Submit {
+                    overlay_type,
+                    max_mb,
+                    warning_mb,
+                    critical_mb,
+                } => {
                     self.send_mutation(BackendCmd::SetOverlayConfig {
                         overlay_type,
                         max_mb,
@@ -621,7 +633,10 @@ pub(crate) mod tests {
     /// 与 `MockUwfBackend::demo()` 对齐的快照数据（供 app/ui 测试共用）
     pub(crate) fn demo_snapshot() -> FullSnapshot {
         FullSnapshot {
-            filter_state: Some(FilterState { current_enabled: true, next_enabled: true }),
+            filter_state: Some(FilterState {
+                current_enabled: true,
+                next_enabled: true,
+            }),
             overlay_config_current: Some(OverlayConfig {
                 current_session: true,
                 overlay_type: OverlayType::Ram,
@@ -651,10 +666,7 @@ pub(crate) mod tests {
                 },
             ],
             file_exclusions_current: vec![],
-            file_exclusions_next: vec![FileExclusion::new(
-                "C:".into(),
-                "\\Windows\\Temp".into(),
-            )],
+            file_exclusions_next: vec![FileExclusion::new("C:".into(), "\\Windows\\Temp".into())],
             registry_exclusions_current: vec![],
             registry_exclusions_next: vec!["HKLM\\SOFTWARE\\UwfManagerDemo".into()],
         }
@@ -728,7 +740,10 @@ pub(crate) mod tests {
 
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
         app.on_dashboard_key(key(KeyCode::Char('e')));
-        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::EnableFilter));
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            BackendCmd::EnableFilter
+        ));
         assert!(app.pending);
         // 在途期间第二条变更被忽略（PLAN §6.5 单变更在途）
         app.on_dashboard_key(key(KeyCode::Char('d')));
@@ -737,7 +752,10 @@ pub(crate) mod tests {
         app.apply_event(BackendEvent::OpOk("ok".into()));
         assert!(!app.pending);
         app.on_dashboard_key(key(KeyCode::Char('d')));
-        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::DisableFilter));
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            BackendCmd::DisableFilter
+        ));
     }
 
     #[test]
@@ -810,16 +828,26 @@ pub(crate) mod tests {
         assert!(matches!(app.modal, Some(Modal::Confirm(_))));
         app.on_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
-        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::RestartSystem));
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            BackendCmd::RestartSystem
+        ));
         app.apply_event(BackendEvent::OpOk("系统即将重启".into()));
         assert!(!app.should_quit);
-        assert!(app.log.back().is_some_and(|e| e.text.contains("（模拟）已重启")));
+        assert!(
+            app.log
+                .back()
+                .is_some_and(|e| e.text.contains("（模拟）已重启"))
+        );
 
         // Windows：真实重启，退出 TUI 让位
         let (mut app, cmd_rx) = ready_app(BackendKind::Windows);
         app.on_key(key(KeyCode::F(10)));
         app.on_key(key(KeyCode::Enter));
-        assert!(matches!(cmd_rx.try_recv().unwrap(), BackendCmd::RestartSystem));
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            BackendCmd::RestartSystem
+        ));
         app.apply_event(BackendEvent::OpOk("系统即将重启".into()));
         assert!(app.should_quit);
     }
@@ -855,7 +883,10 @@ pub(crate) mod tests {
         // 当前禁用 → 不锁定
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
         let mut snapshot = demo_snapshot();
-        snapshot.filter_state = Some(FilterState { current_enabled: false, next_enabled: false });
+        snapshot.filter_state = Some(FilterState {
+            current_enabled: false,
+            next_enabled: false,
+        });
         app.apply_event(BackendEvent::Snapshot(Box::new(snapshot)));
         app.on_dashboard_key(key(KeyCode::Char('s')));
         let Some(Modal::OverlaySettings(state)) = &app.modal else {
@@ -868,7 +899,10 @@ pub(crate) mod tests {
     #[test]
     fn commit_file_deletion_requires_confirm() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.execute_pick(PickerAction::CommitFileDeletion, PathBuf::from("C:\\data\\a.txt"));
+        app.execute_pick(
+            PickerAction::CommitFileDeletion,
+            PathBuf::from("C:\\data\\a.txt"),
+        );
         assert!(matches!(app.modal, Some(Modal::Confirm(_))));
         app.on_key(key(KeyCode::Enter));
         match cmd_rx.try_recv().unwrap() {

@@ -21,9 +21,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wmi::WMIConnection;
 
-use classes::*;
 use crate::error::{Result, UwfError};
 use crate::model::*;
+use classes::*;
 
 use super::UwfBackend;
 
@@ -78,7 +78,10 @@ impl WindowsWmiBackend {
         if out.ReturnValue == 0 {
             Ok(())
         } else {
-            Err(UwfError::WmiMethod { method, code: out.ReturnValue })
+            Err(UwfError::WmiMethod {
+                method,
+                code: out.ReturnValue,
+            })
         }
     }
 
@@ -86,18 +89,12 @@ impl WindowsWmiBackend {
 
     /// UWF_Filter 单例；查询失败或为空 → UWF 功能未安装
     fn filter_instance(&mut self) -> Result<UWF_Filter> {
-        let rows: Vec<UWF_Filter> = self
-            .con()?
-            .query()
-            .map_err(|_| UwfError::NotInstalled)?;
+        let rows: Vec<UWF_Filter> = self.con()?.query().map_err(|_| UwfError::NotInstalled)?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
     fn overlay_instance(&mut self) -> Result<UWF_Overlay> {
-        let rows: Vec<UWF_Overlay> = self
-            .con()?
-            .query()
-            .map_err(|_| UwfError::NotInstalled)?;
+        let rows: Vec<UWF_Overlay> = self.con()?.query().map_err(|_| UwfError::NotInstalled)?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
@@ -223,7 +220,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_OverlayConfig, _>(
             &path,
             "SetType",
-            TypeParam { r#type: overlay_type.as_u32() },
+            TypeParam {
+                r#type: overlay_type.as_u32(),
+            },
         )?;
         Self::ensure_ok("SetType", out)
     }
@@ -241,11 +240,8 @@ impl UwfBackend for WindowsWmiBackend {
 
     fn set_warning_threshold(&mut self, size_mb: u32) -> Result<()> {
         let path = self.overlay_instance()?.path;
-        let out: ReturnOnly = self.exec::<UWF_Overlay, _>(
-            &path,
-            "SetWarningThreshold",
-            SizeParam { size: size_mb },
-        )?;
+        let out: ReturnOnly =
+            self.exec::<UWF_Overlay, _>(&path, "SetWarningThreshold", SizeParam { size: size_mb })?;
         Self::ensure_ok("SetWarningThreshold", out)
     }
 
@@ -303,7 +299,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "CommitFile",
-            FileNameParam { FileName: file_rel_path.to_string() },
+            FileNameParam {
+                FileName: file_rel_path.to_string(),
+            },
         )?;
         Self::ensure_ok("CommitFile", out)
     }
@@ -321,7 +319,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "CommitFileDeletion",
-            FileNameParam { FileName: file_rel_path.to_string() },
+            FileNameParam {
+                FileName: file_rel_path.to_string(),
+            },
         )?;
         Self::ensure_ok("CommitFileDeletion", out)
     }
@@ -332,8 +332,8 @@ impl UwfBackend for WindowsWmiBackend {
         let mut items = Vec::new();
         for volume in self.volumes_for(current_session)? {
             // 与原版一致：单卷 GetExclusions 失败跳过该卷继续
-            let Ok(out) = self
-                .exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
+            let Ok(out) =
+                self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
             else {
                 continue;
             };
@@ -341,7 +341,10 @@ impl UwfBackend for WindowsWmiBackend {
                 continue;
             }
             for file in out.ExcludedFiles.unwrap_or_default() {
-                items.push(FileExclusion::new(volume.DriveLetter.clone(), file.FileName));
+                items.push(FileExclusion::new(
+                    volume.DriveLetter.clone(),
+                    file.FileName,
+                ));
             }
         }
         items.sort();
@@ -354,7 +357,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "AddExclusion",
-            FileNameParam { FileName: file_rel_path.to_string() },
+            FileNameParam {
+                FileName: file_rel_path.to_string(),
+            },
         )?;
         Self::ensure_ok("AddExclusion", out)
     }
@@ -364,7 +369,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "RemoveExclusion",
-            FileNameParam { FileName: file_rel_path.to_string() },
+            FileNameParam {
+                FileName: file_rel_path.to_string(),
+            },
         )?;
         Self::ensure_ok("RemoveExclusion", out)
     }
@@ -392,7 +399,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
             &path,
             "AddExclusion",
-            RegistryKeyParam { RegistryKey: key.to_string() },
+            RegistryKeyParam {
+                RegistryKey: key.to_string(),
+            },
         )?;
         Self::ensure_ok("AddExclusion", out)
     }
@@ -402,7 +411,9 @@ impl UwfBackend for WindowsWmiBackend {
         let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
             &path,
             "RemoveExclusion",
-            RegistryKeyParam { RegistryKey: key.to_string() },
+            RegistryKeyParam {
+                RegistryKey: key.to_string(),
+            },
         )?;
         Self::ensure_ok("RemoveExclusion", out)
     }

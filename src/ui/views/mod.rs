@@ -21,12 +21,11 @@ pub fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
         .style(theme::dim())
         .highlight_style(theme::title())
         .divider("  ");
-    let [tabs_area, badge_area] =
-        ratatui::layout::Layout::horizontal([
-            ratatui::layout::Constraint::Min(40),
-            ratatui::layout::Constraint::Length(18),
-        ])
-        .areas(area);
+    let [tabs_area, badge_area] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Min(40),
+        ratatui::layout::Constraint::Length(18),
+    ])
+    .areas(area);
     frame.render_widget(tabs, tabs_area);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(text::backend_badge(app.backend_kind)).style(theme::dim()),

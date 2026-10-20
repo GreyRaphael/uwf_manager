@@ -9,7 +9,9 @@ pub type Result<T> = std::result::Result<T, UwfError>;
 #[derive(Debug, Error)]
 pub enum UwfError {
     /// UWF 功能未安装或未启用（触发 D6 引导页）
-    #[error("UWF 功能未安装或未启用。请在管理员 PowerShell 中执行：Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter")]
+    #[error(
+        "UWF 功能未安装或未启用。请在管理员 PowerShell 中执行：Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter"
+    )]
     NotInstalled,
 
     /// WMI 方法返回非零 ReturnValue（uwfmgr 风格十六进制错误码）

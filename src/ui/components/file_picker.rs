@@ -2,16 +2,16 @@
 //!
 //! 跨平台：Linux 从 `/` 起导航；Windows 以盘符列表为根（`A:`-`Z:` 探测存在性）。
 
-use std::path::PathBuf;
 #[cfg(windows)]
 use std::path::Path;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
-use ratatui::layout::{Constraint, Layout};
 
 use crate::ui::theme;
 
@@ -206,7 +206,10 @@ pub fn render(frame: &mut Frame, state: &FilePickerState, area: Rect) {
 
     let items: Vec<ListItem> = if state.entries.is_empty() {
         vec![ListItem::new(Line::styled(
-            state.error.clone().unwrap_or_else(|| "（空目录）".to_string()),
+            state
+                .error
+                .clone()
+                .unwrap_or_else(|| "（空目录）".to_string()),
             theme::dim(),
         ))]
     } else {
@@ -218,12 +221,18 @@ pub fn render(frame: &mut Frame, state: &FilePickerState, area: Rect) {
                 let sep = std::path::MAIN_SEPARATOR;
                 let line = if entry.is_dir {
                     Line::from(vec![
-                        Span::styled(if i == state.selected { "▶ " } else { "  " }, theme::title()),
+                        Span::styled(
+                            if i == state.selected { "▶ " } else { "  " },
+                            theme::title(),
+                        ),
                         Span::styled(format!("{}{sep}", entry.name), theme::title()),
                     ])
                 } else {
                     Line::from(vec![
-                        Span::styled(if i == state.selected { "▶ " } else { "  " }, theme::title()),
+                        Span::styled(
+                            if i == state.selected { "▶ " } else { "  " },
+                            theme::title(),
+                        ),
                         Span::raw(&entry.name),
                     ])
                 };

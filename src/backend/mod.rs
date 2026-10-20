@@ -112,9 +112,14 @@ pub enum BackendCmd {
     /// 注册表完整路径，线程内按 R5 拆分
     CommitRegistry(String),
     /// 逐行解析：`HK` 前缀 → 注册表排除，其余 → 文件排除
-    ImportExclusions { path: PathBuf },
+    ImportExclusions {
+        path: PathBuf,
+    },
     /// 导出 UI 当前视图（current_session 由 UI 传入）
-    ExportExclusions { path: PathBuf, current_session: bool },
+    ExportExclusions {
+        path: PathBuf,
+        current_session: bool,
+    },
     RestartSystem,
     ShutdownSystem,
     /// 结束后端线程
@@ -191,16 +196,30 @@ fn handle_cmd(backend: &mut dyn UwfBackend, cmd: BackendCmd, tx: &Sender<Backend
             Ok(runtime) => send(tx, BackendEvent::OverlayRuntime(runtime)),
             Err(e) => send_err(tx, e),
         },
-        BackendCmd::EnableFilter => {
-            mutate(backend, tx, |b| b.enable_filter(), "UWF 将在下次系统重启后启用")
-        }
-        BackendCmd::DisableFilter => {
-            mutate(backend, tx, |b| b.disable_filter(), "UWF 将在下次系统重启后禁用")
-        }
-        BackendCmd::ResetSettings => {
-            mutate(backend, tx, |b| b.reset_settings(), "UWF 配置将在下次重启后重置为默认值")
-        }
-        BackendCmd::SetOverlayConfig { overlay_type, max_mb, warning_mb, critical_mb } => {
+        BackendCmd::EnableFilter => mutate(
+            backend,
+            tx,
+            |b| b.enable_filter(),
+            "UWF 将在下次系统重启后启用",
+        ),
+        BackendCmd::DisableFilter => mutate(
+            backend,
+            tx,
+            |b| b.disable_filter(),
+            "UWF 将在下次系统重启后禁用",
+        ),
+        BackendCmd::ResetSettings => mutate(
+            backend,
+            tx,
+            |b| b.reset_settings(),
+            "UWF 配置将在下次重启后重置为默认值",
+        ),
+        BackendCmd::SetOverlayConfig {
+            overlay_type,
+            max_mb,
+            warning_mb,
+            critical_mb,
+        } => {
             mutate_with(backend, tx, |b| {
                 // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定其余两项）
                 let locked = b.get_filter_state()?.current_enabled;
@@ -217,63 +236,62 @@ fn handle_cmd(backend: &mut dyn UwfBackend, cmd: BackendCmd, tx: &Sender<Backend
                 })
             })
         }
-        BackendCmd::Protect(drive) => {
-            mutate(backend, tx, |b| b.protect_volume(&drive), format!("{drive} 保护成功（下次启动生效）"))
-        }
-        BackendCmd::Unprotect(drive) => {
-            mutate(backend, tx, |b| b.unprotect_volume(&drive), format!("{drive} 已取消保护（下次启动生效）"))
-        }
-        BackendCmd::AddFileExclusion(path) => {
-            mutate_with(backend, tx, |b| {
-                let (drive, rel) = split_absolute_path(&path)?;
-                b.add_file_exclusion(&drive, &rel)?;
-                Ok(format!("已添加文件排除: {path}"))
-            })
-        }
-        BackendCmd::RemoveFileExclusion(path) => {
-            mutate_with(backend, tx, |b| {
-                let (drive, rel) = split_absolute_path(&path)?;
-                b.remove_file_exclusion(&drive, &rel)?;
-                Ok(format!("已删除文件排除: {path}"))
-            })
-        }
-        BackendCmd::AddRegistryExclusion(key) => {
-            mutate(backend, tx, |b| b.add_registry_exclusion(&key), format!("已添加注册表排除: {key}"))
-        }
-        BackendCmd::RemoveRegistryExclusion(key) => {
-            mutate(backend, tx, |b| b.remove_registry_exclusion(&key), format!("已删除注册表排除: {key}"))
-        }
-        BackendCmd::CommitFile(path) => {
-            mutate_with(backend, tx, |b| {
-                let (drive, rel) = split_absolute_path(&path)?;
-                b.commit_file(&drive, &rel)?;
-                Ok(format!("{path} 提交成功"))
-            })
-        }
-        BackendCmd::CommitFileDeletion(path) => {
-            mutate_with(backend, tx, |b| {
-                let (drive, rel) = split_absolute_path(&path)?;
-                b.commit_file_deletion(&drive, &rel)?;
-                Ok(format!("{path} 删除提交成功"))
-            })
-        }
-        BackendCmd::CommitRegistry(full_path) => {
-            mutate_with(backend, tx, |b| {
-                let (key, value) = split_registry_path(&full_path)?;
-                b.commit_registry(&key, &value)?;
-                Ok(format!("注册表 {full_path} 提交成功"))
-            })
-        }
+        BackendCmd::Protect(drive) => mutate(
+            backend,
+            tx,
+            |b| b.protect_volume(&drive),
+            format!("{drive} 保护成功（下次启动生效）"),
+        ),
+        BackendCmd::Unprotect(drive) => mutate(
+            backend,
+            tx,
+            |b| b.unprotect_volume(&drive),
+            format!("{drive} 已取消保护（下次启动生效）"),
+        ),
+        BackendCmd::AddFileExclusion(path) => mutate_with(backend, tx, |b| {
+            let (drive, rel) = split_absolute_path(&path)?;
+            b.add_file_exclusion(&drive, &rel)?;
+            Ok(format!("已添加文件排除: {path}"))
+        }),
+        BackendCmd::RemoveFileExclusion(path) => mutate_with(backend, tx, |b| {
+            let (drive, rel) = split_absolute_path(&path)?;
+            b.remove_file_exclusion(&drive, &rel)?;
+            Ok(format!("已删除文件排除: {path}"))
+        }),
+        BackendCmd::AddRegistryExclusion(key) => mutate(
+            backend,
+            tx,
+            |b| b.add_registry_exclusion(&key),
+            format!("已添加注册表排除: {key}"),
+        ),
+        BackendCmd::RemoveRegistryExclusion(key) => mutate(
+            backend,
+            tx,
+            |b| b.remove_registry_exclusion(&key),
+            format!("已删除注册表排除: {key}"),
+        ),
+        BackendCmd::CommitFile(path) => mutate_with(backend, tx, |b| {
+            let (drive, rel) = split_absolute_path(&path)?;
+            b.commit_file(&drive, &rel)?;
+            Ok(format!("{path} 提交成功"))
+        }),
+        BackendCmd::CommitFileDeletion(path) => mutate_with(backend, tx, |b| {
+            let (drive, rel) = split_absolute_path(&path)?;
+            b.commit_file_deletion(&drive, &rel)?;
+            Ok(format!("{path} 删除提交成功"))
+        }),
+        BackendCmd::CommitRegistry(full_path) => mutate_with(backend, tx, |b| {
+            let (key, value) = split_registry_path(&full_path)?;
+            b.commit_registry(&key, &value)?;
+            Ok(format!("注册表 {full_path} 提交成功"))
+        }),
         BackendCmd::ImportExclusions { path } => import_exclusions(backend, tx, &path),
-        BackendCmd::ExportExclusions { path, current_session } => {
-            export_exclusions(backend, tx, &path, current_session)
-        }
-        BackendCmd::RestartSystem => {
-            mutate(backend, tx, |b| b.restart_system(), "系统即将重启")
-        }
-        BackendCmd::ShutdownSystem => {
-            mutate(backend, tx, |b| b.shutdown_system(), "系统即将关机")
-        }
+        BackendCmd::ExportExclusions {
+            path,
+            current_session,
+        } => export_exclusions(backend, tx, &path, current_session),
+        BackendCmd::RestartSystem => mutate(backend, tx, |b| b.restart_system(), "系统即将重启"),
+        BackendCmd::ShutdownSystem => mutate(backend, tx, |b| b.shutdown_system(), "系统即将关机"),
         BackendCmd::Quit => unreachable!("Quit 由线程循环拦截"),
     }
 }
@@ -385,7 +403,10 @@ fn export_exclusions(
         Ok(lines.len())
     })();
     match result {
-        Ok(count) => send(tx, BackendEvent::OpOk(format!("已导出 {count} 项至 {}", path.display()))),
+        Ok(count) => send(
+            tx,
+            BackendEvent::OpOk(format!("已导出 {count} 项至 {}", path.display())),
+        ),
         Err(e) => send_err(tx, e),
     }
 }
@@ -423,7 +444,9 @@ pub fn split_registry_path(path: &str) -> Result<(String, String)> {
         Some((key, value)) if !key.is_empty() && !value.is_empty() => {
             Ok((key.to_string(), value.to_string()))
         }
-        _ => Err(UwfError::InvalidPath(format!("注册表路径须包含键与值名称: {path}"))),
+        _ => Err(UwfError::InvalidPath(format!(
+            "注册表路径须包含键与值名称: {path}"
+        ))),
     }
 }
 
@@ -467,7 +490,10 @@ mod tests {
     #[test]
     fn r5_split_registry_path() {
         let (key, value) = split_registry_path("HKLM\\SOFTWARE\\X\\MyValue").unwrap();
-        assert_eq!((key.as_str(), value.as_str()), ("HKLM\\SOFTWARE\\X", "MyValue"));
+        assert_eq!(
+            (key.as_str(), value.as_str()),
+            ("HKLM\\SOFTWARE\\X", "MyValue")
+        );
         // 完全无反斜杠时报错；"HKLM\\SOFTWARE" 按规则可拆为 (HKLM, SOFTWARE)，合法
         assert!(matches!(
             split_registry_path("NOSPLIT"),

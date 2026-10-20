@@ -21,11 +21,15 @@ pub fn dim() -> Style {
 }
 
 pub fn title() -> Style {
-    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn selected() -> Style {
-    Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn gauge(level: UsageLevel) -> Style {

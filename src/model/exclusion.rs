@@ -9,7 +9,10 @@ pub struct FileExclusion {
 
 impl FileExclusion {
     pub fn new(drive_letter: String, file_rel_path: String) -> Self {
-        Self { drive_letter, file_rel_path }
+        Self {
+            drive_letter,
+            file_rel_path,
+        }
     }
 
     /// 展示用绝对路径，如 `C:\Windows\Temp`

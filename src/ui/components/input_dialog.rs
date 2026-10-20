@@ -95,5 +95,8 @@ pub fn render(frame: &mut Frame, state: &InputState, area: Rect) {
 
     // 显示文本光标（CJK 宽字符按 1 计，路径输入以 ASCII 为主，可接受）
     let cursor_x = rect.x + 4 + state.buffer.chars().count() as u16;
-    frame.set_cursor_position(Position::new(cursor_x.min(rect.x + rect.width - 2), rect.y + 3));
+    frame.set_cursor_position(Position::new(
+        cursor_x.min(rect.x + rect.width - 2),
+        rect.y + 3,
+    ));
 }
