@@ -276,33 +276,15 @@ impl UwfBackend for WindowsWmiBackend {
 
     fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
         // R2 / PLAN：current/next 两次查询按盘符合并，next-only 卷也必须可见。
-        let current = self.volumes_for(true)?;
-        let next = self.volumes_for(false)?;
-        let mut map: std::collections::BTreeMap<String, VolumeInfo> =
-            std::collections::BTreeMap::new();
-
-        for v in current {
-            let key = v.DriveLetter.to_ascii_uppercase();
-            map.insert(
-                key,
-                VolumeInfo {
-                    drive_letter: v.DriveLetter,
-                    current_protected: v.Protected.unwrap_or(false),
-                    next_protected: false,
-                },
-            );
-        }
-        for v in next {
-            let key = v.DriveLetter.to_ascii_uppercase();
-            let entry = map.entry(key).or_insert_with(|| VolumeInfo {
-                drive_letter: v.DriveLetter.clone(),
-                current_protected: false,
-                next_protected: false,
-            });
-            entry.next_protected = v.Protected.unwrap_or(false);
-        }
-
-        Ok(map.into_values().collect())
+        let current = self
+            .volumes_for(true)?
+            .into_iter()
+            .map(|v| (v.DriveLetter, v.Protected.unwrap_or(false)));
+        let next = self
+            .volumes_for(false)?
+            .into_iter()
+            .map(|v| (v.DriveLetter, v.Protected.unwrap_or(false)));
+        Ok(super::merge_volume_infos(current, next))
     }
 
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {

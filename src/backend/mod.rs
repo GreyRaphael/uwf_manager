@@ -624,6 +624,37 @@ fn export_exclusions(
     }
 }
 
+/// R2：合并 current/next 两次卷查询（按盘符，大小写归一）。
+/// 抽成纯函数便于在非 Windows 平台覆盖 T14（next-only 卷）。
+#[cfg(any(windows, test))]
+pub(crate) fn merge_volume_infos(
+    current: impl IntoIterator<Item = (String, bool)>,
+    next: impl IntoIterator<Item = (String, bool)>,
+) -> Vec<VolumeInfo> {
+    let mut map: std::collections::BTreeMap<String, VolumeInfo> = std::collections::BTreeMap::new();
+    for (drive, protected) in current {
+        let key = drive.to_ascii_uppercase();
+        map.insert(
+            key,
+            VolumeInfo {
+                drive_letter: drive,
+                current_protected: protected,
+                next_protected: false,
+            },
+        );
+    }
+    for (drive, protected) in next {
+        let key = drive.to_ascii_uppercase();
+        let entry = map.entry(key).or_insert_with(|| VolumeInfo {
+            drive_letter: drive,
+            current_protected: false,
+            next_protected: false,
+        });
+        entry.next_protected = protected;
+    }
+    map.into_values().collect()
+}
+
 /// R6：绝对路径 → (盘符, 相对路径)。
 /// 如 `"C:\Windows\a.txt"` → `("C:", "\Windows\a.txt")`（相对路径保留前导 `\`，
 /// 与原版 `FileName.Remove(0, 2)` 一致）。
@@ -870,5 +901,23 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn volume_union_includes_next_only() {
+        let merged = merge_volume_infos(
+            vec![("C:".to_string(), true)],
+            vec![("c:".to_string(), false), ("D:".to_string(), true)],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(
+            merged
+                .iter()
+                .any(|v| v.drive_letter == "C:" && v.current_protected)
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|v| v.drive_letter == "D:" && !v.current_protected && v.next_protected)
+        );
     }
 }
