@@ -30,8 +30,13 @@ Windows 统一写入筛选器（UWF）的终端用户界面（TUI）管理工具
 
 ```bash
 cargo run          # 非 Windows 平台自动使用 Mock 后端
-cargo run -- --mock  # 任意平台强制 Mock（Windows 上免管理员预览）
+cargo run -- --mock  # 任意平台强制 Mock
 ```
+
+> Windows 注意：`--mock` 只跳过运行时的管理员检测，**不会改变内嵌的
+> `requireAdministrator` manifest**。因此从资源管理器/终端启动 exe 时仍会
+> 触发 UAC；如需完全免提权的预览构建，需要单独的 `asInvoker` manifest
+> 或独立 mock 二进制（当前未提供）。
 
 ### Windows 本机构建
 

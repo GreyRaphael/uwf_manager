@@ -54,17 +54,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// 底部操作日志（最近一条）
 fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let line = match app.log.back() {
-        Some(entry) => ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                format!(
-                    "{} [{}] ",
-                    entry.time,
-                    if entry.ok { "成功" } else { "失败" }
-                ),
-                if entry.ok { theme::ok() } else { theme::err() },
-            ),
-            ratatui::text::Span::raw(&entry.text),
-        ]),
+        Some(entry) => {
+            let (label, style) = match entry.level {
+                crate::app::LogLevel::Ok => ("成功", theme::ok()),
+                crate::app::LogLevel::Warn => ("警告", theme::warn()),
+                crate::app::LogLevel::Err => ("失败", theme::err()),
+            };
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(format!("{} [{label}] ", entry.time), style),
+                ratatui::text::Span::raw(&entry.text),
+            ])
+        }
         None => ratatui::text::Line::from(ratatui::text::Span::styled(text::READY, theme::dim())),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -118,7 +118,6 @@ mod tests {
     fn dashboard_renders_snapshot() {
         let mut app = test_app();
         app.snapshot = demo_snapshot();
-        app.overlay_runtime = app.snapshot.overlay_runtime;
         let screen = render_to_string(&mut app, 100, 30);
         assert!(screen.contains("[1]状态概览"), "缺少 Tab 标签:\n{screen}");
         assert!(screen.contains("Mock演示数据"), "缺少后端徽标:\n{screen}");
@@ -167,5 +166,37 @@ mod tests {
         assert!(screen.contains("Overlay配置"), "缺少弹窗标题:\n{screen}");
         assert!(screen.contains("（已锁定）"), "缺少 R1 锁定标记:\n{screen}");
         assert!(screen.contains("仅阈值可改"), "缺少 R1 提示:\n{screen}");
+    }
+    #[test]
+    fn gauge_uses_current_session_max() {
+        use crate::model::{OverlayConfig, OverlayRuntime, OverlayType};
+        let mut app = test_app();
+        app.snapshot = demo_snapshot();
+        app.snapshot.overlay_config_current = Some(OverlayConfig {
+            current_session: true,
+            overlay_type: OverlayType::Ram,
+            max_size_mb: 2048,
+        });
+        app.snapshot.overlay_config_next = Some(OverlayConfig {
+            current_session: false,
+            overlay_type: OverlayType::Ram,
+            max_size_mb: 4096,
+        });
+        app.snapshot.overlay_runtime = Some(OverlayRuntime {
+            available_space_mb: 1536,
+            consumption_mb: 512,
+            warning_threshold_mb: 1536,
+            critical_threshold_mb: 1843,
+        });
+        let screen = render_to_string(&mut app, 100, 30);
+        assert!(
+            screen.contains("已用:512MB/2048MB"),
+            "Gauge 应使用 current 上限:\n{screen}"
+        );
+        assert!(screen.contains("25%"), "百分比应为 25%:\n{screen}");
+        assert!(
+            !screen.contains("已用:512MB/4096MB"),
+            "不应使用 next 上限:\n{screen}"
+        );
     }
 }

@@ -37,13 +37,18 @@ fn session_kw(current_session: bool) -> &'static str {
 
 pub struct WindowsWmiBackend {
     con: Option<WMIConnection>,
+    /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot 取走
+    warnings: Vec<String>,
 }
 
 impl WindowsWmiBackend {
     /// 懒连接：首次调用时才初始化 COM 并连接命名空间（保证 COM 初始化
     /// 发生在后端线程内）
     pub fn new() -> Self {
-        Self { con: None }
+        Self {
+            con: None,
+            warnings: Vec::new(),
+        }
     }
 
     fn con(&mut self) -> Result<&WMIConnection> {
@@ -259,26 +264,34 @@ impl UwfBackend for WindowsWmiBackend {
     // ── Volume ──
 
     fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
+        // R2 / PLAN：current/next 两次查询按盘符合并，next-only 卷也必须可见。
         let current = self.volumes_for(true)?;
         let next = self.volumes_for(false)?;
-        // 与原版一致：以当前会话盘符集为准，下次查询缺失视为不保护
-        let mut infos: Vec<VolumeInfo> = current
-            .iter()
-            .map(|c| {
-                let next_protected = next
-                    .iter()
-                    .find(|n| n.DriveLetter.eq_ignore_ascii_case(&c.DriveLetter))
-                    .and_then(|n| n.Protected)
-                    .unwrap_or(false);
+        let mut map: std::collections::BTreeMap<String, VolumeInfo> =
+            std::collections::BTreeMap::new();
+
+        for v in current {
+            let key = v.DriveLetter.to_ascii_uppercase();
+            map.insert(
+                key,
                 VolumeInfo {
-                    drive_letter: c.DriveLetter.clone(),
-                    current_protected: c.Protected.unwrap_or(false),
-                    next_protected,
-                }
-            })
-            .collect();
-        infos.sort_by(|a, b| a.drive_letter.cmp(&b.drive_letter));
-        Ok(infos)
+                    drive_letter: v.DriveLetter,
+                    current_protected: v.Protected.unwrap_or(false),
+                    next_protected: false,
+                },
+            );
+        }
+        for v in next {
+            let key = v.DriveLetter.to_ascii_uppercase();
+            let entry = map.entry(key).or_insert_with(|| VolumeInfo {
+                drive_letter: v.DriveLetter.clone(),
+                current_protected: false,
+                next_protected: false,
+            });
+            entry.next_protected = v.Protected.unwrap_or(false);
+        }
+
+        Ok(map.into_values().collect())
     }
 
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {
@@ -347,15 +360,24 @@ impl UwfBackend for WindowsWmiBackend {
     fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
         let mut items = Vec::new();
         for volume in self.volumes_for(current_session)? {
-            // 与原版一致：单卷 GetExclusions 失败跳过该卷继续
-            let Ok(out) =
-                self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
-            else {
-                continue;
-            };
-            if out.ReturnValue != 0 {
-                continue;
-            }
+            // P1-6：单卷失败继续读其他卷，但必须留下警告，不能静默显示为空。
+            let out =
+                match self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
+                {
+                    Ok(out) if out.ReturnValue == 0 => out,
+                    Ok(out) => {
+                        self.warnings.push(format!(
+                            "卷 {} 读取排除项失败: ReturnValue=0x{:08X}",
+                            volume.DriveLetter, out.ReturnValue
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        self.warnings
+                            .push(format!("卷 {} 读取排除项失败: {e}", volume.DriveLetter));
+                        continue;
+                    }
+                };
             for file in out.ExcludedFiles.unwrap_or_default() {
                 items.push(FileExclusion::new(
                     volume.DriveLetter.clone(),
@@ -365,6 +387,10 @@ impl UwfBackend for WindowsWmiBackend {
         }
         items.sort();
         Ok(items)
+    }
+
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     fn add_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {

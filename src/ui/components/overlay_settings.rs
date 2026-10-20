@@ -17,6 +17,8 @@ use super::centered_rect;
 pub struct OverlaySettingsState {
     pub overlay_type: OverlayType,
     pub max_size: String,
+    /// 锁定状态下使用快照中的原始上限，不依赖输入框字符串
+    locked_max_size: Option<u32>,
     pub warning: String,
     pub critical: String,
     /// 当前选中行：0=类型 1=上限 2=预警 3=临界
@@ -40,10 +42,16 @@ pub enum OverlayOutcome {
 impl OverlaySettingsState {
     /// 从快照预填：类型/上限取下次会话配置（可改的是下次），阈值取运行时值
     pub fn from_snapshot(snapshot: &FullSnapshot) -> Self {
-        let (overlay_type, max_size) = snapshot
+        let (overlay_type, max_size, locked_max_size) = snapshot
             .overlay_config_next
-            .map(|c| (c.overlay_type, c.max_size_mb.to_string()))
-            .unwrap_or((OverlayType::Ram, String::new()));
+            .map(|c| {
+                (
+                    c.overlay_type,
+                    c.max_size_mb.to_string(),
+                    Some(c.max_size_mb),
+                )
+            })
+            .unwrap_or((OverlayType::Ram, String::new(), None));
         let (warning, critical) = snapshot
             .overlay_runtime
             .map(|r| {
@@ -60,6 +68,7 @@ impl OverlaySettingsState {
         Self {
             overlay_type,
             max_size,
+            locked_max_size,
             warning,
             critical,
             selected: if lock_type_size { 2 } else { 0 },
@@ -98,11 +107,31 @@ impl OverlaySettingsState {
                 .map_err(|_| format!("{what}须为 0-4294967295 的整数"))
         };
         match (|| {
+            let max_mb = if self.lock_type_size {
+                self.locked_max_size
+                    .ok_or_else(|| "配置尚未加载完成，无法保存".to_string())?
+            } else {
+                parse(&self.max_size, "上限")?
+            };
+            let warning_mb = parse(&self.warning, "预警阈值")?;
+            let critical_mb = parse(&self.critical, "临界阈值")?;
+
+            // 业务校验：避免把明显非法的阈值交给 WMI。
+            if max_mb == 0 {
+                return Err("上限必须大于 0".to_string());
+            }
+            if warning_mb >= critical_mb {
+                return Err("预警阈值必须小于临界阈值".to_string());
+            }
+            if critical_mb > max_mb {
+                return Err("临界阈值不能大于 Overlay 上限".to_string());
+            }
+
             Ok(OverlayOutcome::Submit {
                 overlay_type: self.overlay_type,
-                max_mb: parse(&self.max_size, "上限")?,
-                warning_mb: parse(&self.warning, "预警阈值")?,
-                critical_mb: parse(&self.critical, "临界阈值")?,
+                max_mb,
+                warning_mb,
+                critical_mb,
             })
         })() {
             Ok(outcome) => outcome,
@@ -204,4 +233,65 @@ pub fn render(frame: &mut Frame, state: &OverlaySettingsState, area: Rect) {
         theme::dim(),
     ));
     frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> OverlaySettingsState {
+        OverlaySettingsState {
+            overlay_type: OverlayType::Ram,
+            max_size: "2048".into(),
+            locked_max_size: Some(2048),
+            warning: "1536".into(),
+            critical: "1843".into(),
+            selected: 2,
+            lock_type_size: false,
+            error: None,
+        }
+    }
+
+    fn is_submit(state: &mut OverlaySettingsState, max: u32) -> bool {
+        matches!(
+            state.submit(),
+            OverlayOutcome::Submit { max_mb, .. } if max_mb == max
+        )
+    }
+
+    #[test]
+    fn validates_overlay_business_rules() {
+        let mut s = state();
+        assert!(is_submit(&mut s, 2048));
+
+        s.max_size = "0".into();
+        assert!(matches!(s.submit(), OverlayOutcome::Stay));
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("大于 0")));
+
+        let mut s = state();
+        s.warning = "1843".into();
+        assert!(matches!(s.submit(), OverlayOutcome::Stay));
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("必须小于")));
+
+        let mut s = state();
+        s.critical = "4096".into();
+        assert!(matches!(s.submit(), OverlayOutcome::Stay));
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("不能大于")));
+    }
+
+    #[test]
+    fn locked_uses_snapshot_max_instead_of_text() {
+        let mut s = state();
+        s.lock_type_size = true;
+        s.max_size.clear();
+        assert!(is_submit(&mut s, 2048));
+
+        s.locked_max_size = None;
+        assert!(matches!(s.submit(), OverlayOutcome::Stay));
+        assert!(
+            s.error
+                .as_deref()
+                .is_some_and(|e| e.contains("尚未加载完成"))
+        );
+    }
 }

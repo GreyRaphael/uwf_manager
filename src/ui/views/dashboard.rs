@@ -65,7 +65,7 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let (Some(next), Some(current), Some(runtime)) = (
         app.snapshot.overlay_config_next,
         app.snapshot.overlay_config_current,
-        app.overlay_runtime,
+        app.snapshot.overlay_runtime,
     ) else {
         frame.render_widget(Paragraph::new(format!("  {}", text::LOADING)), inner);
         return;
@@ -90,14 +90,16 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
     ));
     frame.render_widget(Paragraph::new(info), info_area);
 
-    let percent = runtime.usage_percent(next.max_size_mb);
+    // 百分比基准必须是当前会话上限：runtime 来自 UWF_Overlay（当前会话）。
+    let max_size = current.max_size_mb.max(1);
+    let percent = runtime.usage_percent(max_size);
     let level = runtime.usage_level();
     let gauge = Gauge::default()
         .gauge_style(theme::gauge(level))
         .percent(percent)
         .label(format!(
-            "已用: {} MB / {} MB  {:.1}%",
-            runtime.consumption_mb, next.max_size_mb, percent as f64
+            "已用: {} MB / {} MB  {}%",
+            runtime.consumption_mb, max_size, percent
         ));
     frame.render_widget(gauge, gauge_area);
 

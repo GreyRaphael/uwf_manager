@@ -16,6 +16,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "下次生效"
     };
+    let edit_hint = if app.exclusion_session_current {
+        " [只读]"
+    } else {
+        ""
+    };
     let files_focused = app.exclusion_focus == ExclusionFocus::Files;
     let registry_focused = !files_focused;
 
@@ -24,7 +29,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::bordered()
                 .title(format!(
-                    "[文件排除项] {session_label}  [A] 添加 [I] 导入 [X] 导出"
+                    "[文件排除项] {session_label}{edit_hint}  [A] 添加 [I] 导入 [X] 导出"
                 ))
                 .border_style(theme::focus_border(files_focused)),
         )
@@ -36,7 +41,9 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let registry = List::new(registry_items)
         .block(
             Block::bordered()
-                .title("[注册表排除项]  [R] 添加 [D] 删除  [S] 视图".to_string())
+                .title(format!(
+                    "[注册表排除项]{edit_hint}  [R] 添加 [D] 删除  [S] 视图"
+                ))
                 .border_style(theme::focus_border(registry_focused)),
         )
         .highlight_style(theme::selected())

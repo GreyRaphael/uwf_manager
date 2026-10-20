@@ -21,7 +21,8 @@ use anyhow::Context;
 use backend::{create_backend_factory, spawn_backend_thread};
 
 fn main() -> anyhow::Result<()> {
-    // `--mock`：任意平台强制使用 Mock 后端（Windows 上免管理员预览界面）
+    // `--mock`：任意平台强制使用 Mock 后端。
+    // 注意：Windows 下 manifest 仍是 requireAdministrator，--mock 只跳过运行时检测。
     let force_mock = std::env::args().any(|arg| arg == "--mock");
 
     // D5 兜底：Windows 真机模式（非 --mock）下检测管理员权限。

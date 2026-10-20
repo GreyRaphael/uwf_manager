@@ -69,6 +69,11 @@ pub trait UwfBackend: 'static {
     fn remove_registry_exclusion(&mut self, key: &str) -> Result<()>;
     /// R5：当前会话实例；key/value 由后端线程按最后一个 `\` 拆分后传入
     fn commit_registry(&mut self, key: &str, value_name: &str) -> Result<()>;
+
+    /// P1-6：取出本次快照期间累积的非致命警告（默认无）。
+    fn take_warnings(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// 全量状态快照（`RefreshAll` 回包）
@@ -83,6 +88,8 @@ pub struct FullSnapshot {
     pub file_exclusions_next: Vec<FileExclusion>,
     pub registry_exclusions_current: Vec<String>,
     pub registry_exclusions_next: Vec<String>,
+    /// 部分卷读取失败等非致命警告
+    pub warnings: Vec<String>,
 }
 
 /// 请求关联 id：每个 UI → 后端请求唯一，回包必须原样带回。
@@ -142,6 +149,8 @@ pub enum BackendCmd {
 pub enum Outcome {
     /// 动作成功，且随后的状态刷新也成功
     Ok(String),
+    /// 动作完成，但需要以警告级别提示（如部分导入失败）
+    Warning(String),
     /// 动作成功，但状态刷新失败：两个事实都要告诉用户
     OkWithRefreshWarning { message: String, warning: String },
     /// 动作失败
@@ -395,6 +404,7 @@ fn collect_snapshot(b: &mut dyn UwfBackend) -> Result<FullSnapshot> {
         file_exclusions_next: b.get_file_exclusions(false)?,
         registry_exclusions_current: b.get_registry_exclusions(true)?,
         registry_exclusions_next: b.get_registry_exclusions(false)?,
+        warnings: b.take_warnings(),
     })
 }
 
@@ -489,20 +499,31 @@ fn import_exclusions(
     })();
     match result {
         Ok((ok, failed)) => {
-            let msg = if failed == 0 {
-                format!("导入完成：成功 {ok} 项")
-            } else {
-                format!("导入完成：成功 {ok} 项，失败 {failed} 项")
+            let base = match (ok, failed) {
+                (0, 0) => Outcome::Ok("导入完成：文件为空".to_string()),
+                (0, n) => Outcome::Err(format!("导入失败：{n} 项均未成功")),
+                (n, 0) => Outcome::Ok(format!("导入完成：成功 {n} 项")),
+                (n, m) => Outcome::Warning(format!("导入完成：成功 {n} 项，失败 {m} 项")),
             };
             let outcome = match refresh_all(id, backend, tx) {
-                Ok(()) => Outcome::Ok(msg),
-                Err(UwfError::NotInstalled) => Outcome::OkWithRefreshWarning {
-                    message: msg,
-                    warning: "状态刷新失败：UWF 功能未安装或未启用".into(),
+                Ok(()) => base,
+                Err(UwfError::NotInstalled) => match base {
+                    Outcome::Ok(msg) => Outcome::OkWithRefreshWarning {
+                        message: msg,
+                        warning: "状态刷新失败：UWF 功能未安装或未启用".into(),
+                    },
+                    Outcome::Warning(msg) => {
+                        Outcome::Warning(format!("{msg}；状态刷新失败：UWF 功能未安装或未启用"))
+                    }
+                    other => other,
                 },
-                Err(e) => Outcome::OkWithRefreshWarning {
-                    message: msg,
-                    warning: format!("导入已执行，但状态刷新失败：{e}"),
+                Err(e) => match base {
+                    Outcome::Ok(msg) => Outcome::OkWithRefreshWarning {
+                        message: msg,
+                        warning: format!("导入已执行，但状态刷新失败：{e}"),
+                    },
+                    Outcome::Warning(msg) => Outcome::Warning(format!("{msg}；状态刷新失败：{e}")),
+                    other => other,
                 },
             };
             send_finished(tx, id, outcome);
@@ -692,5 +713,42 @@ mod tests {
             }
             other => panic!("期望 Snapshot，实际 {other:?}"),
         }
+    }
+    fn finished_outcomes(rx: &Receiver<BackendEvent>) -> Vec<Outcome> {
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if let BackendEvent::Finished { outcome, .. } = evt {
+                out.push(outcome);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn import_all_failed_is_error_partial_is_warning() {
+        let dir = std::env::temp_dir().join(format!("uwf_import_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let all_fail = dir.join("all_fail.txt");
+        std::fs::write(&all_fail, "not_a_path\n").unwrap();
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        import_exclusions(1, &mut backend, &tx, &all_fail);
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Err(_)]
+        ));
+
+        let partial = dir.join("partial.txt");
+        std::fs::write(&partial, "C:\\Windows\\Temp\nnot_a_path\n").unwrap();
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        import_exclusions(2, &mut backend, &tx, &partial);
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Warning(_)]
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

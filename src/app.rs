@@ -13,6 +13,7 @@ use ratatui::widgets::{ListState, TableState};
 use crate::backend::{
     BackendCmd, BackendCommand, BackendEvent, BackendKind, FullSnapshot, Outcome, RequestId,
 };
+#[cfg(test)]
 use crate::model::OverlayRuntime;
 use crate::ui::components::confirm::{ConfirmAction, ConfirmOutcome, ConfirmState};
 use crate::ui::components::file_picker::{
@@ -86,10 +87,17 @@ enum PowerAction {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Ok,
+    Warn,
+    Err,
+}
+
 #[derive(Debug)]
 pub struct StatusEntry {
     pub time: String,
-    pub ok: bool,
+    pub level: LogLevel,
     pub text: String,
 }
 
@@ -100,7 +108,6 @@ pub struct App {
     /// D6：UWF 功能未安装（由 `BackendEvent::NotInstalled` 置位）
     pub not_installed: bool,
     pub snapshot: FullSnapshot,
-    pub overlay_runtime: Option<OverlayRuntime>,
     pub volumes_state: TableState,
     /// 排除项视图：true = 当前生效，false = 下次生效（原版默认下次）
     pub exclusion_session_current: bool,
@@ -139,7 +146,6 @@ impl App {
             backend_kind,
             not_installed: false,
             snapshot: FullSnapshot::default(),
-            overlay_runtime: None,
             volumes_state,
             exclusion_session_current: false,
             exclusion_focus: ExclusionFocus::Files,
@@ -265,7 +271,6 @@ impl App {
     fn apply_event(&mut self, evt: BackendEvent) {
         match evt {
             BackendEvent::Snapshot { id, snapshot } => {
-                self.overlay_runtime = snapshot.overlay_runtime;
                 self.snapshot = snapshot;
                 if self.initial_load == Some(id) {
                     self.initial_load = None;
@@ -273,11 +278,15 @@ impl App {
                 // 查询回包永远不解除 mutation 锁；只有匹配 id 的 Finished 可以。
                 self.not_installed = false;
                 self.clamp_selections();
+                let warnings = self.snapshot.warnings.clone();
+                for warning in &warnings {
+                    self.log_warn(warning);
+                }
                 self.log(true, "已刷新 UWF 全部状态");
             }
             BackendEvent::OverlayRuntime { id, runtime } => {
                 let _ = id;
-                self.overlay_runtime = Some(runtime);
+                self.snapshot.overlay_runtime = Some(runtime);
             }
             BackendEvent::Finished { id, outcome } => {
                 if self.mutation == Some(id) {
@@ -290,8 +299,11 @@ impl App {
                     }
                     Outcome::OkWithRefreshWarning { message, warning } => {
                         self.log(true, &message);
-                        self.log(false, &warning);
+                        self.log_warn(&warning);
                         self.on_power_action_ok(id);
+                    }
+                    Outcome::Warning(msg) => {
+                        self.log_warn(&msg);
                     }
                     Outcome::Err(msg) => {
                         self.log(false, &msg);
@@ -335,12 +347,20 @@ impl App {
     }
 
     fn log(&mut self, ok: bool, text: &str) {
+        self.push_log(if ok { LogLevel::Ok } else { LogLevel::Err }, text);
+    }
+
+    fn log_warn(&mut self, text: &str) {
+        self.push_log(LogLevel::Warn, text);
+    }
+
+    fn push_log(&mut self, level: LogLevel, text: &str) {
         if self.log.len() >= MAX_LOG {
             self.log.pop_front();
         }
         self.log.push_back(StatusEntry {
             time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            ok,
+            level,
             text: text.to_string(),
         });
     }
@@ -518,6 +538,9 @@ impl App {
                 self.clamp_selections();
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
+                if !self.ensure_mutable_exclusions() {
+                    return;
+                }
                 self.modal = Some(Modal::Input(InputState::new(
                     "添加文件排除",
                     "输入绝对路径（如 C:\\Windows\\Temp），或按 [F2] 打开文件选择器",
@@ -526,6 +549,9 @@ impl App {
                 )));
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
+                if !self.ensure_mutable_exclusions() {
+                    return;
+                }
                 self.modal = Some(Modal::Input(InputState::new(
                     "添加注册表排除",
                     "输入注册表键路径（如 HKLM\\SOFTWARE\\Example）",
@@ -533,8 +559,15 @@ impl App {
                     false,
                 )));
             }
-            KeyCode::Char('d') | KeyCode::Char('D') => self.delete_selected_exclusion(),
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if self.ensure_mutable_exclusions() {
+                    self.delete_selected_exclusion();
+                }
+            }
             KeyCode::Char('i') | KeyCode::Char('I') => {
+                if !self.ensure_mutable_exclusions() {
+                    return;
+                }
                 self.modal = Some(Modal::FilePicker(FilePickerState::new(
                     PickerMode::File,
                     PickerAction::ImportExclusions,
@@ -542,6 +575,16 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Char('X') => self.export_exclusions(),
             _ => {}
+        }
+    }
+
+    /// P1-2：当前生效视图只读；增删/导入必须先切到下次生效视图。
+    fn ensure_mutable_exclusions(&mut self) -> bool {
+        if self.exclusion_session_current {
+            self.log(false, "当前生效视图只读，请按 [S] 切换到下次生效视图");
+            false
+        } else {
+            true
         }
     }
 
@@ -795,6 +838,7 @@ pub(crate) mod tests {
             file_exclusions_next: vec![FileExclusion::new("C:".into(), "\\Windows\\Temp".into())],
             registry_exclusions_current: vec![],
             registry_exclusions_next: vec!["HKLM\\SOFTWARE\\UwfManagerDemo".into()],
+            warnings: vec![],
         }
     }
 
@@ -858,7 +902,7 @@ pub(crate) mod tests {
         app.apply_event(BackendEvent::NotInstalled { id: 0 });
         assert!(app.not_installed);
         assert!(!app.is_busy());
-        assert!(app.log.back().is_some_and(|e| !e.ok));
+        assert!(app.log.back().is_some_and(|e| e.level == LogLevel::Err));
         // 重新检测成功（Snapshot）后自动恢复
         app.apply_event(BackendEvent::Snapshot {
             id: 1,
@@ -1142,5 +1186,58 @@ pub(crate) mod tests {
                 .back()
                 .is_some_and(|e| e.text.contains("状态刷新失败"))
         );
+    }
+    #[test]
+    fn current_session_view_is_read_only() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Exclusions;
+        app.on_key(key(KeyCode::Char('s'))); // 当前生效视图
+        assert!(app.exclusion_session_current);
+
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('r'),
+            KeyCode::Char('d'),
+            KeyCode::Char('i'),
+        ] {
+            app.on_key(key(code));
+            assert!(app.modal.is_none(), "当前视图不应打开编辑弹窗: {code:?}");
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "当前视图不应发管理命令: {code:?}"
+            );
+        }
+
+        // 切回下次生效视图后恢复可编辑
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            recv_cmd(&cmd_rx),
+            BackendCmd::RemoveFileExclusion(_)
+        ));
+    }
+
+    #[test]
+    fn snapshot_warnings_are_logged() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        let mut snapshot = demo_snapshot();
+        snapshot.warnings = vec!["卷 D: 读取排除项失败: boom".into()];
+        app.apply_event(BackendEvent::Snapshot { id: 9, snapshot });
+        assert!(app.log.iter().any(|e| {
+            e.level == LogLevel::Warn && e.text.contains("卷 D: 读取排除项失败")
+        }));
+    }
+
+    #[test]
+    fn overlay_runtime_event_updates_snapshot_single_source() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        let runtime = OverlayRuntime {
+            available_space_mb: 100,
+            consumption_mb: 1024,
+            warning_threshold_mb: 1536,
+            critical_threshold_mb: 1843,
+        };
+        app.apply_event(BackendEvent::OverlayRuntime { id: 3, runtime });
+        assert_eq!(app.snapshot.overlay_runtime, Some(runtime));
     }
 }
