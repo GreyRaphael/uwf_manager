@@ -357,10 +357,10 @@ fn handle_cmd(
             current_session,
         } => export_exclusions(id, backend, tx, &path, current_session),
         BackendCmd::RestartSystem => {
-            mutate(id, backend, tx, |b| b.restart_system(), "系统即将重启")
+            mutate_without_refresh(id, backend, tx, |b| b.restart_system(), "系统即将重启")
         }
         BackendCmd::ShutdownSystem => {
-            mutate(id, backend, tx, |b| b.shutdown_system(), "系统即将关机")
+            mutate_without_refresh(id, backend, tx, |b| b.shutdown_system(), "系统即将关机")
         }
         BackendCmd::Quit => unreachable!("Quit 由线程循环拦截"),
     }
@@ -412,6 +412,23 @@ fn mutate(
         action(b)?;
         Ok(ok_msg.into())
     });
+}
+
+/// 电源动作出口：动作成功后**不做全量刷新**。
+///
+/// 重启/关机发出后系统立即进入关机流程，再发起整轮 WMI 查询可能卡住，
+/// 延迟终端恢复；动作是否成功只由 ReturnValue 决定。
+fn mutate_without_refresh(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    tx: &Sender<BackendEvent>,
+    action: impl FnOnce(&mut dyn UwfBackend) -> Result<()>,
+    ok_msg: impl Into<String>,
+) {
+    match action(backend) {
+        Ok(()) => send_finished(tx, id, Outcome::Ok(ok_msg.into())),
+        Err(e) => send_finished(tx, id, Outcome::Err(e.to_string())),
+    }
 }
 
 /// 同 [`mutate`]，但成功文案由 action 返回（适用于需先解析/校验的命令）。
@@ -648,5 +665,32 @@ mod tests {
         assert_eq!(mock.get_registry_exclusions(false).unwrap().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn power_actions_finish_without_snapshot() {
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        mutate_without_refresh(7, &mut backend, &tx, |b| b.restart_system(), "系统即将重启");
+        match rx.try_recv().unwrap() {
+            BackendEvent::Finished {
+                id: 7,
+                outcome: Outcome::Ok(msg),
+            } => assert_eq!(msg, "系统即将重启"),
+            other => panic!("期望仅收到 Finished(Ok)，实际 {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "电源动作不应再发 Snapshot");
+    }
+
+    #[test]
+    fn refresh_all_sends_snapshot_with_request_id() {
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        refresh_all(42, &mut backend, &tx).unwrap();
+        match rx.try_recv().unwrap() {
+            BackendEvent::Snapshot { id: 42, snapshot } => {
+                assert!(snapshot.filter_state.is_some());
+            }
+            other => panic!("期望 Snapshot，实际 {other:?}"),
+        }
     }
 }

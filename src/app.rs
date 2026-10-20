@@ -327,6 +327,8 @@ impl App {
         match (power, self.backend_kind) {
             (PowerAction::Restart, BackendKind::Mock) => {
                 self.log(true, "（模拟）已重启：下次会话配置已生效");
+                // Mock 的重启是把 next 应用为 current；刷新一次让界面展示生效结果。
+                self.refresh_all();
             }
             _ => self.should_quit = true,
         }
@@ -1122,5 +1124,23 @@ pub(crate) mod tests {
             BackendCmd::CommitFileDeletion(path) => assert_eq!(path, "C:\\data\\a.txt"),
             other => panic!("期望 CommitFileDeletion，实际 {other:?}"),
         }
+    }
+    #[test]
+    fn refresh_warning_is_visible_and_clears_pending() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        let id = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
+        app.apply_event(BackendEvent::Finished {
+            id,
+            outcome: Outcome::OkWithRefreshWarning {
+                message: "UWF 将在下次系统重启后启用".into(),
+                warning: "操作已成功，但状态刷新失败：boom".into(),
+            },
+        });
+        assert!(!app.is_pending());
+        assert!(
+            app.log
+                .back()
+                .is_some_and(|e| e.text.contains("状态刷新失败"))
+        );
     }
 }

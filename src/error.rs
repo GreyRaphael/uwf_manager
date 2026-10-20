@@ -25,6 +25,10 @@ pub enum UwfError {
     #[error("未找到卷 {0} 对应的 UWF 实例")]
     VolumeNotFound(String),
 
+    /// R3 两步删除的部分成功：文件已删，但 WMI 固化删除失败
+    #[error("文件 {path} 已删除，但 UWF 固化删除失败：{message}")]
+    CommitDeleteAfterFileRemoved { path: String, message: String },
+
     #[error("无效的路径: {0}")]
     InvalidPath(String),
 

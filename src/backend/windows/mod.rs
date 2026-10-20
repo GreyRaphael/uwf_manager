@@ -180,16 +180,17 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn restart_system(&mut self) -> Result<()> {
-        // 与原版一致：不校验 ReturnValue（调用发出后系统即进入重启流程）
+        // ReturnValue 校验：非零时不要假装重启已发出。
+        // 注：Windows 真机上该调用是否能在重启前返回非零尚未验证（P0-5 定级说明）。
         let path = self.filter_instance()?.path;
-        let _: ReturnOnly = self.exec::<UWF_Filter, _>(&path, "RestartSystem", ())?;
-        Ok(())
+        let out: ReturnOnly = self.exec::<UWF_Filter, _>(&path, "RestartSystem", ())?;
+        Self::ensure_ok("RestartSystem", out)
     }
 
     fn shutdown_system(&mut self) -> Result<()> {
         let path = self.filter_instance()?.path;
-        let _: ReturnOnly = self.exec::<UWF_Filter, _>(&path, "ShutdownSystem", ())?;
-        Ok(())
+        let out: ReturnOnly = self.exec::<UWF_Filter, _>(&path, "ShutdownSystem", ())?;
+        Self::ensure_ok("ShutdownSystem", out)
     }
 
     // ── Overlay ──
@@ -307,23 +308,38 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_file_deletion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R3 第一步：真实删除文件（写入 Overlay；已不存在则容忍）
+        // R3 第一步：先做所有可能失败的校验，再执行不可逆删除。
+        // 卷实例不存在 / WMI 查询失败时完全不碰文件。
+        let path = self.find_volume_path(false, drive_letter)?;
+
+        // R3 第二步：真实删除文件（写入 Overlay；已不存在则容忍）
         let abs_path = format!("{drive_letter}{file_rel_path}");
         match std::fs::remove_file(&abs_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        // R3 第二步：下次会话实例固化删除（重启后依然生效）
-        let path = self.find_volume_path(false, drive_letter)?;
-        let out: ReturnOnly = self.exec::<UWF_Volume, _>(
-            &path,
-            "CommitFileDeletion",
-            FileNameParam {
-                FileName: file_rel_path.to_string(),
-            },
-        )?;
-        Self::ensure_ok("CommitFileDeletion", out)
+
+        // R3 第三步：下次会话实例固化删除（重启后依然生效）。
+        // 走到这里文件已经删除；失败必须明确告知“文件已删除、固化失败”。
+        let out: ReturnOnly = self
+            .exec::<UWF_Volume, _>(
+                &path,
+                "CommitFileDeletion",
+                FileNameParam {
+                    FileName: file_rel_path.to_string(),
+                },
+            )
+            .map_err(|e| UwfError::CommitDeleteAfterFileRemoved {
+                path: abs_path.clone(),
+                message: e.to_string(),
+            })?;
+        Self::ensure_ok("CommitFileDeletion", out).map_err(|e| {
+            UwfError::CommitDeleteAfterFileRemoved {
+                path: abs_path,
+                message: e.to_string(),
+            }
+        })
     }
 
     // ── Exclusion ──
