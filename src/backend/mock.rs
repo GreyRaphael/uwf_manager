@@ -32,6 +32,27 @@ pub struct MockUwfBackend {
 }
 
 impl MockUwfBackend {
+    /// 空数据：用于导出空列表等边界测试。
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            filter_current: false,
+            filter_next: false,
+            overlay_type_current: OverlayType::Ram,
+            overlay_type_next: OverlayType::Ram,
+            max_size_current: 0,
+            max_size_next: 0,
+            warning_mb: 0,
+            critical_mb: 0,
+            consumption_mb: 0,
+            volumes: Vec::new(),
+            file_excl_current: Vec::new(),
+            file_excl_next: Vec::new(),
+            reg_excl_current: Vec::new(),
+            reg_excl_next: Vec::new(),
+        }
+    }
+
     /// 演示数据：C: 受保护、D: 未保护；筛选器当前启用（可演示 R1 锁定）；
     /// RAM 型 Overlay 2048 MB。
     pub fn demo() -> Self {
@@ -135,13 +156,11 @@ impl UwfBackend for MockUwfBackend {
     fn get_overlay_config(&mut self, current_session: bool) -> Result<OverlayConfig> {
         Ok(if current_session {
             OverlayConfig {
-                current_session: true,
                 overlay_type: self.overlay_type_current,
                 max_size_mb: self.max_size_current,
             }
         } else {
             OverlayConfig {
-                current_session: false,
                 overlay_type: self.overlay_type_next,
                 max_size_mb: self.max_size_next,
             }
@@ -149,8 +168,7 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
-        // 每次调用小幅增长，演示 Gauge 颜色梯度（绿→黄→红）
-        self.consumption_mb = (self.consumption_mb + 7).min(self.max_size_current);
+        // 查询必须无副作用：保持稳定值，避免每次刷新都改变用量。
         Ok(OverlayRuntime {
             available_space_mb: self.max_size_current.saturating_sub(self.consumption_mb),
             consumption_mb: self.consumption_mb,
@@ -242,6 +260,8 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn remove_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
+        // 与 add_file_exclusion 一致：未知卷必须报错，不能静默成功。
+        self.known_volume(drive_letter)?;
         let item = FileExclusion::new(drive_letter.to_ascii_uppercase(), file_rel_path.into());
         self.file_excl_next.retain(|x| x != &item);
         Ok(())
@@ -345,17 +365,21 @@ mod tests {
     }
 
     #[test]
-    fn overlay_consumption_grows_and_caps_at_max() {
+    fn overlay_runtime_query_has_no_side_effect() {
         let mut b = MockUwfBackend::demo();
-        let first = b.get_overlay_runtime().unwrap().consumption_mb;
-        assert!(first > 512);
-        for _ in 0..500 {
-            b.get_overlay_runtime().unwrap();
-        }
-        let rt = b.get_overlay_runtime().unwrap();
-        assert_eq!(rt.consumption_mb, 2048);
-        assert_eq!(rt.available_space_mb, 0);
-        assert_eq!(rt.usage_level(), UsageLevel::Critical);
-        assert_eq!(rt.usage_percent(2048), 100);
+        let first = b.get_overlay_runtime().unwrap();
+        let second = b.get_overlay_runtime().unwrap();
+        assert_eq!(first.consumption_mb, 512);
+        assert_eq!(second.consumption_mb, 512);
+        assert_eq!(second.usage_percent(2048), 25);
+    }
+
+    #[test]
+    fn remove_file_exclusion_rejects_unknown_volume() {
+        let mut b = MockUwfBackend::demo();
+        assert!(matches!(
+            b.remove_file_exclusion("Z:", "\\x"),
+            Err(UwfError::VolumeNotFound(_))
+        ));
     }
 }

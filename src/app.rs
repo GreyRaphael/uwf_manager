@@ -1,6 +1,5 @@
 //! 主应用状态机：事件循环、按键路由、模态管理、后端回包应用。
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -30,8 +29,6 @@ pub enum UiEvent {
 
 /// Overlay 轮询周期（与原版 MainForm 的 2 秒后台线程一致）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
-/// 操作日志最大保留条数
-const MAX_LOG: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -45,7 +42,7 @@ impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Volumes, Tab::Exclusions, Tab::Commit];
 
     pub fn index(self) -> usize {
-        self as usize
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 
     pub fn label(self) -> &'static str {
@@ -115,6 +112,8 @@ pub struct App {
     pub not_installed: bool,
     /// 后端线程已退出（channel 断开或 send 失败）；管理键应被禁用
     pub backend_lost: bool,
+    /// 是否已成功加载过至少一次快照（区分“未加载”和“确实为空”）
+    pub loaded: bool,
     pub snapshot: FullSnapshot,
     pub volumes_state: TableState,
     /// 排除项视图：true = 当前生效，false = 下次生效（原版默认下次）
@@ -126,7 +125,7 @@ pub struct App {
     selected_file_key: Option<(String, String)>,
     selected_registry_key: Option<String>,
     pub modal: Option<Modal>,
-    pub log: VecDeque<StatusEntry>,
+    pub last_log: Option<StatusEntry>,
     /// 当前在途的变更请求；只有匹配 id 的 Finished 才能清除
     pub mutation: Option<RequestId>,
     /// 启动时的一次全量刷新；与变更在途锁分离
@@ -157,6 +156,7 @@ impl App {
             backend_kind,
             not_installed: false,
             backend_lost: false,
+            loaded: false,
             snapshot: FullSnapshot::default(),
             volumes_state,
             exclusion_session_current: false,
@@ -165,7 +165,7 @@ impl App {
             registry_exclusion_state,
             selected_file_key: None,
             selected_registry_key: None,
-            log: VecDeque::new(),
+            last_log: None,
             mutation: None,
             initial_load: Some(0),
             power_action: None,
@@ -304,6 +304,7 @@ impl App {
         match evt {
             BackendEvent::Snapshot { id, snapshot } => {
                 self.snapshot = snapshot;
+                self.loaded = true;
                 if self.initial_load == Some(id) {
                     self.initial_load = None;
                 }
@@ -311,11 +312,12 @@ impl App {
                 self.not_installed = false;
                 self.clamp_selections();
                 self.restore_selection();
+                self.log(true, "已刷新 UWF 全部状态");
+                // 警告放在最后，确保底部单行日志展示的是需要用户注意的信息。
                 let warnings = self.snapshot.warnings.clone();
                 for warning in &warnings {
                     self.log_warn(warning);
                 }
-                self.log(true, "已刷新 UWF 全部状态");
             }
             BackendEvent::OverlayRuntime { id, runtime } => {
                 let _ = id;
@@ -388,10 +390,7 @@ impl App {
     }
 
     fn push_log(&mut self, level: LogLevel, text: &str) {
-        if self.log.len() >= MAX_LOG {
-            self.log.pop_front();
-        }
-        self.log.push_back(StatusEntry {
+        self.last_log = Some(StatusEntry {
             time: chrono::Local::now().format("%H:%M:%S").to_string(),
             level,
             text: text.to_string(),
@@ -843,9 +842,8 @@ impl App {
         let filename = chrono::Local::now()
             .format("EXCLUSIONLIST_%Y_%m_%d_%H_%M_%S.txt")
             .to_string();
-        let path = std::env::current_dir()
-            .map(|dir| dir.join(&filename))
-            .unwrap_or_else(|_| PathBuf::from(&filename));
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let path = unique_export_path(dir.join(&filename));
         let _ = self.begin_mutation(BackendCmd::ExportExclusions {
             path,
             current_session: self.exclusion_session_current,
@@ -859,6 +857,29 @@ fn clamp(selected: &mut Option<usize>, len: usize) {
         (None, _) => Some(0),
         (Some(i), _) => Some(i.min(len - 1)),
     };
+}
+
+/// 同秒重复导出时自动追加 _1、_2，避免静默覆盖已有文件。
+fn unique_export_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("EXCLUSIONLIST");
+    let ext = path.extension().and_then(|s| s.to_str());
+    for n in 1.. {
+        let name = match ext {
+            Some(ext) => format!("{stem}_{n}.{ext}"),
+            None => format!("{stem}_{n}"),
+        };
+        let candidate = path.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded unique filename search")
 }
 
 fn move_selection(selected: &mut Option<usize>, len: usize, delta: isize) {
@@ -885,12 +906,10 @@ pub(crate) mod tests {
                 next_enabled: true,
             }),
             overlay_config_current: Some(OverlayConfig {
-                current_session: true,
                 overlay_type: OverlayType::Ram,
                 max_size_mb: 2048,
             }),
             overlay_config_next: Some(OverlayConfig {
-                current_session: false,
                 overlay_type: OverlayType::Ram,
                 max_size_mb: 2048,
             }),
@@ -955,6 +974,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tab_index_matches_all_order() {
+        for (i, tab) in Tab::ALL.iter().enumerate() {
+            assert_eq!(tab.index(), i);
+        }
+    }
+
+    #[test]
     fn selection_helpers_clamp_and_wrap() {
         let mut sel = Some(5);
         clamp(&mut sel, 3);
@@ -982,7 +1008,11 @@ pub(crate) mod tests {
         app.apply_event(BackendEvent::NotInstalled { id: 0 });
         assert!(app.not_installed);
         assert!(!app.is_busy());
-        assert!(app.log.back().is_some_and(|e| e.level == LogLevel::Err));
+        assert!(
+            app.last_log
+                .as_ref()
+                .is_some_and(|e| e.level == LogLevel::Err)
+        );
         // 重新检测成功（Snapshot）后自动恢复
         app.apply_event(BackendEvent::Snapshot {
             id: 1,
@@ -1173,8 +1203,8 @@ pub(crate) mod tests {
         });
         assert!(!app.should_quit);
         assert!(
-            app.log
-                .back()
+            app.last_log
+                .as_ref()
                 .is_some_and(|e| e.text.contains("（模拟）已重启"))
         );
 
@@ -1262,8 +1292,8 @@ pub(crate) mod tests {
         });
         assert!(!app.is_pending());
         assert!(
-            app.log
-                .back()
+            app.last_log
+                .as_ref()
                 .is_some_and(|e| e.text.contains("状态刷新失败"))
         );
     }
@@ -1303,7 +1333,7 @@ pub(crate) mod tests {
         let mut snapshot = demo_snapshot();
         snapshot.warnings = vec!["卷 D: 读取排除项失败: boom".into()];
         app.apply_event(BackendEvent::Snapshot { id: 9, snapshot });
-        assert!(app.log.iter().any(|e| {
+        assert!(app.last_log.as_ref().is_some_and(|e| {
             e.level == LogLevel::Warn && e.text.contains("卷 D: 读取排除项失败")
         }));
     }
@@ -1351,5 +1381,27 @@ pub(crate) mod tests {
             app.selected_file_key,
             Some(("C:".into(), "\\Windows\\Temp".into()))
         );
+    }
+    #[test]
+    fn unique_export_path_does_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!("uwf_export_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("EXCLUSIONLIST_2026_10_20_12_00_00.txt");
+        std::fs::write(&first, "x").unwrap();
+
+        let second = unique_export_path(first.clone());
+        assert_eq!(
+            second.file_name().and_then(|s| s.to_str()),
+            Some("EXCLUSIONLIST_2026_10_20_12_00_00_1.txt")
+        );
+
+        std::fs::write(&second, "y").unwrap();
+        let third = unique_export_path(first);
+        assert_eq!(
+            third.file_name().and_then(|s| s.to_str()),
+            Some("EXCLUSIONLIST_2026_10_20_12_00_00_2.txt")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

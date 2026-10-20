@@ -4,17 +4,17 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, UwfError>;
 
-// 部分变体由阶段 2（InvalidPath）与阶段 3（NotInstalled/WmiMethod/Wmi）接线，届时移除该 allow
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum UwfError {
     /// UWF 功能未安装或未启用（触发 D6 引导页）
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[error(
         "UWF 功能未安装或未启用。请在管理员 PowerShell 中执行：Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter"
     )]
     NotInstalled,
 
     /// WMI 方法返回非零 ReturnValue（uwfmgr 风格十六进制错误码）
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[error("WMI 方法 {method} 调用失败，错误码: 0x{code:08X}")]
     WmiMethod { method: &'static str, code: u32 },
 
@@ -26,6 +26,7 @@ pub enum UwfError {
     VolumeNotFound(String),
 
     /// R3 两步删除的部分成功：文件已删，但 WMI 固化删除失败
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[error("文件 {path} 已删除，但 UWF 固化删除失败：{message}")]
     CommitDeleteAfterFileRemoved { path: String, message: String },
 

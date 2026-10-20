@@ -53,7 +53,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 /// 底部操作日志（最近一条）
 fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let line = match app.log.back() {
+    let line = match app.last_log.as_ref() {
         Some(entry) => {
             let (label, style) = match entry.level {
                 crate::app::LogLevel::Ok => ("成功", theme::ok()),
@@ -119,6 +119,7 @@ mod tests {
     fn dashboard_renders_snapshot() {
         let mut app = test_app();
         app.snapshot = demo_snapshot();
+        app.loaded = true;
         let screen = render_to_string(&mut app, 100, 30);
         assert!(screen.contains("[1]状态概览"), "缺少 Tab 标签:\n{screen}");
         assert!(screen.contains("Mock演示数据"), "缺少后端徽标:\n{screen}");
@@ -160,6 +161,7 @@ mod tests {
     fn overlay_settings_modal_shows_r1_lock_hint() {
         let mut app = test_app();
         app.snapshot = demo_snapshot();
+        app.loaded = true;
         app.modal = Some(Modal::OverlaySettings(OverlaySettingsState::from_snapshot(
             &app.snapshot,
         )));
@@ -173,13 +175,12 @@ mod tests {
         use crate::model::{OverlayConfig, OverlayRuntime, OverlayType};
         let mut app = test_app();
         app.snapshot = demo_snapshot();
+        app.loaded = true;
         app.snapshot.overlay_config_current = Some(OverlayConfig {
-            current_session: true,
             overlay_type: OverlayType::Ram,
             max_size_mb: 2048,
         });
         app.snapshot.overlay_config_next = Some(OverlayConfig {
-            current_session: false,
             overlay_type: OverlayType::Ram,
             max_size_mb: 4096,
         });

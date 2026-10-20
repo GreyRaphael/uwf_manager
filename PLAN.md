@@ -33,13 +33,13 @@
 
 | # | 决策 | 结论与理由 |
 | :--- | :--- | :--- |
-| **D1** | 后端抽象 | 定义 `UwfBackend` Trait；`#[cfg(windows)]` → `WindowsWmiBackend`，其余平台 → `MockUwfBackend`。另提供 `--mock` 启动参数，Windows 上也可强制 Mock 预览（免管理员、免 UWF 环境）。 |
+| **D1** | 后端抽象 | 定义 `UwfBackend` Trait；`#[cfg(windows)]` → `WindowsWmiBackend`，其余平台 → `MockUwfBackend`。另提供 `--mock` 启动参数，Windows 上也可强制 Mock 预览（跳过运行时管理员检测；内嵌 manifest 仍为 `requireAdministrator`，启动仍可能触发 UAC）。 |
 | **D2** | 并发模型 | **不引入 tokio/crossbeam**。全程序仅 2 个线程：UI 线程（crossterm `event::poll` + 2 秒 tick）+ 后端线程（`std::sync::mpsc` 消息循环独占 WMI 连接）。2 秒轮询由 UI tick 发送刷新命令实现。 |
 | **D3** | WMI 驱动选型 | **采用 `wmi` 0.18 crate**（而非裸 `windows` crate 手写 COM 胶水）。理由：① serde 化查询（`con.query::<UWF_Filter>()`）与方法调用（`exec_instance_method`，入参 `Serialize`、出参 `Deserialize`），消灭全部 VARIANT/SAFEARRAY 手工胶水；② COM 初始化与安全策略由 crate 托管；③ **运行时依赖不含 tokio**（tokio 仅为其 dev-dependency）；④ 底层即 `windows` 0.62，必要时可同模块内降级裸调。本机已在 `x86_64-unknown-linux-gnu` 与 `x86_64-pc-windows-gnu` 双 target 实测编译通过。 |
 | **D4** | COM 线程模型 | `wmi::WMIConnection` 为 `!Send + !Sync`（COM 套间约束），因此**后端线程独占连接**（actor 模式），UI 通过 channel 收发命令/事件，天然规避全部套间与 `Send/Sync` 问题。 |
 | **D5** | UAC 策略 | manifest 使用 `requireAdministrator`（与原版一致）。已知行为：从非提权终端启动时，UAC 确认后进程在**新控制台窗口**运行（Windows 机制使然，写入使用手册）。另加运行时 `TokenElevation` 检测兜底：非管理员（如无 manifest 的 dev 构建）打印中文引导并以退出码 2 退出。 |
 | **D6** | UWF 未安装行为 | **不退出**。进入 TUI 引导页，显示启用命令与说明：`Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter`（管理员 PowerShell 执行，重启后生效）。 |
-| **D7** | 界面语言 | 纯中文，所有文案集中于 `ui/text.rs` 常量层（预留未来 i18n 可能，不实现双语切换）。 |
+| **D7** | 界面语言 | 纯中文，部分公共文案集中于 `ui/text.rs`（预留未来 i18n 可能，不实现双语切换）；弹窗/提示仍有硬编码中文，尚未做到“全部集中”。 |
 | **D8** | 与原版差异 | 见 §6.6 差异清单：4 项原版"有实现但 UI 未接线"的能力接入 UI；5 项空壳/损坏能力有意省略并登记。 |
 
 ---
@@ -134,7 +134,7 @@ uwf_manager/
     │   ├── filter.rs           # FilterState { current_enabled, next_enabled }
     │   ├── overlay.rs          # OverlayType{Ram=0,Disk=1}, OverlayConfig, OverlayRuntime
     │   ├── volume.rs           # VolumeInfo { drive_letter, current_protected, next_protected }
-    │   └── exclusion.rs        # FileExclusion, RegistryExclusion
+    │   └── exclusion.rs        # FileExclusion；注册表排除用 Vec<String>
     ├── backend/
     │   ├── mod.rs              # UwfBackend Trait + BackendCmd/BackendEvent + 线程启动
     │   ├── mock.rs             # MockUwfBackend（全平台，含下次会话状态机）
@@ -164,13 +164,13 @@ uwf_manager/
 
 ### 6.1 `UwfBackend` Trait（`src/backend/mod.rs`）
 
-方法全部 `&mut self`（Mock 需要可变状态；WMI 实现内部无状态），`Send` 以满足跨线程转移：
+方法全部 `&mut self`（Mock 需要可变状态；WMI 实现内部无状态），**不要求 `Send`**：后端实例只在其线程内构造和使用：
 
 ```rust
 use crate::error::Result;
 use crate::model::*;
 
-pub trait UwfBackend: Send + 'static {
+pub trait UwfBackend: 'static {
     // ── Filter（单实例，无会话分裂）──
     fn get_filter_state(&mut self) -> Result<FilterState>;
     fn enable_filter(&mut self) -> Result<()>;      // 下次启动生效（R1 同）
@@ -322,14 +322,14 @@ pub enum BackendEvent {
 - 仿真数据：C:（受保护）、D:（未保护）两卷；RAM 型 Overlay 2048 MB；若干预置排除项。
 - **完整实现"下次会话"状态机**：`enable_filter`/`protect_volume` 等只改 next 侧；`restart_system` 将 next 快照应用为 current（模拟重启生效）——TUI 全流程（含"重启后生效"提示）在 Linux 可完整演示。
 - 遵守 R1 锁定规则（current 启用时 set type/max 返回与 Windows 版相同的中文错误），供 UI 置灰逻辑单测。
-- `get_overlay_runtime` 每次调用让 consumption 小幅增长，演示 Gauge 颜色梯度（绿→黄→红）。
+- `get_overlay_runtime` 保持稳定值，查询无副作用；Gauge 颜色由阈值与当前用量决定。
 
 ### 6.7 与原版的差异与有意省略
 
 **接入 UI 的扩展**（原版有实现但未接线）：
 1. `ResetSettings`（仪表盘 `[R]`，确认弹窗，文案注明"将重置全部 UWF 配置"）
 2. `RestartSystem` / `ShutdownSystem`（`[F10]`/`[F11]`，确认弹窗）
-3. `RemoveAllExclusions` 保留在 Windows 后端内部使用（导入前可选清空），UI 不单独暴露
+3. `RemoveAllExclusions` 当前未实现；如需“导入前清空”应先补后端方法，UI 不单独暴露
 
 **有意省略**（登记备查）：
 1. `UWF_Servicing`（Windows 更新服务模式）——原版为全空壳（方法均 `return 0`，未实现）
@@ -367,7 +367,7 @@ pub enum BackendEvent {
 - **Tab 2**：Table 列为 盘符/当前保护/下次保护；`[P]` 保护、`[U]` 取消保护（R2，立即体现"下次"列变化）。
 - **Tab 3**：左栏文件排除、右栏注册表排除（`←/→` 切换焦点）；`[S]` 切换"当前生效/下次生效"视图；`[A]` 添加文件排除（FilePicker 或手输）、`[R]` 添加注册表排除（输入框）；`[D]` 删除选中；**`[I]` 导入 txt（逐行：`HK` 前缀→注册表，其余→文件）、`[X]` 导出当前视图至 `EXCLUSIONLIST_yyyy_MM_dd_HH_mm_ss.txt`**（文件名格式与原版一致）。
 - **Tab 4**：`[F]` FilePicker 选文件 → CommitFile；`[D]` 删除提交（**确认弹窗注明"将立即删除该文件并固化删除"**，R3）；`[R]` 输入注册表完整路径 → CommitRegistry（R5）。
-- **全局**：`[1-4]`/`[Tab]` 切页、`[F5]` 全量刷新、`[?]` 帮助弹窗、`[Q]`/`Esc` 退出（变更在途时 Esc 仅取消弹窗）。
+- **全局**：`[1-4]`/`[Tab]` 切页、`[F5]` 全量刷新、`[?]` 帮助弹窗、`[Q]`/`Esc` 退出；变更在途时 `Q/Esc` 弹出退出确认，确认后才退出（普通弹窗内 Esc 仍只取消弹窗）。
 
 ---
 

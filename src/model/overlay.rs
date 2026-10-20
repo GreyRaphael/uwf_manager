@@ -36,7 +36,6 @@ impl OverlayType {
 /// Overlay 配置（对应 `UWF_OverlayConfig`，按当前/下次会话各一份）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayConfig {
-    pub current_session: bool,
     pub overlay_type: OverlayType,
     pub max_size_mb: u32,
 }

@@ -23,7 +23,7 @@ Windows 统一写入筛选器（UWF）的终端用户界面（TUI）管理工具
 | 用途 | 要求 |
 | :--- | :--- |
 | 任意平台开发预览 | Rust 1.99+（stable） |
-| Windows 本机构建 | 无需额外组件（embed-resource 使用工具链自带资源编译器） |
+| Windows 本机构建 | 通常需要 `rc.exe`（VS Build Tools / Windows SDK）或 `windres`；`embed-resource` 会调用工具链资源编译器 |
 | Linux 交叉 check / build | `llvm-rc`（或 `x86_64-w64-mingw32-windres`）；构建 exe 另需 `x86_64-w64-mingw32-gcc` 链接器 |
 
 ### Linux / macOS 开发预览（Mock 数据）
@@ -125,11 +125,14 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter
 
 ```bash
 cargo clippy --all-targets -- -D warnings   # 零告警基线（双 target 均通过）
-cargo test                                  # 单元 + reducer + UI 渲染断言（23 项）
+cargo build                                 # smoke 测试需要先构建 debug 二进制
+cargo test                                  # 单元 + reducer + UI 渲染断言
 cargo check --target x86_64-pc-windows-gnu  # Windows 目标编译验证
-python3 scripts/tui_smoke.py                # pty 端到端冒烟（虚拟屏幕断言）
+python3 scripts/tui_smoke.py                # pty 端到端冒烟（仅 Unix；在临时目录运行）
 ```
 
-架构：UI 线程（crossterm poll + 2s tick）⇄ `std::sync::mpsc` ⇄ 后端线程
-（actor 模式独占 `UwfBackend`，COM 套间约束天然规避）；全程序无异步运行时，
-`unsafe` 仅提权检测一处（模块内显式豁免）。
+架构：UI 线程（终端读取线程 + 后端回包转发线程统一汇入 `UiEvent` channel，
+2s tick 驱动 Overlay 轮询）⇄ `std::sync::mpsc` ⇄ 后端线程（actor 模式独占
+`UwfBackend`，COM 套间约束天然规避）；全程序无异步运行时。运行时代码的
+`unsafe` 仅 `backend/windows/elevate.rs` 一处（模块内显式豁免）；`build.rs`
+另有一处 `set_var`。

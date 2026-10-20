@@ -531,7 +531,11 @@ fn import_exclusions(
     path: &PathBuf,
 ) {
     let result = (|| -> Result<(usize, usize)> {
-        let content = std::fs::read_to_string(path)?;
+        // 明确只支持 UTF-8；UTF-16 等编码给出可操作的中文错误，而不是底层 IO 报错。
+        let bytes = std::fs::read(path)?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| UwfError::InvalidPath("导入文件须为 UTF-8 编码".into()))?;
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
         let mut ok = 0;
         let mut failed = 0;
         for line in content.lines() {
@@ -601,7 +605,13 @@ fn export_exclusions(
         let registry = backend.get_registry_exclusions(current_session)?;
         let mut lines: Vec<String> = files.iter().map(|e| e.display()).collect();
         lines.extend(registry);
-        std::fs::write(path, lines.join("\n") + "\n")?;
+        // 空列表导出 0 字节，不写一个只有换行符的文件。
+        let body = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        };
+        std::fs::write(path, body)?;
         Ok(lines.len())
     })();
     match result {
@@ -812,6 +822,51 @@ mod tests {
         assert!(matches!(
             finished_outcomes(&rx).as_slice(),
             [Outcome::Warning(_)]
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn import_strips_utf8_bom_and_export_empty_is_zero_bytes() {
+        let dir = std::env::temp_dir().join(format!("uwf_bom_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bom = dir.join("bom.txt");
+        std::fs::write(&bom, "\u{feff}C:\\Windows\\Bom\n").unwrap();
+        let mut backend = MockUwfBackend::demo();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        import_exclusions(1, &mut backend, &tx, &bom);
+        assert!(
+            backend
+                .get_file_exclusions(false)
+                .unwrap()
+                .iter()
+                .any(|e| e.display() == "C:\\Windows\\Bom")
+        );
+
+        let export = dir.join("empty.txt");
+        let mut empty = MockUwfBackend::empty();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        export_exclusions(2, &mut empty, &tx, &export, false);
+        assert_eq!(std::fs::metadata(&export).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_rejects_non_utf8_with_clear_error() {
+        let dir = std::env::temp_dir().join(format!("uwf_utf16_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("utf16.txt");
+        std::fs::write(&path, [0xFF, 0xFE, b'C', 0, b':', 0]).unwrap();
+
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        import_exclusions(1, &mut backend, &tx, &path);
+        let outcomes = finished_outcomes(&rx);
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Outcome::Err(msg)] if msg.contains("UTF-8")
         ));
 
         let _ = std::fs::remove_dir_all(&dir);

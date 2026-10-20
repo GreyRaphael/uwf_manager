@@ -119,8 +119,10 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_volume_summary(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered().title("[卷保护摘要]");
-    let lines: Vec<Line> = if app.snapshot.volumes.is_empty() {
+    let lines: Vec<Line> = if !app.loaded {
         vec![Line::from(format!("  {}", text::LOADING))]
+    } else if app.snapshot.volumes.is_empty() {
+        vec![Line::from(format!("  {}", text::READY_EMPTY))]
     } else {
         app.snapshot
             .volumes

@@ -215,7 +215,6 @@ impl UwfBackend for WindowsWmiBackend {
     fn get_overlay_config(&mut self, current_session: bool) -> Result<OverlayConfig> {
         let c = self.overlay_config_instance(current_session)?;
         Ok(OverlayConfig {
-            current_session,
             overlay_type: OverlayType::from_u32(c.Type),
             max_size_mb: c.MaximumSize,
         })

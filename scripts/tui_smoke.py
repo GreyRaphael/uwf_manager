@@ -6,10 +6,13 @@
 到虚拟屏幕，并对每帧结束时的屏幕快照做断言。
 """
 import os, pty, time, fcntl, termios, struct, select, re, signal, sys, glob, unicodedata
+import shutil, tempfile
 
 ROWS, COLS = 35, 110
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = "./target/debug/uwf_manager"
+BIN = os.path.join(REPO, "target/debug/uwf_manager")
+# 在临时目录运行，避免导出文件的 glob 误删仓库/用户文件。
+RUN_DIR = tempfile.mkdtemp(prefix="uwf_smoke_")
 
 
 def char_width(ch):
@@ -17,8 +20,12 @@ def char_width(ch):
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
-def run_tui(schedule, duration=8.0, cwd=REPO):
-    """在 pty 中运行 TUI，返回 (exit_code, 每帧屏幕快照列表)。"""
+def run_tui(schedule, duration=8.0, cwd=None):
+    """在 pty 中运行 TUI，返回 (exit_code, 每帧屏幕快照列表)。
+
+    默认在 RUN_DIR 临时目录运行，导出文件不会落到仓库。
+    """
+    cwd = cwd or RUN_DIR
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     pid = os.fork()
@@ -115,7 +122,7 @@ def scenario_1():
         (7.2, b"q"),
     ]
     code, frames = run_tui(sched)
-    exported = glob.glob(os.path.join(REPO, "EXCLUSIONLIST_*.txt"))
+    exported = glob.glob(os.path.join(RUN_DIR, "EXCLUSIONLIST_*.txt"))
     export_ok = False
     if exported:
         content = open(exported[0]).read()
@@ -180,4 +187,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutil.rmtree(RUN_DIR, ignore_errors=True)

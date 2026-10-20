@@ -32,8 +32,6 @@ pub struct UWF_Overlay {
 pub struct UWF_OverlayConfig {
     #[serde(rename = "__Path")]
     pub path: String,
-    #[allow(dead_code)]
-    pub CurrentSession: bool,
     pub Type: u32,
     pub MaximumSize: u32,
 }
@@ -43,8 +41,6 @@ pub struct UWF_OverlayConfig {
 pub struct UWF_Volume {
     #[serde(rename = "__Path")]
     pub path: String,
-    #[allow(dead_code)]
-    pub CurrentSession: bool,
     pub DriveLetter: String,
     /// 与原版一致：属性可能为 null，缺省视为不保护
     pub Protected: Option<bool>,
@@ -55,8 +51,6 @@ pub struct UWF_Volume {
 pub struct UWF_RegistryFilter {
     #[serde(rename = "__Path")]
     pub path: String,
-    #[allow(dead_code)]
-    pub CurrentSession: bool,
 }
 
 // ── 方法出参 ──
