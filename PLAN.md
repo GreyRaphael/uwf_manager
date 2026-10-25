@@ -93,25 +93,33 @@ embed-resource = "3"   # build.rs 内按 CARGO_CFG_TARGET_OS == "windows" 条件
 
 ```mermaid
 graph TD
-    subgraph UI_Thread ["UI 线程 (main)"]
-        Loop[事件循环: crossterm poll 超时即 2s tick] --> AppState[AppState 状态机<br/>Tab/选区/输入缓存/Toast/pending 标志]
+    subgraph UI_Thread ["UI 主线程 (main)"]
+        UiRx[UiEvent channel<br/>Terminal / Backend] --> Loop[recv_timeout + 2s tick]
+        Loop --> AppState[AppState 状态机<br/>Tab/选区/初始加载/变更 RequestId/Toast]
         AppState --> Views[4 个 Tab 视图 + 模态组件<br/>FilePicker/InputDialog/Confirm/Help]
     end
 
+    subgraph Aux_Threads ["辅助线程"]
+        TermReader[终端读取线程] --> UiRx
+        Fwd[后端回包转发线程] --> UiRx
+    end
+
     subgraph Backend_Thread ["后端线程 (actor)"]
-        Recv[mpsc Receiver BackendCmd] --> Backend[dyn UwfBackend<br/>独占 WMI 连接 / Mock 状态机]
+        Recv[mpsc Receiver BackendCommand] --> Backend[dyn UwfBackend<br/>独占 WMI 连接 / Mock 状态机]
         Backend --> Send[mpsc Sender BackendEvent]
     end
 
-    UI_Thread <-->|BackendCmd / BackendEvent<br/>std::sync::mpsc| Backend_Thread
+    UI_Thread -->|BackendCommand<br/>std::sync::mpsc| Backend_Thread
+    Send -->|BackendEvent| Fwd
     Backend <-->|cfg windows: wmi crate| WMI["WMI root\\standardcimv2\\embedded<br/>UWF_Filter / UWF_Overlay / UWF_OverlayConfig<br/>UWF_Volume / UWF_RegistryFilter"]
     Backend <-->|cfg not windows 或 --mock| Mock[MockUwfBackend 仿真数据]
 ```
 
 要点：
-- **UI 永不阻塞**：所有 WMI 调用都在后端线程执行；UI 发出命令后置 `pending`，收到 `BackendEvent` 后更新状态并弹 Toast。
-- **2 秒监测**：UI 线程本地计时，每 2 秒发 `BackendCmd::RefreshOverlayRuntime`，回复仅更新 Overlay 区域。
-- 同一时刻只允许一条变更类命令在途（查询类可并发入队），Mock 下即时回包，Windows 下 WMI 调用耗时也可感知。
+- **UI 永不阻塞**：所有 WMI 调用都在后端线程执行；UI 发命令时分配 `RequestId`，变更用 `mutation: Option<RequestId>` 表示，只有匹配 id 的 `Finished` 才解除；查询回包不会误解锁。
+- **2 秒监测**：主循环使用 `ui_rx.recv_timeout(距下个 tick 的剩余时间)`；终端输入与后端回包都会立即唤醒，超时后发 `BackendCmd::RefreshOverlayRuntime`，回复仅更新 Overlay 区域。
+- 同一时刻只允许一条变更类命令在途（查询类可并发入队）；`Quit` 带停止 ack，主线程最多等待 2 秒。
+- 初始全量查询无论成功或失败都会结束 `initial_load`；失败时由 `load_failed` 驱动“加载失败，按 F5 重试”。
 
 ---
 

@@ -54,6 +54,10 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]),
         ],
+        None if app.load_failed => vec![Line::styled(
+            format!("  {}", text::LOAD_FAILED),
+            theme::err(),
+        )],
         None => vec![Line::from(format!("  {}", text::LOADING))],
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -69,7 +73,15 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
         app.snapshot.overlay_config_current,
         app.snapshot.overlay_runtime,
     ) else {
-        frame.render_widget(Paragraph::new(format!("  {}", text::LOADING)), inner);
+        let (message, style) = if app.load_failed {
+            (text::LOAD_FAILED, theme::err())
+        } else {
+            (text::LOADING, ratatui::style::Style::default())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!("  {message}"), style)),
+            inner,
+        );
         return;
     };
 
@@ -119,7 +131,12 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_volume_summary(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered().title("[卷保护摘要]");
-    let lines: Vec<Line> = if !app.loaded {
+    let lines: Vec<Line> = if app.load_failed {
+        vec![Line::styled(
+            format!("  {}", text::LOAD_FAILED),
+            theme::err(),
+        )]
+    } else if !app.loaded {
         vec![Line::from(format!("  {}", text::LOADING))]
     } else if app.snapshot.volumes.is_empty() {
         vec![Line::from(format!("  {}", text::READY_EMPTY))]

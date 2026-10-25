@@ -4,6 +4,7 @@ use crate::backend::BackendKind;
 
 pub const READY: &str = "就绪";
 pub const LOADING: &str = "加载中…";
+pub const LOAD_FAILED: &str = "加载失败，按 [F5] 重试";
 pub const READY_EMPTY: &str = "（无）";
 pub const HOTKEY_BAR: &str = "[Tab] 切换页面  [↑/↓] 选择  [←/→] 切换栏  [F5] 全部刷新  [Q] 退出";
 pub const NI_HOTKEY_BAR: &str = "[F5] 重新检测  [Q] 退出  [ ? ] 帮助";

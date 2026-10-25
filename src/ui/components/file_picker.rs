@@ -389,7 +389,8 @@ mod tests {
     fn directory_label_has_exactly_one_separator() {
         let separator = std::path::MAIN_SEPARATOR;
         let expected = format!("C:{separator}");
-        // 同时覆盖普通目录名和 list_drives 已带尾部分隔符的真实盘符形态。
+        // 同时覆盖普通目录名和带尾部分隔符的盘符形态（当前 list_drives 已 trim，
+        // 第二种是防御性覆盖）。
         for name in ["C:".to_string(), expected.clone()] {
             let entry = PickerEntry {
                 name,

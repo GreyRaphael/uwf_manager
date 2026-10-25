@@ -201,4 +201,19 @@ mod tests {
             "不应使用 next 上限:\n{screen}"
         );
     }
+    #[test]
+    fn initial_load_failure_shows_retry_hint() {
+        let mut app = test_app();
+        app.initial_load = None;
+        app.load_failed = true;
+        let screen = render_to_string(&mut app, 100, 30);
+        assert!(
+            screen.contains("加载失败，按[F5]重试"),
+            "加载失败应提示重新检测:\n{screen}"
+        );
+        assert!(
+            !screen.contains("加载中…"),
+            "失败态不应再显示加载中:\n{screen}"
+        );
+    }
 }

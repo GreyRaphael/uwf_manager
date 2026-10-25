@@ -114,6 +114,8 @@ pub struct App {
     pub backend_lost: bool,
     /// 是否已成功加载过至少一次快照（区分“未加载”和“确实为空”）
     pub loaded: bool,
+    /// 初始加载失败且尚未重试成功（驱动“加载失败，按 F5 重试”提示）
+    pub load_failed: bool,
     pub snapshot: FullSnapshot,
     pub volumes_state: TableState,
     /// 排除项视图：true = 当前生效，false = 下次生效（原版默认下次）
@@ -157,6 +159,7 @@ impl App {
             not_installed: false,
             backend_lost: false,
             loaded: false,
+            load_failed: false,
             snapshot: FullSnapshot::default(),
             volumes_state,
             exclusion_session_current: false,
@@ -197,32 +200,47 @@ impl App {
         self.cmd_tx.send(BackendCommand { id, cmd }).is_ok()
     }
 
+    /// 后端线程不可用：进入错误态、清除在途状态，并记录一次失败原因。
+    fn mark_backend_lost(&mut self, message: &str) {
+        let first = !self.backend_lost;
+        self.backend_lost = true;
+        self.mutation = None;
+        self.initial_load = None;
+        if !self.loaded {
+            self.load_failed = true;
+        }
+        if first {
+            self.log(false, message);
+        }
+    }
+
     /// 启动时发出第一次全量刷新（由 main 调用；单独方法便于测试不启动后台线程）。
     pub fn start_initial_load(&mut self) {
         let Some(id) = self.initial_load else {
             return;
         };
+        self.load_failed = false;
         if !self.send(id, BackendCmd::RefreshAll) {
-            self.initial_load = None;
-            self.backend_lost = true;
-            self.log(false, "后端线程已退出，无法加载 UWF 状态");
+            self.mark_backend_lost("后端线程已退出，无法加载 UWF 状态");
         }
     }
 
     /// F5 / 重新检测：查询不占用 mutation 锁。
     pub fn refresh_all(&mut self) {
+        // 重试后先回到“加载中”，避免旧失败提示一直挂着。
+        if !self.loaded {
+            self.load_failed = false;
+        }
         let id = self.next_request_id();
         if !self.send(id, BackendCmd::RefreshAll) {
-            self.backend_lost = true;
-            self.log(false, "后端线程已退出，无法刷新");
+            self.mark_backend_lost("后端线程已退出，无法刷新");
         }
     }
 
     fn send_overlay_refresh(&mut self) {
         let id = self.next_request_id();
         if !self.send(id, BackendCmd::RefreshOverlayRuntime) {
-            self.backend_lost = true;
-            self.log(false, "后端线程已退出，无法刷新 Overlay 状态");
+            self.mark_backend_lost("后端线程已退出，无法刷新 Overlay 状态");
         }
     }
 
@@ -239,8 +257,7 @@ impl App {
         }
         let id = self.next_request_id();
         if !self.send(id, cmd) {
-            self.backend_lost = true;
-            self.log(false, "后端线程已退出，操作未发送");
+            self.mark_backend_lost("后端线程已退出，操作未发送");
             return None;
         }
         self.mutation = Some(id);
@@ -292,12 +309,7 @@ impl App {
     }
 
     fn handle_disconnected(&mut self) {
-        if !self.backend_lost {
-            self.backend_lost = true;
-            self.mutation = None;
-            self.initial_load = None;
-            self.log(false, "后端线程已退出，请重启应用");
-        }
+        self.mark_backend_lost("后端线程已退出，请重启应用");
     }
 
     fn apply_event(&mut self, evt: BackendEvent) {
@@ -305,6 +317,7 @@ impl App {
             BackendEvent::Snapshot { id, snapshot } => {
                 self.snapshot = snapshot;
                 self.loaded = true;
+                self.load_failed = false;
                 if self.initial_load == Some(id) {
                     self.initial_load = None;
                 }
@@ -325,7 +338,8 @@ impl App {
             }
             BackendEvent::Finished { id, outcome } => {
                 // 启动查询失败也有终态；不能因错误回包让初始加载一直显示为执行中。
-                if self.initial_load == Some(id) {
+                let was_initial_load = self.initial_load == Some(id);
+                if was_initial_load {
                     self.initial_load = None;
                 }
                 if self.mutation == Some(id) {
@@ -346,6 +360,9 @@ impl App {
                     }
                     Outcome::Err(msg) => {
                         self.log(false, &msg);
+                        if was_initial_load {
+                            self.load_failed = true;
+                        }
                         if self
                             .power_action
                             .is_some_and(|(power_id, _)| power_id == id)
@@ -359,6 +376,7 @@ impl App {
                 if self.initial_load == Some(id) {
                     self.initial_load = None;
                 }
+                self.load_failed = false;
                 self.not_installed = true;
                 self.modal = None;
                 self.log(false, "UWF 功能未安装或未启用");
@@ -401,52 +419,50 @@ impl App {
         });
     }
 
-    /// 记录当前选中项的稳定 key（文件用盘符+相对路径，注册表用完整 key）。
-    fn remember_selection(&mut self) {
-        self.selected_file_key = self
-            .file_exclusion_state
+    /// 当前文件排除项的稳定 key（盘符 + 相对路径）。
+    fn current_file_key(&self) -> Option<(String, String)> {
+        self.file_exclusion_state
             .selected()
             .and_then(|i| self.visible_file_exclusions().get(i))
-            .map(|e| (e.drive_letter.clone(), e.file_rel_path.clone()));
-        self.selected_registry_key = self
-            .registry_exclusion_state
-            .selected()
-            .and_then(|i| self.visible_registry_exclusions().get(i))
-            .cloned();
+            .map(|e| (e.drive_letter.clone(), e.file_rel_path.clone()))
     }
 
-    /// 快照/排序变化后按 key 恢复选中；首次出现列表项时记录默认选中项的 key。
-    /// key 已存在但对应项消失时保留 clamp 后的索引，等待后续选择或快照收敛。
+    /// 当前注册表排除项的稳定 key。
+    fn current_registry_key(&self) -> Option<String> {
+        self.registry_exclusion_state
+            .selected()
+            .and_then(|i| self.visible_registry_exclusions().get(i))
+            .cloned()
+    }
+
+    /// 记录当前选中项的稳定 key。
+    fn remember_selection(&mut self) {
+        self.selected_file_key = self.current_file_key();
+        self.selected_registry_key = self.current_registry_key();
+    }
+
+    /// 快照/排序变化后按 key 恢复选中。
+    /// key 尚未建立（首次快照）或对应项已消失（被删除）时，重新锚定到
+    /// clamp 后的选中项，避免后续插入项时选中索引无声漂移。
     fn restore_selection(&mut self) {
-        if let Some((drive, rel)) = self.selected_file_key.clone() {
-            if let Some(i) = self
-                .visible_file_exclusions()
+        let file_hit = self.selected_file_key.clone().and_then(|(drive, rel)| {
+            self.visible_file_exclusions()
                 .iter()
                 .position(|e| e.drive_letter == drive && e.file_rel_path == rel)
-            {
-                self.file_exclusion_state.select(Some(i));
-            }
-        } else {
-            self.selected_file_key = self
-                .file_exclusion_state
-                .selected()
-                .and_then(|i| self.visible_file_exclusions().get(i))
-                .map(|e| (e.drive_letter.clone(), e.file_rel_path.clone()));
+        });
+        match file_hit {
+            Some(i) => self.file_exclusion_state.select(Some(i)),
+            None => self.selected_file_key = self.current_file_key(),
         }
-        if let Some(key) = self.selected_registry_key.clone() {
-            if let Some(i) = self
-                .visible_registry_exclusions()
+
+        let registry_hit = self.selected_registry_key.clone().and_then(|key| {
+            self.visible_registry_exclusions()
                 .iter()
                 .position(|k| k == &key)
-            {
-                self.registry_exclusion_state.select(Some(i));
-            }
-        } else {
-            self.selected_registry_key = self
-                .registry_exclusion_state
-                .selected()
-                .and_then(|i| self.visible_registry_exclusions().get(i))
-                .cloned();
+        });
+        match registry_hit {
+            Some(i) => self.registry_exclusion_state.select(Some(i)),
+            None => self.selected_registry_key = self.current_registry_key(),
         }
     }
 
@@ -624,6 +640,20 @@ impl App {
                     ExclusionFocus::Registry => {
                         let len = self.visible_registry_exclusions().len();
                         move_selection(self.registry_exclusion_state.selected_mut(), len, delta);
+                    }
+                }
+                self.remember_selection();
+            }
+            KeyCode::Home | KeyCode::End => {
+                let end = key.code == KeyCode::End;
+                match self.exclusion_focus {
+                    ExclusionFocus::Files => {
+                        let len = self.visible_file_exclusions().len();
+                        select_edge(self.file_exclusion_state.selected_mut(), len, end);
+                    }
+                    ExclusionFocus::Registry => {
+                        let len = self.visible_registry_exclusions().len();
+                        select_edge(self.registry_exclusion_state.selected_mut(), len, end);
                     }
                 }
                 self.remember_selection();
@@ -901,6 +931,17 @@ fn unique_export_path(path: PathBuf) -> PathBuf {
     unreachable!("unbounded unique filename search")
 }
 
+/// Home/End：选中首项或末项；空列表清空选中。
+fn select_edge(selected: &mut Option<usize>, len: usize, end: bool) {
+    *selected = if len == 0 {
+        None
+    } else if end {
+        Some(len - 1)
+    } else {
+        Some(0)
+    };
+}
+
 fn move_selection(selected: &mut Option<usize>, len: usize, delta: isize) {
     if len == 0 {
         *selected = None;
@@ -1048,13 +1089,25 @@ pub(crate) mod tests {
             outcome: Outcome::Err("temporary WMI failure".into()),
         });
         assert!(!app.is_busy(), "初始查询失败也必须结束加载状态");
+        assert!(app.load_failed, "初始查询失败应进入可重试的失败态");
 
         app.apply_event(BackendEvent::Snapshot {
             id: 1,
             snapshot: demo_snapshot(),
         });
         assert!(app.loaded);
+        assert!(!app.load_failed, "成功刷新必须清除失败态");
         assert!(!app.is_busy(), "后续成功刷新不应恢复或遗留加载状态");
+
+        // F5 重试开始后先回到“加载中”，不等回包再清除旧失败提示。
+        let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
+        app.apply_event(BackendEvent::Finished {
+            id: 0,
+            outcome: Outcome::Err("temporary WMI failure".into()),
+        });
+        assert!(app.load_failed);
+        app.refresh_all();
+        assert!(!app.load_failed);
     }
 
     #[test]
@@ -1221,6 +1274,25 @@ pub(crate) mod tests {
             }
             other => panic!("期望 RemoveRegistryExclusion，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn exclusions_home_end_move_selection() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Exclusions;
+        let mut snapshot = demo_snapshot();
+        snapshot.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\B".into()),
+        ];
+        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.file_exclusion_state.selected(), Some(1));
+        assert_eq!(app.selected_file_key, Some(("C:".into(), "\\B".into())));
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.file_exclusion_state.selected(), Some(0));
+        assert_eq!(app.selected_file_key, Some(("C:".into(), "\\A".into())));
     }
 
     #[test]
@@ -1395,11 +1467,45 @@ pub(crate) mod tests {
 
         app.handle_disconnected();
         assert!(app.backend_lost);
+        assert!(app.load_failed, "断线时未加载成功应显示可重试的失败态");
         assert!(!app.is_busy()); // 不会永久 pending
 
         app.on_dashboard_key(key(KeyCode::Char('e')));
         assert!(cmd_rx.try_recv().is_err());
     }
+    #[test]
+    fn selection_reanchors_after_selected_item_removed() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+
+        // 选中项被删除：选择收敛到相邻项，并把 key 重新锚定到该项。
+        let mut snapshot = demo_snapshot();
+        snapshot.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\B".into()),
+        ];
+        snapshot.registry_exclusions_next = vec!["HKLM\\SOFTWARE\\A".into()];
+        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+        assert_eq!(app.file_exclusion_state.selected(), Some(0));
+        assert_eq!(app.selected_file_key, Some(("C:".into(), "\\A".into())));
+        assert_eq!(app.registry_exclusion_state.selected(), Some(0));
+        assert_eq!(app.selected_registry_key, Some("HKLM\\SOFTWARE\\A".into()));
+
+        // 后续插入排序更靠前的项：必须继续跟随 \A（index 1），不能漂移到 \0。
+        let mut snapshot = demo_snapshot();
+        snapshot.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\0".into()),
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\B".into()),
+        ];
+        snapshot.registry_exclusions_next =
+            vec!["HKLM\\SOFTWARE\\0".into(), "HKLM\\SOFTWARE\\A".into()];
+        app.apply_event(BackendEvent::Snapshot { id: 2, snapshot });
+        assert_eq!(app.file_exclusion_state.selected(), Some(1));
+        assert_eq!(app.selected_file_key, Some(("C:".into(), "\\A".into())));
+        assert_eq!(app.registry_exclusion_state.selected(), Some(1));
+        assert_eq!(app.selected_registry_key, Some("HKLM\\SOFTWARE\\A".into()));
+    }
+
     #[test]
     fn default_selection_identity_survives_reorder() {
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
