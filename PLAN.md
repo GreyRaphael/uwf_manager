@@ -34,7 +34,7 @@
 | # | 决策 | 结论与理由 |
 | :--- | :--- | :--- |
 | **D1** | 后端抽象 | 定义 `UwfBackend` Trait；`#[cfg(windows)]` → `WindowsWmiBackend`，其余平台 → `MockUwfBackend`。另提供 `--mock` 启动参数，Windows 上也可强制 Mock 预览（跳过运行时管理员检测；内嵌 manifest 仍为 `requireAdministrator`，启动仍可能触发 UAC）。 |
-| **D2** | 并发模型 | **不引入 tokio/crossbeam**。全程序仅 2 个线程：UI 线程（crossterm `event::poll` + 2 秒 tick）+ 后端线程（`std::sync::mpsc` 消息循环独占 WMI 连接）。2 秒轮询由 UI tick 发送刷新命令实现。 |
+| **D2** | 并发模型 | **不引入 tokio/crossbeam**。主流程由 UI 主线程、后端 actor 线程、后端回包转发线程和终端读取线程组成；终端事件与后端事件统一汇入 `UiEvent` channel，2 秒 tick 驱动 Overlay 轮询。后端实例仍在 actor 线程内构造并独占，满足 COM 套间约束。 |
 | **D3** | WMI 驱动选型 | **采用 `wmi` 0.18 crate**（而非裸 `windows` crate 手写 COM 胶水）。理由：① serde 化查询（`con.query::<UWF_Filter>()`）与方法调用（`exec_instance_method`，入参 `Serialize`、出参 `Deserialize`），消灭全部 VARIANT/SAFEARRAY 手工胶水；② COM 初始化与安全策略由 crate 托管；③ **运行时依赖不含 tokio**（tokio 仅为其 dev-dependency）；④ 底层即 `windows` 0.62，必要时可同模块内降级裸调。本机已在 `x86_64-unknown-linux-gnu` 与 `x86_64-pc-windows-gnu` 双 target 实测编译通过。 |
 | **D4** | COM 线程模型 | `wmi::WMIConnection` 为 `!Send + !Sync`（COM 套间约束），因此**后端线程独占连接**（actor 模式），UI 通过 channel 收发命令/事件，天然规避全部套间与 `Send/Sync` 问题。 |
 | **D5** | UAC 策略 | manifest 使用 `requireAdministrator`（与原版一致）。已知行为：从非提权终端启动时，UAC 确认后进程在**新控制台窗口**运行（Windows 机制使然，写入使用手册）。另加运行时 `TokenElevation` 检测兜底：非管理员（如无 manifest 的 dev 构建）打印中文引导并以退出码 2 退出。 |
@@ -289,6 +289,13 @@ struct ExcludedFile { FileName: String }
 ### 6.5 事件循环与线程协议
 
 ```rust
+pub type RequestId = u64;
+
+pub struct BackendCommand {
+    pub id: RequestId,
+    pub cmd: BackendCmd,
+}
+
 pub enum BackendCmd {
     RefreshAll, RefreshOverlayRuntime,
     EnableFilter, DisableFilter, ResetSettings,
@@ -301,20 +308,34 @@ pub enum BackendCmd {
     ImportExclusions { path: PathBuf },                          // 逐行: "HK" 前缀→注册表，其余→文件
     ExportExclusions { path: PathBuf, current_session: bool },   // 导出 UI 当前视图
     RestartSystem, ShutdownSystem,
-    Quit,                                                        // 结束后端线程
+    Quit,                                                        // 结束后端线程并发送停止 ack
+}
+
+pub enum Outcome {
+    Ok(String),
+    Warning(String),
+    OkWithRefreshWarning { message: String, warning: String },
+    Err(String),
 }
 
 pub enum BackendEvent {
-    Snapshot(Box<FullSnapshot>),      // RefreshAll 全量回包
-    OverlayRuntime(OverlayRuntime),   // 2s 增量回包
-    OpOk(String),                     // Toast（中文）
-    OpErr(String),                    // Toast（中文，含错误码）
+    Snapshot { id: RequestId, snapshot: FullSnapshot },
+    OverlayRuntime { id: RequestId, runtime: OverlayRuntime },
+    Finished { id: RequestId, outcome: Outcome },
+    NotInstalled { id: RequestId },
+}
+
+pub enum UiEvent {
+    Terminal(crossterm::event::Event),
+    Backend(BackendEvent),
 }
 ```
 
-- UI 主循环：`event::poll(距下个 tick 的剩余时间)`；超时 → 发 `RefreshOverlayRuntime`；每轮迭代先 drain 后端回包再绘制。
-- 变更类命令在途时 UI 显示 `⏳ 执行中…`，忽略后续变更键（查询不受影响）。
-- 重启/关机：确认弹窗 → 发送 → 收到 Ok 后显示"系统即将重启/关机"并干净退出 TUI（恢复终端）。
+- UI 主循环使用 `ui_rx.recv_timeout(距下个 tick 的剩余时间)`；终端输入与后端回包都能立即唤醒，超时后发送 `RefreshOverlayRuntime`。
+- 变更类命令在途时 UI 显示 `⏳ 执行中…`，只有匹配 `RequestId` 的 `Finished` 才解除变更锁；查询回包不会误解锁。
+- 初始全量查询无论成功或失败都会结束初始加载状态；后续 F5 使用新的请求 id，可独立恢复。
+- 重启/关机：确认后绑定请求 id；Windows 成功后不做全量刷新并退出 TUI，Mock 重启后刷新快照继续演示，失败则不退出。
+- UI 向后端发送命令失败会进入 `backend_lost` 并禁用管理键；退出时发送 `Quit`，主线程最多等待停止 ack 2 秒。
 - `main.rs` 安装 panic hook：任何 panic 先恢复终端再输出错误。
 
 ### 6.6 Mock 设计（`backend/mock.rs`）

@@ -278,7 +278,7 @@ fn list_drives() -> Vec<PickerEntry> {
 }
 
 fn entry_label(entry: &PickerEntry) -> String {
-    if entry.is_dir {
+    if entry.is_dir && !entry.name.ends_with(std::path::MAIN_SEPARATOR) {
         format!("{}{}", entry.name, std::path::MAIN_SEPARATOR)
     } else {
         entry.name.clone()
@@ -387,13 +387,16 @@ mod tests {
 
     #[test]
     fn directory_label_has_exactly_one_separator() {
-        let entry = PickerEntry {
-            name: "C:".into(),
-            path: PathBuf::from("C:\\"),
-            is_dir: true,
-        };
-        let label = entry_label(&entry);
-        assert_eq!(label, format!("C:{}", std::path::MAIN_SEPARATOR));
-        assert!(!label.contains("\\\\"));
+        let separator = std::path::MAIN_SEPARATOR;
+        let expected = format!("C:{separator}");
+        // 同时覆盖普通目录名和 list_drives 已带尾部分隔符的真实盘符形态。
+        for name in ["C:".to_string(), expected.clone()] {
+            let entry = PickerEntry {
+                name,
+                path: PathBuf::from("C:\\"),
+                is_dir: true,
+            };
+            assert_eq!(entry_label(&entry), expected);
+        }
     }
 }

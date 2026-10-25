@@ -324,6 +324,10 @@ impl App {
                 self.snapshot.overlay_runtime = Some(runtime);
             }
             BackendEvent::Finished { id, outcome } => {
+                // 启动查询失败也有终态；不能因错误回包让初始加载一直显示为执行中。
+                if self.initial_load == Some(id) {
+                    self.initial_load = None;
+                }
                 if self.mutation == Some(id) {
                     self.mutation = None;
                 }
@@ -411,23 +415,38 @@ impl App {
             .cloned();
     }
 
-    /// 快照/排序变化后按 key 恢复选中；key 不存在时保留 clamp 后的索引。
+    /// 快照/排序变化后按 key 恢复选中；首次出现列表项时记录默认选中项的 key。
+    /// key 已存在但对应项消失时保留 clamp 后的索引，等待后续选择或快照收敛。
     fn restore_selection(&mut self) {
-        if let Some((drive, rel)) = self.selected_file_key.clone()
-            && let Some(i) = self
+        if let Some((drive, rel)) = self.selected_file_key.clone() {
+            if let Some(i) = self
                 .visible_file_exclusions()
                 .iter()
                 .position(|e| e.drive_letter == drive && e.file_rel_path == rel)
-        {
-            self.file_exclusion_state.select(Some(i));
+            {
+                self.file_exclusion_state.select(Some(i));
+            }
+        } else {
+            self.selected_file_key = self
+                .file_exclusion_state
+                .selected()
+                .and_then(|i| self.visible_file_exclusions().get(i))
+                .map(|e| (e.drive_letter.clone(), e.file_rel_path.clone()));
         }
-        if let Some(key) = self.selected_registry_key.clone()
-            && let Some(i) = self
+        if let Some(key) = self.selected_registry_key.clone() {
+            if let Some(i) = self
                 .visible_registry_exclusions()
                 .iter()
                 .position(|k| k == &key)
-        {
-            self.registry_exclusion_state.select(Some(i));
+            {
+                self.registry_exclusion_state.select(Some(i));
+            }
+        } else {
+            self.selected_registry_key = self
+                .registry_exclusion_state
+                .selected()
+                .and_then(|i| self.visible_registry_exclusions().get(i))
+                .cloned();
         }
     }
 
@@ -1022,6 +1041,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn initial_load_error_finishes_and_later_refresh_recovers() {
+        let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
+        app.apply_event(BackendEvent::Finished {
+            id: 0,
+            outcome: Outcome::Err("temporary WMI failure".into()),
+        });
+        assert!(!app.is_busy(), "初始查询失败也必须结束加载状态");
+
+        app.apply_event(BackendEvent::Snapshot {
+            id: 1,
+            snapshot: demo_snapshot(),
+        });
+        assert!(app.loaded);
+        assert!(!app.is_busy(), "后续成功刷新不应恢复或遗留加载状态");
+    }
+
+    #[test]
     fn query_events_do_not_clear_mutation() {
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
         let mutation = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
@@ -1365,21 +1401,38 @@ pub(crate) mod tests {
         assert!(cmd_rx.try_recv().is_err());
     }
     #[test]
-    fn selection_identity_survives_reorder() {
+    fn default_selection_identity_survives_reorder() {
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
-        app.selected_file_key = Some(("C:".into(), "\\Windows\\Temp".into()));
+        // 不手工预填 key：首份快照必须为默认选中的文件和注册表项建立身份。
+        assert_eq!(
+            app.selected_file_key,
+            Some(("C:".into(), "\\Windows\\Temp".into()))
+        );
+        assert_eq!(
+            app.selected_registry_key,
+            Some("HKLM\\SOFTWARE\\UwfManagerDemo".into())
+        );
 
         let mut snapshot = demo_snapshot();
         snapshot.file_exclusions_next = vec![
             FileExclusion::new("C:".into(), "\\A".into()),
             FileExclusion::new("C:".into(), "\\Windows\\Temp".into()),
         ];
+        snapshot.registry_exclusions_next = vec![
+            "HKLM\\SOFTWARE\\A".into(),
+            "HKLM\\SOFTWARE\\UwfManagerDemo".into(),
+        ];
         app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
 
         assert_eq!(app.file_exclusion_state.selected(), Some(1));
+        assert_eq!(app.registry_exclusion_state.selected(), Some(1));
         assert_eq!(
             app.selected_file_key,
             Some(("C:".into(), "\\Windows\\Temp".into()))
+        );
+        assert_eq!(
+            app.selected_registry_key,
+            Some("HKLM\\SOFTWARE\\UwfManagerDemo".into())
         );
     }
     #[test]
