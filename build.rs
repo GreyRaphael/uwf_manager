@@ -34,17 +34,25 @@ fn main() {
         .expect("编译 Windows 资源（UAC 清单/图标）失败：请安装 mingw windres 或 llvm-rc");
 }
 
-/// 目标程序是否可在 PATH 上执行（spawn 成功即视为可用）
+/// 目标程序是否存在于 PATH 上且可执行（避免 spawn + kill 子进程）
 fn runnable(program: &str) -> bool {
-    use std::process::{Command, Stdio};
-    Command::new(program)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|mut child| {
-            let _ = child.kill();
-            let _ = child.wait();
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe"] } else { &[""] };
+    std::env::split_paths(&path).any(|dir| {
+        exts.iter().any(|ext| {
+            let cand = dir.join(format!("{program}{ext}"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                cand.metadata()
+                    .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            }
+            #[cfg(not(unix))]
+            {
+                cand.is_file()
+            }
         })
-        .is_ok()
+    })
 }
