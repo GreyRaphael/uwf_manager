@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::Alignment;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::ui::theme;
 
@@ -59,22 +59,26 @@ impl ConfirmState {
     }
 }
 
-pub fn render(frame: &mut Frame, state: &ConfirmState, area: Rect) {
-    let rect = centered_rect(56, 32, area);
+pub fn render(frame: &mut Frame, state: &ConfirmState, area: ratatui::layout::Rect) {
+    let rect = centered_rect(64, 42, area);
     let block = Block::bordered()
         .title(format!(" {} ", state.title))
         .border_style(theme::warn());
     frame.render_widget(Clear, rect);
-    let lines = vec![
-        Line::from(""),
-        Line::from(state.message.clone()),
-        Line::from(""),
-        Line::styled("[Enter] 确认    [Esc / N] 取消", theme::dim()),
-    ];
+    let mut lines = vec![Line::from("")];
+    lines.extend(
+        state
+            .message
+            .lines()
+            .map(|line| Line::from(line.to_string())),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::styled("[Enter] 确认    [Esc / N] 取消", theme::dim()));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .alignment(Alignment::Center),
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
         rect,
     );
 }

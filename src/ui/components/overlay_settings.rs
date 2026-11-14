@@ -2,7 +2,7 @@
 //!
 //! R1：筛选器当前启用时，类型与上限两行锁定（置灰且不可选中）。
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -162,7 +162,12 @@ impl OverlaySettingsState {
                 };
                 OverlayOutcome::Stay
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 if let Some(field) = self.text_field_mut() {
                     field.push(c);
                 }
@@ -228,10 +233,12 @@ pub fn render(frame: &mut Frame, state: &OverlaySettingsState, area: Rect) {
     if let Some(error) = &state.error {
         lines.push(Line::styled(error.clone(), theme::err()));
     }
-    lines.push(Line::styled(
-        "[↑/↓] 选择  [←/→] 切换类型  [Enter] 保存  [Esc] 取消",
-        theme::dim(),
-    ));
+    let hint = if locked {
+        "[↑/↓] 选择  [Enter] 保存  [Esc] 取消"
+    } else {
+        "[↑/↓] 选择  [←/→] 切换类型  [Enter] 保存  [Esc] 取消"
+    };
+    lines.push(Line::styled(hint, theme::dim()));
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
@@ -293,5 +300,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("尚未加载完成"))
         );
+    }
+
+    #[test]
+    fn ctrl_alt_digits_are_ignored() {
+        let mut s = state();
+        s.on_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL));
+        s.on_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::ALT));
+        assert_eq!(s.warning, "1536");
+
+        s.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(s.warning, "15360");
     }
 }

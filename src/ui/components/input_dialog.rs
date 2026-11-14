@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::ui::theme;
@@ -21,6 +21,8 @@ pub struct InputState {
     pub title: String,
     pub hint: String,
     pub buffer: String,
+    /// 光标所在 UTF-8 字符偏移（`0..=buffer.chars().count()`）
+    pub cursor: usize,
     pub action: InputAction,
     /// 是否支持 [F2] 打开文件选择器（仅 AddFileExclusion）
     pub browse: bool,
@@ -45,6 +47,7 @@ impl InputState {
             title: title.into(),
             hint: hint.into(),
             buffer: String::new(),
+            cursor: 0,
             action,
             browse,
         }
@@ -61,8 +64,36 @@ impl InputState {
             }
             KeyCode::Esc => InputOutcome::Cancel,
             KeyCode::F(2) if self.browse => InputOutcome::Browse,
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                InputOutcome::Stay
+            }
+            KeyCode::Right => {
+                let len = self.buffer.chars().count();
+                self.cursor = (self.cursor + 1).min(len);
+                InputOutcome::Stay
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                InputOutcome::Stay
+            }
+            KeyCode::End => {
+                self.cursor = self.buffer.chars().count();
+                InputOutcome::Stay
+            }
             KeyCode::Backspace => {
-                self.buffer.pop();
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    let idx = char_to_byte(&self.buffer, self.cursor);
+                    self.buffer.remove(idx);
+                }
+                InputOutcome::Stay
+            }
+            KeyCode::Delete => {
+                let idx = char_to_byte(&self.buffer, self.cursor);
+                if idx < self.buffer.len() {
+                    self.buffer.remove(idx);
+                }
                 InputOutcome::Stay
             }
             KeyCode::Char(c)
@@ -70,12 +101,59 @@ impl InputState {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.buffer.push(c);
+                let idx = char_to_byte(&self.buffer, self.cursor);
+                self.buffer.insert(idx, c);
+                self.cursor += 1;
                 InputOutcome::Stay
             }
             _ => InputOutcome::Stay,
         }
     }
+}
+
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
+}
+
+/// 按 UTF-8 显示列宽计算可见子串及光标在可见串内的列偏移。
+fn visible_window(s: &str, cursor_char: usize, max_cols: usize) -> (&str, u16) {
+    let chars: Vec<(usize, usize, usize)> = s
+        .char_indices()
+        .map(|(i, c)| {
+            let end = i + c.len_utf8();
+            (i, end, Span::raw(&s[i..end]).width())
+        })
+        .collect();
+    let cursor = cursor_char.min(chars.len());
+
+    let mut start = cursor;
+    let mut used = 0usize;
+    while start > 0 {
+        let w = chars[start - 1].2;
+        if used + w > max_cols {
+            break;
+        }
+        used += w;
+        start -= 1;
+    }
+    let cursor_col = used;
+
+    let mut end = cursor;
+    while end < chars.len() {
+        let w = chars[end].2;
+        if used + w > max_cols {
+            break;
+        }
+        used += w;
+        end += 1;
+    }
+
+    let slice = if start >= end {
+        ""
+    } else {
+        &s[chars[start].0..chars[end - 1].1]
+    };
+    (slice, cursor_col as u16)
 }
 
 pub fn render(frame: &mut Frame, state: &InputState, area: Rect) {
@@ -88,11 +166,9 @@ pub fn render(frame: &mut Frame, state: &InputState, area: Rect) {
     } else {
         "[Enter] 确认    [Esc] 取消"
     };
-    // 横向滚动：只显示能放进输入框的尾部，避免长路径溢出。
+    // 横向滚动：按显示列宽窗口展示，兼容中文宽字符路径。
     let inner_width = rect.width.saturating_sub(4) as usize; // border 2 + "> " 2
-    let chars: Vec<char> = state.buffer.chars().collect();
-    let shown = inner_width.min(chars.len());
-    let display: String = chars[chars.len() - shown..].iter().collect();
+    let (display, cursor_col) = visible_window(&state.buffer, state.cursor, inner_width);
 
     let lines = vec![
         Line::styled(state.hint.clone(), theme::dim()),
@@ -103,13 +179,10 @@ pub fn render(frame: &mut Frame, state: &InputState, area: Rect) {
     ];
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 
-    // 显示文本光标：border(1) + "> "(2) = rect.x + 3
-    // CJK 宽字符仍按 1 计（路径以 ASCII 为主），超出右边界时钳制。
-    let cursor_x = rect.x + 3 + shown as u16;
-    frame.set_cursor_position(Position::new(
-        cursor_x.min(rect.x + rect.width - 2),
-        rect.y + 3,
-    ));
+    // 显示文本光标：border(1) + "> "(2) = rect.x + 3，窄终端下安全钳制避免下溢。
+    let cursor_x = (rect.x + 3 + cursor_col).min(rect.x + rect.width.saturating_sub(2));
+    let cursor_y = (rect.y + 3).min(rect.y + rect.height.saturating_sub(2));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 #[cfg(test)]
@@ -144,5 +217,46 @@ mod tests {
             no_browse.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             InputOutcome::Stay
         ));
+    }
+
+    #[test]
+    fn cursor_edits_utf8_mid_string_and_computes_cjk_width() {
+        let mut state = InputState::new("t", "h", InputAction::AddFileExclusion, false);
+        for c in ['C', ':', '\\', '中', '文'] {
+            state.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(state.cursor, 5);
+        assert_eq!(
+            visible_window(&state.buffer, state.cursor, 10),
+            ("C:\\中文", 7)
+        );
+
+        // 移到 "中" 后插入 'X'，再用 Delete 删 "文"
+        state.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(state.buffer, "C:\\中X文");
+        assert_eq!(
+            visible_window(&state.buffer, state.cursor, 10),
+            ("C:\\中X文", 6)
+        );
+
+        state.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(state.buffer, "C:\\中X");
+        state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            visible_window(&state.buffer, state.cursor, 5),
+            ("C:\\中", 0)
+        );
+        state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.cursor, 5);
+    }
+
+    #[test]
+    fn render_on_tiny_terminal_does_not_underflow() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let state = InputState::new("t", "h", InputAction::AddFileExclusion, false);
+        let mut terminal = Terminal::new(TestBackend::new(4, 4)).unwrap();
+        terminal.draw(|f| render(f, &state, f.area())).unwrap();
     }
 }
