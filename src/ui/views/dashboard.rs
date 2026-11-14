@@ -42,16 +42,6 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                     "[E] 启用  [D] 禁用  [R] 重置配置  [S] Overlay 配置  [F10] 重启  [F11] 关机",
                     theme::dim(),
                 ),
-                Span::styled(
-                    if app.phase == Phase::BackendLost {
-                        "   ⚠ 后端已断开"
-                    } else if app.is_busy() {
-                        "   ⏳ 执行中…"
-                    } else {
-                        ""
-                    },
-                    theme::warn(),
-                ),
             ]),
         ],
         None if app.phase == Phase::LoadFailed => vec![Line::styled(
@@ -89,24 +79,29 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let [info_area, gauge_area, avail_area] = Layout::vertical([
+    let [info_area, threshold_area, gauge_area, avail_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
 
-    // 与原版一致：类型展示当前会话、上限展示下次会话（R1 锁定规则的直观呈现）
+    // 与原版一致：类型展示当前会话、上限展示下次会话（R1 锁定规则的直观呈现）；
+    // 分两行展示，保证 80 列宽终端下预警/临界阈值不被截断。
     let info = Line::from(format!(
-        "  类型: {}（当前: {}）  上限: {} MB（当前: {} MB）  预警: {} MB   临界: {} MB",
+        "  类型: {}（当前: {}）  上限: {} MB（当前: {} MB）",
         next.overlay_type.label(),
         current.overlay_type.label(),
         next.max_size_mb,
         current.max_size_mb,
-        runtime.warning_threshold_mb,
-        runtime.critical_threshold_mb,
     ));
     frame.render_widget(Paragraph::new(info), info_area);
+    let thresholds = Line::from(format!(
+        "  预警: {} MB   临界: {} MB",
+        runtime.warning_threshold_mb, runtime.critical_threshold_mb,
+    ));
+    frame.render_widget(Paragraph::new(thresholds), threshold_area);
 
     // 百分比基准必须是当前会话上限：runtime 来自 UWF_Overlay（当前会话）。
     let max_size = current.max_size_mb.max(1);

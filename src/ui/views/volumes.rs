@@ -8,6 +8,10 @@ use crate::app::App;
 use crate::ui::{text, theme};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().title("[卷保护管理]  [P] 保护  [U] 取消保护");
+    if super::render_load_placeholder(frame, app, area, block.clone()) {
+        return;
+    }
     let header = Row::new(["盘符", "当前保护", "下次保护"]).style(theme::title());
     let rows = app.snapshot.volumes.iter().map(|v| {
         Row::new([
@@ -24,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(14),
         ],
     )
-    .block(Block::bordered().title("[卷保护管理]  [P] 保护  [U] 取消保护"))
+    .block(block)
     .header(header)
     .row_highlight_style(theme::selected())
     .highlight_symbol("▶ ");

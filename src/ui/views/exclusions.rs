@@ -2,14 +2,22 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::widgets::{Block, List, ListItem};
+use ratatui::widgets::{Block, List, ListItem, Paragraph};
 
 use crate::app::{App, ExclusionFocus};
 use crate::ui::{text, theme};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    if super::render_load_placeholder(frame, app, area, Block::bordered().title("[排除项管理]"))
+    {
+        return;
+    }
+
+    let [cols_area, hint_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let [files_area, registry_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(cols_area);
 
     let session_label = if app.exclusion_session_current {
         "当前生效"
@@ -28,9 +36,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let files = List::new(file_items)
         .block(
             Block::bordered()
-                .title(format!(
-                    "[文件排除项] {session_label}{edit_hint}  [A] 添加 [I] 导入 [X] 导出"
-                ))
+                .title(format!("[文件排除] {session_label}{edit_hint}"))
                 .border_style(theme::focus_border(files_focused)),
         )
         .highlight_style(theme::selected())
@@ -41,14 +47,20 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let registry = List::new(registry_items)
         .block(
             Block::bordered()
-                .title(format!(
-                    "[注册表排除项]{edit_hint}  [R] 添加 [D] 删除  [S] 视图"
-                ))
+                .title(format!("[注册表排除]{edit_hint}"))
                 .border_style(theme::focus_border(registry_focused)),
         )
         .highlight_style(theme::selected())
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(registry, registry_area, &mut app.registry_exclusion_state);
+
+    frame.render_widget(
+        Paragraph::new(
+            "  [A] 添加文件  [R] 添加注册表  [D] 删除  [I] 导入  [X] 导出  [S] 切换视图",
+        )
+        .style(theme::dim()),
+        hint_area,
+    );
 }
 
 fn items_or_empty(iter: impl Iterator<Item = String>) -> Vec<ListItem<'static>> {

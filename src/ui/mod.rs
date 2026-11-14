@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Dashboard => views::dashboard::render(frame, app, body_area),
             Tab::Volumes => views::volumes::render(frame, app, body_area),
             Tab::Exclusions => views::exclusions::render(frame, app, body_area),
-            Tab::Commit => views::commit::render(frame, app, body_area),
+            Tab::Commit => views::commit::render(frame, body_area),
         }
         render_hotkeys(frame, hotkey_area, false);
     }
@@ -84,8 +84,9 @@ fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect, not_installed:
 mod tests {
     use super::*;
     use crate::app::tests::demo_snapshot;
-    use crate::app::{App, Modal, Phase};
+    use crate::app::{App, Modal, Phase, Tab};
     use crate::backend::BackendKind;
+    use crate::ui::components::confirm::{ConfirmAction, ConfirmState};
     use crate::ui::components::overlay_settings::OverlaySettingsState;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -213,5 +214,94 @@ mod tests {
             !screen.contains("加载中…"),
             "失败态不应再显示加载中:\n{screen}"
         );
+    }
+
+    #[test]
+    fn confirm_wraps_multiline_long_path_at_80x24() {
+        let mut app = test_app();
+        app.phase = Phase::Ready;
+        let long_path =
+            r"C:\Users\Administrator\AppData\Local\Temp\very_long_folder_name\target_subfile.log";
+        app.modal = Some(Modal::Confirm(ConfirmState::new(
+            "确认删除提交",
+            format!("确认从卷中删除并固化？\n{long_path}"),
+            ConfirmAction::Quit,
+        )));
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(screen.contains("确认从卷中删除并固化？"), "{screen}");
+        assert!(screen.contains("target_subfile.log"), "{screen}");
+        assert!(screen.contains("[Enter]确认"), "{screen}");
+    }
+
+    #[test]
+    fn volumes_and_exclusions_show_loading_and_failed_placeholders_at_80x24() {
+        let mut app = test_app();
+        for tab in [Tab::Volumes, Tab::Exclusions] {
+            app.tab = tab;
+            app.phase = Phase::Loading;
+            let loading = render_to_string(&mut app, 80, 24);
+            assert!(loading.contains("加载中…"), "{loading}");
+
+            app.phase = Phase::LoadFailed;
+            let failed = render_to_string(&mut app, 80, 24);
+            assert!(failed.contains("加载失败，按[F5]重试"), "{failed}");
+        }
+    }
+
+    #[test]
+    fn dashboard_and_hotkey_bar_fit_at_80x24() {
+        let mut app = test_app();
+        app.snapshot = demo_snapshot();
+        app.phase = Phase::Ready;
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(screen.contains("预警:1536MB"), "{screen}");
+        assert!(screen.contains("临界:1843MB"), "{screen}");
+        assert!(screen.contains("[?]帮助"), "{screen}");
+        assert!(screen.contains("[Q]退出"), "{screen}");
+    }
+
+    #[test]
+    fn exclusions_tab_layout_fits_at_80x24() {
+        let mut app = test_app();
+        app.snapshot = demo_snapshot();
+        app.phase = Phase::Ready;
+        app.tab = Tab::Exclusions;
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(screen.contains("[文件排除]下次生效"), "{screen}");
+        assert!(screen.contains("[注册表排除]"), "{screen}");
+        assert!(screen.contains("[A]添加文件"), "{screen}");
+        assert!(screen.contains("[S]切换视图"), "{screen}");
+    }
+
+    #[test]
+    fn help_modal_shows_all_sections_at_80x24() {
+        let mut app = test_app();
+        app.phase = Phase::Ready;
+        app.modal = Some(Modal::Help);
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(screen.contains("全局"), "{screen}");
+        assert!(screen.contains("提交工具"), "{screen}");
+        assert!(
+            screen.contains("弹窗通用:[Enter]确认[Esc]取消/关闭"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn overlay_settings_hides_type_switch_hint_when_locked() {
+        let mut app = test_app();
+        app.snapshot = demo_snapshot();
+        app.phase = Phase::Ready;
+        let mut state = OverlaySettingsState::from_snapshot(&app.snapshot);
+        state.lock_type_size = true;
+        app.modal = Some(Modal::OverlaySettings(state));
+        let locked_screen = render_to_string(&mut app, 80, 24);
+        assert!(!locked_screen.contains("切换类型"), "{locked_screen}");
+
+        let mut unlocked_state = OverlaySettingsState::from_snapshot(&app.snapshot);
+        unlocked_state.lock_type_size = false;
+        app.modal = Some(Modal::OverlaySettings(unlocked_state));
+        let unlocked_screen = render_to_string(&mut app, 80, 24);
+        assert!(unlocked_screen.contains("切换类型"), "{unlocked_screen}");
     }
 }

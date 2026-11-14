@@ -5,10 +5,9 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::App;
 use crate::ui::theme;
 
-pub fn render(frame: &mut Frame, _app: &App, area: Rect) {
+pub fn render(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("  将受保护卷中的临时更改固化到物理磁盘（重启后不丢失）。"),
         Line::from(""),
