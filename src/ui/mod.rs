@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Tab};
+use crate::app::{App, Phase, Tab};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas(inner);
 
     // D6：UWF 未安装时以引导页取代正常视图（[F5] 重新检测，检测到后自动恢复）
-    if app.not_installed {
+    if app.phase == Phase::NotInstalled {
         views::not_installed::render(frame, tabs_area, body_area);
         render_hotkeys(frame, hotkey_area, true);
     } else {
@@ -84,7 +84,7 @@ fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect, not_installed:
 mod tests {
     use super::*;
     use crate::app::tests::demo_snapshot;
-    use crate::app::{App, Modal};
+    use crate::app::{App, Modal, Phase};
     use crate::backend::BackendKind;
     use crate::ui::components::overlay_settings::OverlaySettingsState;
     use ratatui::Terminal;
@@ -92,8 +92,7 @@ mod tests {
 
     fn test_app() -> App {
         let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
-        std::mem::forget(ui_tx);
+        let (_, ui_rx) = std::sync::mpsc::channel();
         App::new(cmd_tx, ui_rx, BackendKind::Mock)
     }
 
@@ -119,7 +118,7 @@ mod tests {
     fn dashboard_renders_snapshot() {
         let mut app = test_app();
         app.snapshot = demo_snapshot();
-        app.loaded = true;
+        app.phase = Phase::Ready;
         let screen = render_to_string(&mut app, 100, 30);
         assert!(screen.contains("[1]状态概览"), "缺少 Tab 标签:\n{screen}");
         assert!(screen.contains("Mock演示数据"), "缺少后端徽标:\n{screen}");
@@ -135,7 +134,7 @@ mod tests {
     #[test]
     fn not_installed_guide_page_replaces_tabs() {
         let mut app = test_app();
-        app.not_installed = true;
+        app.phase = Phase::NotInstalled;
         let screen = render_to_string(&mut app, 100, 30);
         // D6 引导页：启用命令完整可见
         assert!(
@@ -161,7 +160,7 @@ mod tests {
     fn overlay_settings_modal_shows_r1_lock_hint() {
         let mut app = test_app();
         app.snapshot = demo_snapshot();
-        app.loaded = true;
+        app.phase = Phase::Ready;
         app.modal = Some(Modal::OverlaySettings(OverlaySettingsState::from_snapshot(
             &app.snapshot,
         )));
@@ -175,7 +174,7 @@ mod tests {
         use crate::model::{OverlayConfig, OverlayRuntime, OverlayType};
         let mut app = test_app();
         app.snapshot = demo_snapshot();
-        app.loaded = true;
+        app.phase = Phase::Ready;
         app.snapshot.overlay_config_current = Some(OverlayConfig {
             overlay_type: OverlayType::Ram,
             max_size_mb: 2048,
@@ -204,8 +203,7 @@ mod tests {
     #[test]
     fn initial_load_failure_shows_retry_hint() {
         let mut app = test_app();
-        app.initial_load = None;
-        app.load_failed = true;
+        app.phase = Phase::LoadFailed;
         let screen = render_to_string(&mut app, 100, 30);
         assert!(
             screen.contains("加载失败，按[F5]重试"),

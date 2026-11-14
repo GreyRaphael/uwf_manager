@@ -18,7 +18,7 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::Context;
-use backend::{BackendEvent, create_backend_factory, spawn_backend_thread};
+use backend::{create_backend_factory, spawn_backend_thread};
 use crossterm::event;
 
 fn main() -> anyhow::Result<()> {
@@ -45,20 +45,11 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let (backend_evt_tx, backend_evt_rx) = std::sync::mpsc::channel::<BackendEvent>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel();
     let (factory, kind) = create_backend_factory(force_mock);
-    let backend = spawn_backend_thread(factory, cmd_rx, backend_evt_tx);
+    let backend = spawn_backend_thread(factory, cmd_rx, ui_tx.clone());
 
-    // 后端回包转发到 UI 统一 channel；终端读取线程同样汇入，二者都能立即唤醒主循环。
-    let forward_tx = ui_tx.clone();
-    std::thread::spawn(move || {
-        while let Ok(evt) = backend_evt_rx.recv() {
-            if forward_tx.send(app::UiEvent::Backend(evt)).is_err() {
-                break;
-            }
-        }
-    });
+    // 终端事件直汇入 UI channel，与后端回包一起立即唤醒主循环。
     std::thread::spawn(move || {
         while let Ok(evt) = event::read() {
             if ui_tx.send(app::UiEvent::Terminal(evt)).is_err() {
@@ -68,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut app = app::App::new(cmd_tx, ui_rx, kind);
-    app.start_initial_load();
+    app.refresh_all();
     let result = app.run(&mut terminal);
 
     // 无论 run 正常/异常返回，都通知后端退出；最多等 2 秒，避免 WMI 挂死拖住进程。

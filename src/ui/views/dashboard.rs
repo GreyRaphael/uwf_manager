@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 
-use crate::app::App;
+use crate::app::{App, Phase};
 use crate::model::UsageLevel;
 use crate::ui::{text, theme};
 
@@ -43,7 +43,7 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                     theme::dim(),
                 ),
                 Span::styled(
-                    if app.backend_lost {
+                    if app.phase == Phase::BackendLost {
                         "   ⚠ 后端已断开"
                     } else if app.is_busy() {
                         "   ⏳ 执行中…"
@@ -54,8 +54,12 @@ fn render_filter(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]),
         ],
-        None if app.load_failed => vec![Line::styled(
+        None if app.phase == Phase::LoadFailed => vec![Line::styled(
             format!("  {}", text::LOAD_FAILED),
+            theme::err(),
+        )],
+        None if app.phase == Phase::BackendLost => vec![Line::styled(
+            "  后端已断开，无法加载状态，请退出重启",
             theme::err(),
         )],
         None => vec![Line::from(format!("  {}", text::LOADING))],
@@ -73,10 +77,10 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
         app.snapshot.overlay_config_current,
         app.snapshot.overlay_runtime,
     ) else {
-        let (message, style) = if app.load_failed {
-            (text::LOAD_FAILED, theme::err())
-        } else {
-            (text::LOADING, ratatui::style::Style::default())
+        let (message, style) = match app.phase {
+            Phase::LoadFailed => (text::LOAD_FAILED, theme::err()),
+            Phase::BackendLost => ("后端已断开，请退出重启", theme::err()),
+            _ => (text::LOADING, ratatui::style::Style::default()),
         };
         frame.render_widget(
             Paragraph::new(Line::styled(format!("  {message}"), style)),
@@ -131,12 +135,14 @@ fn render_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_volume_summary(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered().title("[卷保护摘要]");
-    let lines: Vec<Line> = if app.load_failed {
+    let lines: Vec<Line> = if app.phase == Phase::LoadFailed {
         vec![Line::styled(
             format!("  {}", text::LOAD_FAILED),
             theme::err(),
         )]
-    } else if !app.loaded {
+    } else if app.phase == Phase::BackendLost && app.snapshot.volumes.is_empty() {
+        vec![Line::styled("  后端已断开，请退出重启", theme::err())]
+    } else if app.phase == Phase::Loading {
         vec![Line::from(format!("  {}", text::LOADING))]
     } else if app.snapshot.volumes.is_empty() {
         vec![Line::from(format!("  {}", text::READY_EMPTY))]

@@ -45,15 +45,12 @@ pub struct FilePickerState {
     /// 当前目录；`None` 表示盘符列表（仅 Windows）
     pub cwd: Option<PathBuf>,
     pub entries: Vec<PickerEntry>,
-    pub selected: usize,
     pub list_state: ListState,
     /// 可视高度（render 时更新，供 PageUp/PageDown 使用）
     pub page_size: usize,
     pub error: Option<String>,
     #[cfg(windows)]
     drive_rx: Option<std::sync::mpsc::Receiver<Vec<PickerEntry>>>,
-    #[cfg(windows)]
-    loading_drives: bool,
 }
 
 pub enum PickerOutcome {
@@ -72,25 +69,61 @@ impl FilePickerState {
             action,
             cwd,
             entries: Vec::new(),
-            selected: 0,
             list_state: ListState::default(),
             page_size: 10,
             error: None,
             #[cfg(windows)]
             drive_rx: None,
-            #[cfg(windows)]
-            loading_drives: false,
         };
         state.reload();
         state
     }
 
-    fn sync_list_state(&mut self) {
+    fn select(&mut self, index: Option<usize>) {
         if self.entries.is_empty() {
             self.list_state.select(None);
         } else {
-            self.selected = self.selected.min(self.entries.len() - 1);
-            self.list_state.select(Some(self.selected));
+            self.list_state
+                .select(Some(index.unwrap_or(0).min(self.entries.len() - 1)));
+        }
+    }
+
+    pub fn is_polling(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.drive_rx.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// 推进异步盘符探测；状态有更新返回 `true` 以便事件循环及时重绘
+    pub fn poll(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            let Some(rx) = &self.drive_rx else {
+                return false;
+            };
+            match rx.try_recv() {
+                Ok(drives) => {
+                    self.entries = drives;
+                    self.drive_rx = None;
+                    self.select(Some(0));
+                    true
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.drive_rx = None;
+                    self.error = Some("盘符探测线程异常退出".into());
+                    true
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            false
         }
     }
 
@@ -98,15 +131,14 @@ impl FilePickerState {
     fn reload(&mut self) {
         self.error = None;
         self.entries.clear();
-        self.selected = 0;
         let Some(cwd) = &self.cwd else {
             #[cfg(windows)]
             {
                 // 盘符探测放到后台线程，避免网络盘/软驱阻塞 UI。
                 self.start_drive_probe();
-                self.poll_drives();
+                let _ = self.poll();
             }
-            self.sync_list_state();
+            self.select(Some(0));
             return;
         };
         match std::fs::read_dir(cwd) {
@@ -127,7 +159,7 @@ impl FilePickerState {
                 self.error = Some(format!("无法读取目录: {e}"));
             }
         }
-        self.sync_list_state();
+        self.select(Some(0));
     }
 
     #[cfg(windows)]
@@ -140,29 +172,6 @@ impl FilePickerState {
             let _ = tx.send(list_drives());
         });
         self.drive_rx = Some(rx);
-        self.loading_drives = true;
-    }
-
-    #[cfg(windows)]
-    fn poll_drives(&mut self) {
-        let Some(rx) = &self.drive_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(drives) => {
-                self.entries = drives;
-                self.drive_rx = None;
-                self.loading_drives = false;
-                self.selected = 0;
-                self.sync_list_state();
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.drive_rx = None;
-                self.loading_drives = false;
-                self.error = Some("盘符探测线程异常退出".into());
-            }
-        }
     }
 
     fn enter(&mut self, path: PathBuf) {
@@ -197,43 +206,35 @@ impl FilePickerState {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> PickerOutcome {
+        let cur = self.list_state.selected().unwrap_or(0);
         match key.code {
             KeyCode::Esc => PickerOutcome::Cancel,
             KeyCode::Up => {
                 if !self.entries.is_empty() {
-                    self.selected = (self.selected + self.entries.len() - 1) % self.entries.len();
+                    self.select(Some((cur + self.entries.len() - 1) % self.entries.len()));
                 }
-                self.sync_list_state();
                 PickerOutcome::Stay
             }
             KeyCode::Down => {
                 if !self.entries.is_empty() {
-                    self.selected = (self.selected + 1) % self.entries.len();
+                    self.select(Some((cur + 1) % self.entries.len()));
                 }
-                self.sync_list_state();
                 PickerOutcome::Stay
             }
             KeyCode::PageUp => {
-                self.selected = self.selected.saturating_sub(self.page_size.max(1));
-                self.sync_list_state();
+                self.select(Some(cur.saturating_sub(self.page_size.max(1))));
                 PickerOutcome::Stay
             }
             KeyCode::PageDown => {
-                if !self.entries.is_empty() {
-                    self.selected =
-                        (self.selected + self.page_size.max(1)).min(self.entries.len() - 1);
-                }
-                self.sync_list_state();
+                self.select(Some(cur + self.page_size.max(1)));
                 PickerOutcome::Stay
             }
             KeyCode::Home => {
-                self.selected = 0;
-                self.sync_list_state();
+                self.select(Some(0));
                 PickerOutcome::Stay
             }
             KeyCode::End => {
-                self.selected = self.entries.len().saturating_sub(1);
-                self.sync_list_state();
+                self.select(Some(self.entries.len().saturating_sub(1)));
                 PickerOutcome::Stay
             }
             KeyCode::Backspace | KeyCode::Left => {
@@ -241,7 +242,8 @@ impl FilePickerState {
                 PickerOutcome::Stay
             }
             KeyCode::Enter => {
-                let Some(entry) = self.entries.get(self.selected) else {
+                let Some(entry) = self.list_state.selected().and_then(|i| self.entries.get(i))
+                else {
                     return PickerOutcome::Stay;
                 };
                 if entry.is_dir {
@@ -253,7 +255,8 @@ impl FilePickerState {
                 }
             }
             KeyCode::Char(' ') => {
-                let Some(entry) = self.entries.get(self.selected) else {
+                let Some(entry) = self.list_state.selected().and_then(|i| self.entries.get(i))
+                else {
                     return PickerOutcome::Stay;
                 };
                 self.pick(entry).unwrap_or(PickerOutcome::Stay)
@@ -286,10 +289,6 @@ fn entry_label(entry: &PickerEntry) -> String {
 }
 
 pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
-    #[cfg(windows)]
-    if state.cwd.is_none() {
-        state.poll_drives();
-    }
     let rect = centered_rect(72, 70, area);
     let cwd_label = match &state.cwd {
         Some(cwd) => cwd.display().to_string(),
@@ -303,11 +302,9 @@ pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
     frame.render_widget(block, rect);
 
     state.page_size = list_area.height.max(1) as usize;
-    state.sync_list_state();
 
     let items: Vec<ListItem> = if state.entries.is_empty() {
-        #[cfg(windows)]
-        let empty = if state.loading_drives {
+        let empty = if state.is_polling() {
             "正在检测盘符…".to_string()
         } else {
             state
@@ -315,11 +312,6 @@ pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
                 .clone()
                 .unwrap_or_else(|| "（空目录）".to_string())
         };
-        #[cfg(not(windows))]
-        let empty = state
-            .error
-            .clone()
-            .unwrap_or_else(|| "（空目录）".to_string());
         vec![ListItem::new(Line::styled(empty, theme::dim()))]
     } else {
         state
@@ -361,9 +353,8 @@ mod tests {
                 is_dir: false,
             })
             .collect();
-        state.selected = 0;
         state.page_size = 10;
-        state.sync_list_state();
+        state.select(Some(0));
         state
     }
 
@@ -371,17 +362,15 @@ mod tests {
     fn page_home_end_move_selection_and_list_state() {
         let mut state = state_with_entries(30);
         state.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(state.selected, 10);
         assert_eq!(state.list_state.selected(), Some(10));
 
         state.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(state.selected, 20);
+        assert_eq!(state.list_state.selected(), Some(20));
 
         state.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(state.selected, 29);
+        assert_eq!(state.list_state.selected(), Some(29));
 
         state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(state.selected, 0);
         assert_eq!(state.list_state.selected(), Some(0));
     }
 

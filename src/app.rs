@@ -27,6 +27,12 @@ pub enum UiEvent {
     Backend(BackendEvent),
 }
 
+impl From<BackendEvent> for UiEvent {
+    fn from(evt: BackendEvent) -> Self {
+        Self::Backend(evt)
+    }
+}
+
 /// Overlay 轮询周期（与原版 MainForm 的 2 秒后台线程一致）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
 
@@ -104,18 +110,26 @@ pub struct StatusEntry {
     pub text: String,
 }
 
+/// 应用生命周期阶段（单源表达，避免多个布尔状态出现非法组合）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// 启动加载中，或失败/未安装状态下按 `[F5]` 重新检测中（尚无可用快照）
+    Loading,
+    /// 无有效快照时的加载失败（可按 `[F5]` 重试）
+    LoadFailed,
+    /// D6：UWF 功能未安装或未启用
+    NotInstalled,
+    /// 已持有至少一份有效快照，正常工作态
+    Ready,
+    /// 后端线程已退出（channel 断开或 panic），仅允许退出或查看帮助
+    BackendLost,
+}
+
 pub struct App {
     pub tab: Tab,
     pub should_quit: bool,
     pub backend_kind: BackendKind,
-    /// D6：UWF 功能未安装（由 `BackendEvent::NotInstalled` 置位）
-    pub not_installed: bool,
-    /// 后端线程已退出（channel 断开或 send 失败）；管理键应被禁用
-    pub backend_lost: bool,
-    /// 是否已成功加载过至少一次快照（区分“未加载”和“确实为空”）
-    pub loaded: bool,
-    /// 初始加载失败且尚未重试成功（驱动“加载失败，按 F5 重试”提示）
-    pub load_failed: bool,
+    pub phase: Phase,
     pub snapshot: FullSnapshot,
     pub volumes_state: TableState,
     /// 排除项视图：true = 当前生效，false = 下次生效（原版默认下次）
@@ -128,11 +142,9 @@ pub struct App {
     selected_registry_key: Option<String>,
     pub modal: Option<Modal>,
     pub last_log: Option<StatusEntry>,
-    /// 当前在途的变更请求；只有匹配 id 的 Finished 才能清除
+    /// 当前在途的变更请求；只有匹配 id 的 Finished / NotInstalled 才能清除
     pub mutation: Option<RequestId>,
-    /// 启动时的一次全量刷新；与变更在途锁分离
-    pub initial_load: Option<RequestId>,
-    /// 电源动作绑定到具体请求 id，避免被无关 OpOk 误触发
+    /// 电源动作绑定到具体请求 id，避免被无关回包误触发
     power_action: Option<(RequestId, PowerAction)>,
     next_request_id: RequestId,
     last_overlay_tick: Instant,
@@ -156,10 +168,7 @@ impl App {
             tab: Tab::Dashboard,
             should_quit: false,
             backend_kind,
-            not_installed: false,
-            backend_lost: false,
-            loaded: false,
-            load_failed: false,
+            phase: Phase::Loading,
             snapshot: FullSnapshot::default(),
             volumes_state,
             exclusion_session_current: false,
@@ -170,7 +179,6 @@ impl App {
             selected_registry_key: None,
             last_log: None,
             mutation: None,
-            initial_load: Some(0),
             power_action: None,
             next_request_id: 1,
             last_overlay_tick: Instant::now(),
@@ -180,9 +188,9 @@ impl App {
         }
     }
 
-    /// 是否应显示“执行中”：启动刷新或变更在途。
+    /// 是否应显示“执行中”：初始/重试加载中或有变更在途。
     pub fn is_busy(&self) -> bool {
-        self.initial_load.is_some() || self.mutation.is_some()
+        self.phase == Phase::Loading || self.is_pending()
     }
 
     /// 是否有变更在途（退出确认、变更键拦截只看这个）。
@@ -196,50 +204,37 @@ impl App {
         id
     }
 
-    fn send(&self, id: RequestId, cmd: BackendCmd) -> bool {
-        self.cmd_tx.send(BackendCommand { id, cmd }).is_ok()
+    fn send(&self, command: BackendCommand) -> bool {
+        self.cmd_tx.send(command).is_ok()
     }
 
-    /// 后端线程不可用：进入错误态、清除在途状态，并记录一次失败原因。
+    /// 后端线程不可用：进入错误态、关闭可能覆盖提示的弹窗并清除在途锁。
     fn mark_backend_lost(&mut self, message: &str) {
-        let first = !self.backend_lost;
-        self.backend_lost = true;
+        let first = self.phase != Phase::BackendLost;
+        self.phase = Phase::BackendLost;
+        self.modal = None;
         self.mutation = None;
-        self.initial_load = None;
-        if !self.loaded {
-            self.load_failed = true;
-        }
+        self.power_action = None;
         if first {
             self.log(false, message);
         }
     }
 
-    /// 启动时发出第一次全量刷新（由 main 调用；单独方法便于测试不启动后台线程）。
-    pub fn start_initial_load(&mut self) {
-        let Some(id) = self.initial_load else {
-            return;
-        };
-        self.load_failed = false;
-        if !self.send(id, BackendCmd::RefreshAll) {
-            self.mark_backend_lost("后端线程已退出，无法加载 UWF 状态");
-        }
-    }
-
-    /// F5 / 重新检测：查询不占用 mutation 锁。
+    /// F5 / 启动首次加载 / 未安装重检：查询不占用 mutation 锁。
     pub fn refresh_all(&mut self) {
-        // 重试后先回到“加载中”，避免旧失败提示一直挂着。
-        if !self.loaded {
-            self.load_failed = false;
+        if matches!(self.phase, Phase::LoadFailed | Phase::NotInstalled) {
+            self.phase = Phase::Loading;
         }
-        let id = self.next_request_id();
-        if !self.send(id, BackendCmd::RefreshAll) {
+        if !self.send(BackendCommand::RefreshAll) {
             self.mark_backend_lost("后端线程已退出，无法刷新");
         }
     }
 
     fn send_overlay_refresh(&mut self) {
-        let id = self.next_request_id();
-        if !self.send(id, BackendCmd::RefreshOverlayRuntime) {
+        if self.phase != Phase::Ready || self.is_pending() {
+            return;
+        }
+        if !self.send(BackendCommand::RefreshOverlayRuntime) {
             self.mark_backend_lost("后端线程已退出，无法刷新 Overlay 状态");
         }
     }
@@ -247,8 +242,11 @@ impl App {
     /// 变更类命令：同刻只允许一条在途（PLAN §6.5）。
     /// 返回 id 仅当命令真正发送成功；调用方据此才 arm 电源动作。
     fn begin_mutation(&mut self, cmd: BackendCmd) -> Option<RequestId> {
-        if self.backend_lost {
+        if self.phase == Phase::BackendLost {
             self.log(false, "后端线程已退出，请重启应用");
+            return None;
+        }
+        if self.phase != Phase::Ready {
             return None;
         }
         if self.mutation.is_some() {
@@ -256,7 +254,7 @@ impl App {
             return None;
         }
         let id = self.next_request_id();
-        if !self.send(id, cmd) {
+        if !self.send(BackendCommand::Mutate { id, cmd }) {
             self.mark_backend_lost("后端线程已退出，操作未发送");
             return None;
         }
@@ -266,15 +264,22 @@ impl App {
 
     /// 通知后端线程退出；main 在 `run` 返回后调用（正常/错误路径都会停线程）。
     pub fn send_quit(&mut self) {
-        let id = self.next_request_id();
-        let _ = self.send(id, BackendCmd::Quit);
+        let _ = self.send(BackendCommand::Quit);
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         while !self.should_quit {
+            if let Some(Modal::FilePicker(picker)) = &mut self.modal {
+                picker.poll();
+            }
             terminal.draw(|frame| crate::ui::render(frame, self))?;
 
-            let timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
+            let mut timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
+            if let Some(Modal::FilePicker(picker)) = &self.modal
+                && picker.is_polling()
+            {
+                timeout = timeout.min(Duration::from_millis(50));
+            }
             match self.ui_rx.recv_timeout(timeout) {
                 Ok(evt) => {
                     self.handle_ui_event(evt);
@@ -284,10 +289,8 @@ impl App {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.handle_disconnected();
-                    break;
-                }
+                // 仅当后端与终端读取线程均已退出时通道才会闭合，直接退出避免空转。
+                Err(RecvTimeoutError::Disconnected) => break,
             }
 
             if self.last_overlay_tick.elapsed() >= OVERLAY_POLL {
@@ -300,7 +303,9 @@ impl App {
 
     fn handle_ui_event(&mut self, evt: UiEvent) {
         match evt {
-            UiEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+            UiEvent::Terminal(Event::Key(key))
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
                 self.on_key(key)
             }
             UiEvent::Terminal(_) => {}
@@ -308,40 +313,30 @@ impl App {
         }
     }
 
-    fn handle_disconnected(&mut self) {
-        self.mark_backend_lost("后端线程已退出，请重启应用");
-    }
-
     fn apply_event(&mut self, evt: BackendEvent) {
         match evt {
-            BackendEvent::Snapshot { id, snapshot } => {
+            BackendEvent::Snapshot(snapshot) => {
                 self.snapshot = snapshot;
-                self.loaded = true;
-                self.load_failed = false;
-                if self.initial_load == Some(id) {
-                    self.initial_load = None;
-                }
-                // 查询回包永远不解除 mutation 锁；只有匹配 id 的 Finished 可以。
-                self.not_installed = false;
+                self.phase = Phase::Ready;
                 self.clamp_selections();
                 self.restore_selection();
                 self.log(true, "已刷新 UWF 全部状态");
-                // 警告放在最后，确保底部单行日志展示的是需要用户注意的信息。
-                let warnings = self.snapshot.warnings.clone();
-                for warning in &warnings {
-                    self.log_warn(warning);
+                if !self.snapshot.warnings.is_empty() {
+                    // 单行日志聚合全部卷读取警告，避免前序警告被覆盖。
+                    let combined = self.snapshot.warnings.join("；");
+                    self.log_warn(&combined);
                 }
             }
-            BackendEvent::OverlayRuntime { id, runtime } => {
-                let _ = id;
+            BackendEvent::OverlayRuntime(runtime) => {
                 self.snapshot.overlay_runtime = Some(runtime);
             }
-            BackendEvent::Finished { id, outcome } => {
-                // 启动查询失败也有终态；不能因错误回包让初始加载一直显示为执行中。
-                let was_initial_load = self.initial_load == Some(id);
-                if was_initial_load {
-                    self.initial_load = None;
+            BackendEvent::RefreshFailed(msg) => {
+                self.log(false, &msg);
+                if self.phase == Phase::Loading {
+                    self.phase = Phase::LoadFailed;
                 }
+            }
+            BackendEvent::Finished { id, outcome } => {
                 if self.mutation == Some(id) {
                     self.mutation = None;
                 }
@@ -360,9 +355,6 @@ impl App {
                     }
                     Outcome::Err(msg) => {
                         self.log(false, &msg);
-                        if was_initial_load {
-                            self.load_failed = true;
-                        }
                         if self
                             .power_action
                             .is_some_and(|(power_id, _)| power_id == id)
@@ -372,14 +364,24 @@ impl App {
                     }
                 }
             }
-            BackendEvent::NotInstalled { id } => {
-                if self.initial_load == Some(id) {
-                    self.initial_load = None;
+            BackendEvent::NotInstalled(id) => {
+                if let Some(req_id) = id {
+                    if self.mutation == Some(req_id) {
+                        self.mutation = None;
+                    }
+                    if self
+                        .power_action
+                        .is_some_and(|(power_id, _)| power_id == req_id)
+                    {
+                        self.power_action = None;
+                    }
                 }
-                self.load_failed = false;
-                self.not_installed = true;
+                self.phase = Phase::NotInstalled;
                 self.modal = None;
                 self.log(false, "UWF 功能未安装或未启用");
+            }
+            BackendEvent::Disconnected => {
+                self.mark_backend_lost("后端线程已退出，请重启应用");
             }
         }
     }
@@ -501,48 +503,49 @@ impl App {
     // ── 按键路由 ──
 
     fn on_key(&mut self, key: KeyEvent) {
-        // D6：未安装引导页只允许重新检测、退出、帮助，其余管理键全部隔离。
-        if self.not_installed {
-            if self.modal.is_some() {
-                self.on_modal_key(key);
-                return;
-            }
-            match key.code {
-                KeyCode::F(5) => self.refresh_all(),
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
-                KeyCode::Char('?') => self.modal = Some(Modal::Help),
-                _ => {}
-            }
-            return;
-        }
-
-        if self.backend_lost {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Char('?') => self.modal = Some(Modal::Help),
-                _ => self.log(false, "后端线程已退出，请重启应用"),
-            }
-            return;
-        }
-
         if self.modal.is_some() {
             self.on_modal_key(key);
             return;
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
-            KeyCode::Tab => self.tab = self.tab.next(),
-            KeyCode::BackTab => self.tab = self.tab.prev(),
-            KeyCode::Char(c @ '1'..='4') => {
-                self.tab = Tab::from_index(c as usize - '1' as usize);
-            }
-            KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::F(5) => self.refresh_all(),
-            _ => match self.tab {
-                Tab::Dashboard => self.on_dashboard_key(key),
-                Tab::Volumes => self.on_volumes_key(key),
-                Tab::Exclusions => self.on_exclusions_key(key),
-                Tab::Commit => self.on_commit_key(key),
+        match self.phase {
+            // D6：未安装引导页只允许重新检测、退出、帮助，其余管理键全部隔离。
+            Phase::NotInstalled => match key.code {
+                KeyCode::F(5) => self.refresh_all(),
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                _ => {}
+            },
+            Phase::BackendLost => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                _ => self.log(false, "后端线程已退出，请重启应用"),
+            },
+            Phase::Loading | Phase::LoadFailed => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
+                KeyCode::Tab => self.tab = self.tab.next(),
+                KeyCode::BackTab => self.tab = self.tab.prev(),
+                KeyCode::Char(c @ '1'..='4') => {
+                    self.tab = Tab::from_index(c as usize - '1' as usize);
+                }
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                KeyCode::F(5) => self.refresh_all(),
+                _ => {}
+            },
+            Phase::Ready => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
+                KeyCode::Tab => self.tab = self.tab.next(),
+                KeyCode::BackTab => self.tab = self.tab.prev(),
+                KeyCode::Char(c @ '1'..='4') => {
+                    self.tab = Tab::from_index(c as usize - '1' as usize);
+                }
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                KeyCode::F(5) => self.refresh_all(),
+                _ => match self.tab {
+                    Tab::Dashboard => self.on_dashboard_key(key),
+                    Tab::Volumes => self.on_volumes_key(key),
+                    Tab::Exclusions => self.on_exclusions_key(key),
+                    Tab::Commit => self.on_commit_key(key),
+                },
             },
         }
     }
@@ -560,6 +563,18 @@ impl App {
         }
     }
 
+    /// 在途或未就绪时拦截打开修改类弹窗，避免用户输完长路径后才被拒绝并丢失输入。
+    fn open_action_modal(&mut self, modal: Modal) {
+        if self.phase != Phase::Ready {
+            return;
+        }
+        if self.is_pending() {
+            self.log(false, "有操作正在执行，请稍后再试");
+            return;
+        }
+        self.modal = Some(modal);
+    }
+
     fn on_dashboard_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -569,26 +584,26 @@ impl App {
                 let _ = self.begin_mutation(BackendCmd::DisableFilter);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                self.open_action_modal(Modal::Confirm(ConfirmState::new(
                     "重置配置确认",
                     "将重置全部 UWF 配置（筛选器 / Overlay / 卷保护 / 排除项），\n下次重启后恢复默认值。确定继续？",
                     ConfirmAction::ResetSettings,
                 )));
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.modal = Some(Modal::OverlaySettings(OverlaySettingsState::from_snapshot(
-                    &self.snapshot,
-                )));
+                self.open_action_modal(Modal::OverlaySettings(
+                    OverlaySettingsState::from_snapshot(&self.snapshot),
+                ));
             }
             KeyCode::F(10) => {
-                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                self.open_action_modal(Modal::Confirm(ConfirmState::new(
                     "重启系统确认",
                     "系统将立即重启，未保存的工作将丢失。\n确定继续？",
                     ConfirmAction::Restart,
                 )));
             }
             KeyCode::F(11) => {
-                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                self.open_action_modal(Modal::Confirm(ConfirmState::new(
                     "关机确认",
                     "系统将立即关机，未保存的工作将丢失。\n确定继续？",
                     ConfirmAction::Shutdown,
@@ -661,13 +676,15 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.exclusion_session_current = !self.exclusion_session_current;
                 self.clamp_selections();
-                self.remember_selection();
+                if !self.exclusion_session_current {
+                    self.restore_selection();
+                }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 if !self.ensure_mutable_exclusions() {
                     return;
                 }
-                self.modal = Some(Modal::Input(InputState::new(
+                self.open_action_modal(Modal::Input(InputState::new(
                     "添加文件排除",
                     "输入绝对路径（如 C:\\Windows\\Temp），或按 [F2] 打开文件选择器",
                     InputAction::AddFileExclusion,
@@ -678,7 +695,7 @@ impl App {
                 if !self.ensure_mutable_exclusions() {
                     return;
                 }
-                self.modal = Some(Modal::Input(InputState::new(
+                self.open_action_modal(Modal::Input(InputState::new(
                     "添加注册表排除",
                     "输入注册表键路径（如 HKLM\\SOFTWARE\\Example）",
                     InputAction::AddRegistryExclusion,
@@ -694,7 +711,7 @@ impl App {
                 if !self.ensure_mutable_exclusions() {
                     return;
                 }
-                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                self.open_action_modal(Modal::FilePicker(FilePickerState::new(
                     PickerMode::File,
                     PickerAction::ImportExclusions,
                 )));
@@ -717,19 +734,19 @@ impl App {
     fn on_commit_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('f') | KeyCode::Char('F') => {
-                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                self.open_action_modal(Modal::FilePicker(FilePickerState::new(
                     PickerMode::File,
                     PickerAction::CommitFile,
                 )));
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.modal = Some(Modal::FilePicker(FilePickerState::new(
+                self.open_action_modal(Modal::FilePicker(FilePickerState::new(
                     PickerMode::File,
                     PickerAction::CommitFileDeletion,
                 )));
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.modal = Some(Modal::Input(InputState::new(
+                self.open_action_modal(Modal::Input(InputState::new(
                     "注册表提交",
                     "输入注册表完整路径（如 HKLM\\SOFTWARE\\Example\\ValueName）",
                     InputAction::CommitRegistry,
@@ -750,7 +767,11 @@ impl App {
             Modal::Help => {
                 if !matches!(
                     key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Char('q')
+                        | KeyCode::Char('Q')
+                        | KeyCode::Char('?')
                 ) {
                     self.modal = Some(Modal::Help);
                 }
@@ -886,13 +907,13 @@ impl App {
     }
 
     /// 导出当前视图排除列表：文件名格式与原版一致
-    /// （EXCLUSIONLIST_yyyy_MM_dd_HH_mm_ss.txt，写入当前目录）
+    /// （EXCLUSIONLIST_yyyy_MM_dd_HH_mm_ss.txt，防重名自动编号由后端线程原子创建）
     fn export_exclusions(&mut self) {
         let filename = chrono::Local::now()
             .format("EXCLUSIONLIST_%Y_%m_%d_%H_%M_%S.txt")
             .to_string();
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let path = unique_export_path(dir.join(&filename));
+        let path = dir.join(&filename);
         let _ = self.begin_mutation(BackendCmd::ExportExclusions {
             path,
             current_session: self.exclusion_session_current,
@@ -906,29 +927,6 @@ fn clamp(selected: &mut Option<usize>, len: usize) {
         (None, _) => Some(0),
         (Some(i), _) => Some(i.min(len - 1)),
     };
-}
-
-/// 同秒重复导出时自动追加 _1、_2，避免静默覆盖已有文件。
-fn unique_export_path(path: PathBuf) -> PathBuf {
-    if !path.exists() {
-        return path;
-    }
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("EXCLUSIONLIST");
-    let ext = path.extension().and_then(|s| s.to_str());
-    for n in 1.. {
-        let name = match ext {
-            Some(ext) => format!("{stem}_{n}.{ext}"),
-            None => format!("{stem}_{n}"),
-        };
-        let candidate = path.with_file_name(name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("unbounded unique filename search")
 }
 
 /// Home/End：选中首项或末项；空列表清空选中。
@@ -1001,27 +999,25 @@ pub(crate) mod tests {
 
     fn test_app(kind: BackendKind) -> (App, Receiver<BackendCommand>) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
-        // 测试不运行事件循环；保留 sender，避免 App 把通道断开误判为后端退出。
-        std::mem::forget(ui_tx);
+        let (_, ui_rx) = std::sync::mpsc::channel();
         (App::new(cmd_tx, ui_rx, kind), cmd_rx)
     }
 
     fn recv_cmd(rx: &Receiver<BackendCommand>) -> BackendCmd {
-        rx.try_recv().expect("期望收到后端命令").cmd
+        match rx.try_recv().expect("期望收到后端命令") {
+            BackendCommand::Mutate { cmd, .. } => cmd,
+            other => panic!("期望 Mutate 命令，实际 {other:?}"),
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, event::KeyModifiers::NONE)
     }
 
-    /// 注入启动快照（id=0），清除 initial_load。
+    /// 注入启动快照，进入 Ready 阶段。
     fn ready_app(kind: BackendKind) -> (App, Receiver<BackendCommand>) {
         let (mut app, cmd_rx) = test_app(kind);
-        app.apply_event(BackendEvent::Snapshot {
-            id: 0,
-            snapshot: demo_snapshot(),
-        });
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
         (app, cmd_rx)
     }
 
@@ -1064,9 +1060,9 @@ pub(crate) mod tests {
     #[test]
     fn not_installed_event_shows_guide_and_snapshot_recovers() {
         let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
-        assert!(app.is_busy()); // 启动即 RefreshAll 在途
-        app.apply_event(BackendEvent::NotInstalled { id: 0 });
-        assert!(app.not_installed);
+        assert!(app.is_busy()); // 启动即 Loading
+        app.apply_event(BackendEvent::NotInstalled(None));
+        assert_eq!(app.phase, Phase::NotInstalled);
         assert!(!app.is_busy());
         assert!(
             app.last_log
@@ -1074,40 +1070,32 @@ pub(crate) mod tests {
                 .is_some_and(|e| e.level == LogLevel::Err)
         );
         // 重新检测成功（Snapshot）后自动恢复
-        app.apply_event(BackendEvent::Snapshot {
-            id: 1,
-            snapshot: demo_snapshot(),
-        });
-        assert!(!app.not_installed);
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
+        assert_eq!(app.phase, Phase::Ready);
     }
 
     #[test]
-    fn initial_load_error_finishes_and_later_refresh_recovers() {
-        let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
-        app.apply_event(BackendEvent::Finished {
-            id: 0,
-            outcome: Outcome::Err("temporary WMI failure".into()),
-        });
+    fn initial_load_error_and_retry_failure_transition_cleanly() {
+        let (mut app, cmd_rx) = test_app(BackendKind::Mock);
+        app.apply_event(BackendEvent::RefreshFailed("temporary WMI failure".into()));
         assert!(!app.is_busy(), "初始查询失败也必须结束加载状态");
-        assert!(app.load_failed, "初始查询失败应进入可重试的失败态");
+        assert_eq!(app.phase, Phase::LoadFailed);
 
-        app.apply_event(BackendEvent::Snapshot {
-            id: 1,
-            snapshot: demo_snapshot(),
-        });
-        assert!(app.loaded);
-        assert!(!app.load_failed, "成功刷新必须清除失败态");
-        assert!(!app.is_busy(), "后续成功刷新不应恢复或遗留加载状态");
-
-        // F5 重试开始后先回到“加载中”，不等回包再清除旧失败提示。
-        let (mut app, _cmd_rx) = test_app(BackendKind::Mock);
-        app.apply_event(BackendEvent::Finished {
-            id: 0,
-            outcome: Outcome::Err("temporary WMI failure".into()),
-        });
-        assert!(app.load_failed);
+        // F5 重试进入 Loading，若再次失败必须回到 LoadFailed，不能卡死在加载中。
         app.refresh_all();
-        assert!(!app.load_failed);
+        assert!(matches!(cmd_rx.try_recv(), Ok(BackendCommand::RefreshAll)));
+        assert_eq!(app.phase, Phase::Loading);
+        app.apply_event(BackendEvent::RefreshFailed("second failure".into()));
+        assert_eq!(app.phase, Phase::LoadFailed);
+
+        // 重试成功后恢复 Ready，之后 Ready 下 F5 失败不破坏当前快照显示。
+        app.refresh_all();
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
+        assert_eq!(app.phase, Phase::Ready);
+        assert!(!app.is_busy());
+        app.refresh_all();
+        app.apply_event(BackendEvent::RefreshFailed("transient".into()));
+        assert_eq!(app.phase, Phase::Ready);
     }
 
     #[test]
@@ -1115,25 +1103,24 @@ pub(crate) mod tests {
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
         let mutation = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
 
-        // 查询错误（不同 id）不能解锁变更
-        app.apply_event(BackendEvent::Finished {
-            id: mutation + 1,
-            outcome: Outcome::Err("Overlay 轮询失败".into()),
-        });
+        // 刷新失败或快照回包均不能解锁变更
+        app.apply_event(BackendEvent::RefreshFailed("刷新失败".into()));
         assert_eq!(app.mutation, Some(mutation));
 
-        // Snapshot 也不能解锁变更
-        app.apply_event(BackendEvent::Snapshot {
-            id: mutation + 2,
-            snapshot: demo_snapshot(),
-        });
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
         assert_eq!(app.mutation, Some(mutation));
 
-        // NotInstalled 只置引导页，不误解锁
-        app.apply_event(BackendEvent::NotInstalled { id: mutation + 3 });
+        // 无 id 的 NotInstalled 只置引导页，不误解锁
+        app.apply_event(BackendEvent::NotInstalled(None));
         assert_eq!(app.mutation, Some(mutation));
 
-        // 只有匹配 id 的 Finished 才解锁
+        // 带匹配 id 的 NotInstalled 应同步解锁
+        app.apply_event(BackendEvent::NotInstalled(Some(mutation)));
+        assert_eq!(app.mutation, None);
+
+        // 重回 Ready 验证正常 Finished 解锁
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
+        let mutation = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
         app.apply_event(BackendEvent::Finished {
             id: mutation,
             outcome: Outcome::Ok("ok".into()),
@@ -1145,9 +1132,11 @@ pub(crate) mod tests {
     fn mutation_gated_while_pending() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
         app.on_dashboard_key(key(KeyCode::Char('e')));
-        let command = cmd_rx.try_recv().unwrap();
-        assert!(matches!(command.cmd, BackendCmd::EnableFilter));
-        assert_eq!(app.mutation, Some(command.id));
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::EnableFilter));
+        assert_eq!(app.mutation, Some(id));
 
         // 在途期间第二条变更被忽略（PLAN §6.5 单变更在途）
         app.on_dashboard_key(key(KeyCode::Char('d')));
@@ -1155,7 +1144,7 @@ pub(crate) mod tests {
 
         // 匹配 id 的完成事件解除锁
         app.apply_event(BackendEvent::Finished {
-            id: command.id,
+            id,
             outcome: Outcome::Ok("ok".into()),
         });
         assert!(!app.is_pending());
@@ -1195,7 +1184,7 @@ pub(crate) mod tests {
     #[test]
     fn not_installed_blocks_management_keys() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.apply_event(BackendEvent::NotInstalled { id: 0 });
+        app.apply_event(BackendEvent::NotInstalled(None));
         for code in [
             KeyCode::F(10),
             KeyCode::Char('e'),
@@ -1208,6 +1197,28 @@ pub(crate) mod tests {
             assert!(app.modal.is_none(), "未安装页不应打开管理弹窗: {code:?}");
         }
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn not_installed_and_backend_lost_skip_overlay_poll() {
+        let (mut app, cmd_rx) = test_app(BackendKind::Mock);
+        app.send_overlay_refresh();
+        assert!(cmd_rx.try_recv().is_err(), "Loading 阶段不应轮询 Overlay");
+
+        app.apply_event(BackendEvent::NotInstalled(None));
+        app.send_overlay_refresh();
+        assert!(cmd_rx.try_recv().is_err(), "未安装阶段不应轮询 Overlay");
+
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
+        app.send_overlay_refresh();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(BackendCommand::RefreshOverlayRuntime)
+        ));
+
+        app.apply_event(BackendEvent::Disconnected);
+        app.send_overlay_refresh();
+        assert!(cmd_rx.try_recv().is_err(), "断线后不应轮询 Overlay");
     }
 
     #[test]
@@ -1224,7 +1235,7 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         app.on_key(key(KeyCode::F(5)));
-        assert!(matches!(recv_cmd(&cmd_rx), BackendCmd::RefreshAll));
+        assert!(matches!(cmd_rx.try_recv(), Ok(BackendCommand::RefreshAll)));
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
@@ -1253,15 +1264,17 @@ pub(crate) mod tests {
 
         // 焦点文件栏，删除选中 → RemoveFileExclusion（display 形式绝对路径）
         app.on_key(key(KeyCode::Char('d')));
-        let first = cmd_rx.try_recv().unwrap();
-        match first.cmd {
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        match cmd {
             BackendCmd::RemoveFileExclusion(path) => {
                 assert_eq!(path, "C:\\Windows\\Temp")
             }
             other => panic!("期望 RemoveFileExclusion，实际 {other:?}"),
         }
         app.apply_event(BackendEvent::Finished {
-            id: first.id,
+            id,
             outcome: Outcome::Ok("ok".into()),
         });
 
@@ -1285,7 +1298,7 @@ pub(crate) mod tests {
             FileExclusion::new("C:".into(), "\\A".into()),
             FileExclusion::new("C:".into(), "\\B".into()),
         ];
-        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+        app.apply_event(BackendEvent::Snapshot(snapshot));
 
         app.on_key(key(KeyCode::End));
         assert_eq!(app.file_exclusion_state.selected(), Some(1));
@@ -1303,10 +1316,12 @@ pub(crate) mod tests {
         assert!(matches!(app.modal, Some(Modal::Confirm(_))));
         app.on_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
-        let command = cmd_rx.try_recv().unwrap();
-        assert!(matches!(command.cmd, BackendCmd::RestartSystem));
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::RestartSystem));
         app.apply_event(BackendEvent::Finished {
-            id: command.id,
+            id,
             outcome: Outcome::Ok("系统即将重启".into()),
         });
         assert!(!app.should_quit);
@@ -1320,10 +1335,12 @@ pub(crate) mod tests {
         let (mut app, cmd_rx) = ready_app(BackendKind::Windows);
         app.on_key(key(KeyCode::F(10)));
         app.on_key(key(KeyCode::Enter));
-        let command = cmd_rx.try_recv().unwrap();
-        assert!(matches!(command.cmd, BackendCmd::RestartSystem));
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::RestartSystem));
         app.apply_event(BackendEvent::Finished {
-            id: command.id,
+            id,
             outcome: Outcome::Ok("系统即将重启".into()),
         });
         assert!(app.should_quit);
@@ -1364,7 +1381,7 @@ pub(crate) mod tests {
             current_enabled: false,
             next_enabled: false,
         });
-        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+        app.apply_event(BackendEvent::Snapshot(snapshot));
         app.on_dashboard_key(key(KeyCode::Char('s')));
         let Some(Modal::OverlaySettings(state)) = &app.modal else {
             panic!("期望 OverlaySettings 弹窗");
@@ -1436,14 +1453,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn snapshot_warnings_are_logged() {
+    fn snapshot_warnings_are_merged_without_losing_first() {
         let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
         let mut snapshot = demo_snapshot();
-        snapshot.warnings = vec!["卷 D: 读取排除项失败: boom".into()];
-        app.apply_event(BackendEvent::Snapshot { id: 9, snapshot });
-        assert!(app.last_log.as_ref().is_some_and(|e| {
-            e.level == LogLevel::Warn && e.text.contains("卷 D: 读取排除项失败")
-        }));
+        snapshot.warnings = vec![
+            "卷 C: 读取排除项失败: e1".into(),
+            "卷 D: 读取排除项失败: e2".into(),
+        ];
+        app.apply_event(BackendEvent::Snapshot(snapshot));
+        let entry = app.last_log.as_ref().expect("应记录合并后的警告");
+        assert_eq!(entry.level, LogLevel::Warn);
+        assert!(entry.text.contains("卷 C:"));
+        assert!(entry.text.contains("卷 D:"));
     }
 
     #[test]
@@ -1455,23 +1476,26 @@ pub(crate) mod tests {
             warning_threshold_mb: 1536,
             critical_threshold_mb: 1843,
         };
-        app.apply_event(BackendEvent::OverlayRuntime { id: 3, runtime });
+        app.apply_event(BackendEvent::OverlayRuntime(runtime));
         assert_eq!(app.snapshot.overlay_runtime, Some(runtime));
     }
     #[test]
-    fn backend_disconnect_marks_lost_and_blocks_mutations() {
+    fn backend_disconnect_marks_lost_closes_modal_and_blocks_mutations() {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (_ui_tx, ui_rx) = std::sync::mpsc::channel();
         let mut app = App::new(cmd_tx, ui_rx, BackendKind::Mock);
+        app.modal = Some(Modal::Help);
         assert!(app.is_busy()); // 启动加载在途
 
-        app.handle_disconnected();
-        assert!(app.backend_lost);
-        assert!(app.load_failed, "断线时未加载成功应显示可重试的失败态");
+        app.apply_event(BackendEvent::Disconnected);
+        assert_eq!(app.phase, Phase::BackendLost);
+        assert!(app.modal.is_none(), "断线必须关闭遗留弹窗");
         assert!(!app.is_busy()); // 不会永久 pending
 
-        app.on_dashboard_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Char('e')));
         assert!(cmd_rx.try_recv().is_err());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
     }
     #[test]
     fn selection_reanchors_after_selected_item_removed() {
@@ -1484,7 +1508,7 @@ pub(crate) mod tests {
             FileExclusion::new("C:".into(), "\\B".into()),
         ];
         snapshot.registry_exclusions_next = vec!["HKLM\\SOFTWARE\\A".into()];
-        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+        app.apply_event(BackendEvent::Snapshot(snapshot));
         assert_eq!(app.file_exclusion_state.selected(), Some(0));
         assert_eq!(app.selected_file_key, Some(("C:".into(), "\\A".into())));
         assert_eq!(app.registry_exclusion_state.selected(), Some(0));
@@ -1499,7 +1523,7 @@ pub(crate) mod tests {
         ];
         snapshot.registry_exclusions_next =
             vec!["HKLM\\SOFTWARE\\0".into(), "HKLM\\SOFTWARE\\A".into()];
-        app.apply_event(BackendEvent::Snapshot { id: 2, snapshot });
+        app.apply_event(BackendEvent::Snapshot(snapshot));
         assert_eq!(app.file_exclusion_state.selected(), Some(1));
         assert_eq!(app.selected_file_key, Some(("C:".into(), "\\A".into())));
         assert_eq!(app.registry_exclusion_state.selected(), Some(1));
@@ -1528,7 +1552,7 @@ pub(crate) mod tests {
             "HKLM\\SOFTWARE\\A".into(),
             "HKLM\\SOFTWARE\\UwfManagerDemo".into(),
         ];
-        app.apply_event(BackendEvent::Snapshot { id: 1, snapshot });
+        app.apply_event(BackendEvent::Snapshot(snapshot));
 
         assert_eq!(app.file_exclusion_state.selected(), Some(1));
         assert_eq!(app.registry_exclusion_state.selected(), Some(1));
@@ -1542,25 +1566,54 @@ pub(crate) mod tests {
         );
     }
     #[test]
-    fn unique_export_path_does_not_overwrite() {
-        let dir = std::env::temp_dir().join(format!("uwf_export_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = dir.join("EXCLUSIONLIST_2026_10_20_12_00_00.txt");
-        std::fs::write(&first, "x").unwrap();
+    fn exclusions_s_toggle_preserves_selected_key_across_empty_current() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        let mut snapshot = demo_snapshot();
+        snapshot.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\B".into()),
+        ];
+        snapshot.file_exclusions_current = vec![];
+        app.apply_event(BackendEvent::Snapshot(snapshot));
+        app.tab = Tab::Exclusions;
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.file_exclusion_state.selected(), Some(1));
 
-        let second = unique_export_path(first.clone());
-        assert_eq!(
-            second.file_name().and_then(|s| s.to_str()),
-            Some("EXCLUSIONLIST_2026_10_20_12_00_00_1.txt")
-        );
+        // 切到空的当前视图再切回，必须回到 \B 而不是重置到索引 0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.file_exclusion_state.selected(), None);
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.file_exclusion_state.selected(), Some(1));
+        assert_eq!(app.selected_file_key, Some(("C:".into(), "\\B".into())));
+    }
 
-        std::fs::write(&second, "y").unwrap();
-        let third = unique_export_path(first);
-        assert_eq!(
-            third.file_name().and_then(|s| s.to_str()),
-            Some("EXCLUSIONLIST_2026_10_20_12_00_00_2.txt")
-        );
+    #[test]
+    fn repeat_events_advance_selection_and_release_is_ignored() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        app.tab = Tab::Volumes;
+        app.handle_ui_event(UiEvent::Terminal(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            event::KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ))));
+        assert_eq!(app.volumes_state.selected(), Some(1));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        app.handle_ui_event(UiEvent::Terminal(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ))));
+        assert_eq!(app.volumes_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn help_closes_with_upper_q_and_enter() {
+        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+        for close in [KeyCode::Char('Q'), KeyCode::Enter] {
+            app.on_key(key(KeyCode::Char('?')));
+            assert!(matches!(app.modal, Some(Modal::Help)));
+            app.on_key(key(close));
+            assert!(app.modal.is_none());
+        }
     }
 }

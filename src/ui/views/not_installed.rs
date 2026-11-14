@@ -1,6 +1,6 @@
 //! D6：UWF 功能未安装引导页。
 //!
-//! 后端回包 `BackendEvent::NotInstalled` 置位 `app.not_installed` 后，
+//! 当 `app.phase == Phase::NotInstalled` 时，
 //! 本页取代正常 Tab 视图；[F5] 重新检测（RefreshAll），检测到后自动恢复。
 
 use ratatui::Frame;
