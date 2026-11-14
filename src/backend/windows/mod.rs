@@ -30,20 +30,6 @@ use super::UwfBackend;
 /// UWF WMI 命名空间
 const NAMESPACE: &str = "root\\standardcimv2\\embedded";
 
-/// 仅把“命名空间/类不存在”映射为 NotInstalled；权限、RPC、服务异常保留为 Wmi。
-fn map_connect_error(e: wmi::WMIError) -> UwfError {
-    const WBEM_E_INVALID_NAMESPACE: i32 = 0x8004_100E_u32 as i32;
-    const WBEM_E_NOT_FOUND: i32 = 0x8004_1002_u32 as i32;
-    match &e {
-        wmi::WMIError::HResultError { hres }
-            if *hres == WBEM_E_INVALID_NAMESPACE || *hres == WBEM_E_NOT_FOUND =>
-        {
-            UwfError::NotInstalled
-        }
-        _ => UwfError::Wmi(Box::new(e)),
-    }
-}
-
 /// WQL 布尔字面量（显式大写，与原版 C# 插值结果一致）
 fn session_kw(current_session: bool) -> &'static str {
     if current_session { "TRUE" } else { "FALSE" }
@@ -51,7 +37,7 @@ fn session_kw(current_session: bool) -> &'static str {
 
 pub struct WindowsWmiBackend {
     con: Option<WMIConnection>,
-    /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot 取走
+    /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot / export_exclusions 取走
     warnings: Vec<String>,
 }
 
@@ -67,11 +53,30 @@ impl WindowsWmiBackend {
 
     fn con(&mut self) -> Result<&WMIConnection> {
         if self.con.is_none() {
-            // 命名空间不存在（UWF 功能未安装）时 ConnectServer 返回错误
-            self.con =
-                Some(WMIConnection::with_namespace_path(NAMESPACE).map_err(map_connect_error)?);
+            // 命名空间不存在（UWF 功能未安装）时经 From<WMIError> 转为 NotInstalled
+            self.con = Some(WMIConnection::with_namespace_path(NAMESPACE)?);
         }
         Ok(self.con.as_ref().expect("connected above"))
+    }
+
+    fn query<T: DeserializeOwned>(&mut self) -> Result<Vec<T>> {
+        match self.con()?.query() {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                self.con = None;
+                Err(e.into())
+            }
+        }
+    }
+
+    fn raw_query<T: DeserializeOwned>(&mut self, wql: &str) -> Result<Vec<T>> {
+        match self.con()?.raw_query(wql) {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                self.con = None;
+                Err(e.into())
+            }
+        }
     }
 
     /// 调用实例方法（serde 化入参/出参）
@@ -85,9 +90,16 @@ impl WindowsWmiBackend {
         Class: DeserializeOwned,
         Out: DeserializeOwned,
     {
-        Ok(self
+        match self
             .con()?
-            .exec_instance_method::<Class, Out>(object_path, method, in_params)?)
+            .exec_instance_method::<Class, Out>(object_path, method, in_params)
+        {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                self.con = None;
+                Err(e.into())
+            }
+        }
     }
 
     /// ReturnValue != 0 → UwfError::WmiMethod（uwfmgr 风格十六进制错误码）
@@ -106,12 +118,12 @@ impl WindowsWmiBackend {
 
     /// UWF_Filter 单例；查询失败或为空 → UWF 功能未安装
     fn filter_instance(&mut self) -> Result<UWF_Filter> {
-        let rows: Vec<UWF_Filter> = self.con()?.query()?;
+        let rows: Vec<UWF_Filter> = self.query()?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
     fn overlay_instance(&mut self) -> Result<UWF_Overlay> {
-        let rows: Vec<UWF_Overlay> = self.con()?.query()?;
+        let rows: Vec<UWF_Overlay> = self.query()?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
@@ -120,7 +132,7 @@ impl WindowsWmiBackend {
             "SELECT * FROM UWF_OverlayConfig WHERE CurrentSession = {}",
             session_kw(current_session)
         );
-        let rows: Vec<UWF_OverlayConfig> = self.con()?.raw_query(&wql)?;
+        let rows: Vec<UWF_OverlayConfig> = self.raw_query(&wql)?;
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
@@ -130,7 +142,7 @@ impl WindowsWmiBackend {
             "SELECT * FROM UWF_Volume WHERE CurrentSession = {}",
             session_kw(current_session)
         );
-        let rows: Vec<UWF_Volume> = self.con()?.raw_query(&wql)?;
+        let rows: Vec<UWF_Volume> = self.raw_query(&wql)?;
         Ok(rows
             .into_iter()
             .filter(|v| !v.DriveLetter.is_empty())
@@ -151,7 +163,7 @@ impl WindowsWmiBackend {
             "SELECT * FROM UWF_RegistryFilter WHERE CurrentSession = {}",
             session_kw(current_session)
         );
-        let rows: Vec<UWF_RegistryFilter> = self.con()?.raw_query(&wql)?;
+        let rows: Vec<UWF_RegistryFilter> = self.raw_query(&wql)?;
         rows.into_iter()
             .next()
             .map(|r| r.path)
@@ -421,12 +433,14 @@ impl UwfBackend for WindowsWmiBackend {
                 code: out.ReturnValue,
             });
         }
-        Ok(out
+        let mut keys: Vec<String> = out
             .ExcludedKeys
             .unwrap_or_default()
             .into_iter()
             .map(|k| k.RegistryKey)
-            .collect())
+            .collect();
+        keys.sort();
+        Ok(keys)
     }
 
     fn add_registry_exclusion(&mut self, key: &str) -> Result<()> {
