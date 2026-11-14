@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 推送以 v 开头的 tag 时触发，例如 v3.5.6
+
+permissions:
+  contents: write # 创建 Release 与上传产物需要写权限
+
+jobs:
+  release:
+    name: Build & Publish (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build release
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package & prepare release notes
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target\x86_64-pc-windows-msvc\release\uwf_manager.exe -DestinationPath uwf_manager-windows-amd64.zip -Force
+          $body = (Get-Content -Raw -Encoding utf8 .github/release-body.md).Replace('{{TAG}}', $env:GITHUB_REF_NAME)
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: uwf_manager ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: uwf_manager-windows-amd64.zip
+          prerelease: ${{ contains(github.ref_name, '-') }}
