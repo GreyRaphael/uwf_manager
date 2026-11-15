@@ -718,6 +718,162 @@ pub(crate) fn merge_volume_infos(
     map.into_values().collect()
 }
 
+/// 原始 `UWF_Volume` WMI 行（Windows 查询后直接解码到此结构供纯逻辑消歧）。
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawVolumeInstance {
+    pub path: String,
+    pub current_session: bool,
+    pub drive_letter: Option<String>,
+    pub volume_name: Option<String>,
+    pub bind_by_drive_letter: bool,
+    pub protected: bool,
+}
+
+/// 经筛选与盘符消歧后的有效 `UWF_Volume` 实例。
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedVolume {
+    pub path: String,
+    pub current_session: bool,
+    pub drive_letter: String,
+    pub volume_name: String,
+    pub bind_by_drive_letter: bool,
+    pub protected: bool,
+}
+
+/// 将 `Win32_Volume.DeviceID`（如 `\\?\Volume{GUID}\`）归一为 `Volume{GUID}`，
+/// 以匹配 `UWF_Volume.VolumeName`。
+#[cfg(any(windows, test))]
+pub(crate) fn extract_volume_guid_name(device_id: &str) -> Option<String> {
+    let trimmed = device_id.trim();
+    let without_prefix = trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed);
+    let guid = without_prefix.trim_end_matches('\\');
+    (!guid.is_empty()).then(|| guid.to_string())
+}
+
+/// 将盘符文本（如 `"d:"`、`"D:\\"`）归一为大写 `"X:"`；空串或无效值返回 `None`。
+#[cfg(any(windows, test))]
+pub(crate) fn normalize_drive_letter(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(['\\', '/']);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(trimmed.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// 在已消歧的卷集合中按 `(current_session, drive_letter)` 查找实例。
+#[cfg(any(windows, test))]
+pub(crate) fn find_session_volume<'a>(
+    volumes: &'a [ResolvedVolume],
+    current_session: bool,
+    drive_letter: &str,
+) -> Option<&'a ResolvedVolume> {
+    let target = normalize_drive_letter(drive_letter)?;
+    volumes
+        .iter()
+        .find(|v| v.current_session == current_session && v.drive_letter == target)
+}
+
+/// 过滤无效盘符行，并在同一会话同一盘符存在多条 GUID 实例时按当前挂载卷消歧。
+///
+/// 仅当某 `(current_session, drive_letter)` 桶出现 >= 2 条实例时才按需调用
+/// `mounted_guid(drive_letter)`：
+/// - `CurrentSession = TRUE`：仅保留与当前挂载 GUID 一致的实例（剔除陈旧拔插盘符记录）；
+/// - `CurrentSession = FALSE`：保留 `BindByDriveLetter = true` 或匹配当前挂载 GUID 的实例；
+/// - 同一桶内若仍有 >= 2 条适用实例（或完全相同的 `(session, drive, guid)` 重复）返回 [`UwfError::VolumeAmbiguous`]。
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_volumes<F>(
+    raw_rows: Vec<RawVolumeInstance>,
+    mut mounted_guid: F,
+) -> Result<Vec<ResolvedVolume>>
+where
+    F: FnMut(&str) -> Result<Option<String>>,
+{
+    let mut volumes = Vec::with_capacity(raw_rows.len());
+    let mut seen_identities = std::collections::BTreeSet::new();
+    let mut buckets: std::collections::BTreeMap<(bool, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+
+    for raw in raw_rows {
+        let Some(drive_letter) = raw.drive_letter.as_deref().and_then(normalize_drive_letter)
+        else {
+            continue;
+        };
+        let volume_name = raw
+            .volume_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if !volume_name.is_empty()
+            && !seen_identities.insert((
+                raw.current_session,
+                drive_letter.clone(),
+                volume_name.to_ascii_uppercase(),
+            ))
+        {
+            return Err(UwfError::VolumeAmbiguous(drive_letter));
+        }
+        let idx = volumes.len();
+        buckets
+            .entry((raw.current_session, drive_letter.clone()))
+            .or_default()
+            .push(idx);
+        volumes.push(ResolvedVolume {
+            path: raw.path,
+            current_session: raw.current_session,
+            drive_letter,
+            volume_name,
+            bind_by_drive_letter: raw.bind_by_drive_letter,
+            protected: raw.protected,
+        });
+    }
+
+    let mut selected = vec![true; volumes.len()];
+    let mut mount_cache: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+
+    for ((current_session, drive_letter), indices) in buckets {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let mounted = match mount_cache.get(&drive_letter) {
+            Some(cached) => cached.clone(),
+            None => {
+                let resolved = mounted_guid(&drive_letter)?
+                    .as_deref()
+                    .and_then(extract_volume_guid_name);
+                mount_cache.insert(drive_letter.clone(), resolved.clone());
+                resolved
+            }
+        };
+        let mut matched = 0usize;
+        for idx in indices {
+            let row = &volumes[idx];
+            let matches_mount = mounted.as_deref().is_some_and(|guid| {
+                !row.volume_name.is_empty() && guid.eq_ignore_ascii_case(&row.volume_name)
+            });
+            let applies = (!current_session && row.bind_by_drive_letter) || matches_mount;
+            selected[idx] = applies;
+            if applies {
+                matched += 1;
+                if matched > 1 {
+                    return Err(UwfError::VolumeAmbiguous(drive_letter));
+                }
+            }
+        }
+    }
+
+    Ok(volumes
+        .into_iter()
+        .zip(selected)
+        .filter_map(|(v, keep)| keep.then_some(v))
+        .collect())
+}
+
 /// R6：绝对路径 → (盘符, 相对路径)。
 /// 如 `"C:\Windows\a.txt"` → `("C:", "\Windows\a.txt")`（相对路径保留前导 `\`，
 /// 与原版 `FileName.Remove(0, 2)` 一致）。
@@ -1267,5 +1423,144 @@ mod tests {
             (rt.warning_threshold_mb, rt.critical_threshold_mb),
             (1200, 1600)
         );
+    }
+
+    fn raw_vol(
+        session: bool,
+        drive: Option<&str>,
+        guid: Option<&str>,
+        bind_by_drive: bool,
+        protected: bool,
+    ) -> RawVolumeInstance {
+        let drive_label = drive.unwrap_or("none");
+        let guid_label = guid.unwrap_or("empty");
+        RawVolumeInstance {
+            path: format!(
+                "UWF_Volume.CurrentSession={session},DriveLetter=\"{drive_label}\",VolumeName=\"{guid_label}\""
+            ),
+            current_session: session,
+            drive_letter: drive.map(str::to_string),
+            volume_name: guid.map(str::to_string),
+            bind_by_drive_letter: bind_by_drive,
+            protected,
+        }
+    }
+
+    #[test]
+    fn extract_volume_guid_name_normalizes_win32_device_id() {
+        assert_eq!(
+            extract_volume_guid_name(r"\\?\Volume{f0696b3f-f3ac-4e6e-8262-578ac0957ab8}\")
+                .as_deref(),
+            Some("Volume{f0696b3f-f3ac-4e6e-8262-578ac0957ab8}")
+        );
+        assert_eq!(
+            extract_volume_guid_name("  Volume{abc}  ").as_deref(),
+            Some("Volume{abc}")
+        );
+        assert_eq!(extract_volume_guid_name(""), None);
+        assert_eq!(extract_volume_guid_name(r"\\?\"), None);
+    }
+
+    #[test]
+    fn resolve_volumes_skips_missing_drive_and_avoids_mount_probe_without_conflict() {
+        let rows = vec![
+            raw_vol(true, None, Some("Volume{efi}"), false, false),
+            raw_vol(true, Some(""), Some("Volume{recovery}"), false, false),
+            raw_vol(true, Some("   "), Some("Volume{blank}"), false, false),
+            raw_vol(true, Some("e:\\"), Some("Volume{15bed6ce}"), false, false),
+            raw_vol(false, Some("c:"), Some("Volume{f0696b3f}"), true, true),
+        ];
+        let mut probed = Vec::new();
+        let resolved = resolve_volumes(rows, |drive| {
+            probed.push(drive.to_string());
+            Ok(None)
+        })
+        .unwrap();
+
+        assert!(probed.is_empty(), "无盘符冲突时不应触发挂载查询");
+        assert_eq!(resolved.len(), 2);
+        let e = find_session_volume(&resolved, true, "e:").unwrap();
+        assert_eq!(e.drive_letter, "E:");
+        assert_eq!(e.volume_name, "Volume{15bed6ce}");
+        assert!(!e.bind_by_drive_letter);
+        assert!(!e.protected);
+
+        let c = find_session_volume(&resolved, false, "C:").unwrap();
+        assert!(c.bind_by_drive_letter);
+        assert!(c.protected);
+        assert!(c.path.contains("CurrentSession=false"));
+    }
+
+    #[test]
+    fn resolve_volumes_disambiguates_duplicate_current_session_via_mount() {
+        let rows = vec![
+            raw_vol(true, Some("E:"), Some("Volume{15bed6ce}"), false, false),
+            raw_vol(true, Some("H:"), Some("Volume{df5bd4a8}"), false, false),
+            raw_vol(true, Some("H:"), Some("Volume{4ff2d2fc}"), false, false),
+            raw_vol(false, Some("C:"), Some("Volume{f0696b3f}"), false, true),
+        ];
+        let mut probed = Vec::new();
+        let resolved = resolve_volumes(rows, |drive| {
+            probed.push(drive.to_string());
+            Ok(match drive {
+                "H:" => Some(r"\\?\Volume{4FF2D2FC}\".to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(probed, vec!["H:"]);
+        let h = find_session_volume(&resolved, true, "H:").unwrap();
+        assert_eq!(h.volume_name, "Volume{4ff2d2fc}");
+        assert!(find_session_volume(&resolved, true, "E:").is_some());
+        assert!(find_session_volume(&resolved, false, "C:").is_some());
+    }
+
+    #[test]
+    fn resolve_volumes_drops_unmounted_ghosts_and_handles_next_session_conflict() {
+        // 全离线冲突行应被安全滤除而不报错
+        let ghost_rows = vec![
+            raw_vol(true, Some("H:"), Some("Volume{old-1}"), false, false),
+            raw_vol(true, Some("H:"), Some("Volume{old-2}"), false, false),
+        ];
+        let resolved_ghosts = resolve_volumes(ghost_rows, |_| Ok(None)).unwrap();
+        assert!(resolved_ghosts.is_empty());
+
+        // 下次会话中 BindByDriveLetter = true 的配置即使旧 GUID 已卸载也应保留
+        let next_conflict = vec![
+            raw_vol(false, Some("D:"), Some("Volume{old-usb}"), true, true),
+            raw_vol(false, Some("D:"), Some("Volume{stale}"), false, false),
+        ];
+        let resolved_next = resolve_volumes(next_conflict, |_| Ok(None)).unwrap();
+        assert_eq!(resolved_next.len(), 1);
+        assert_eq!(resolved_next[0].volume_name, "Volume{old-usb}");
+        assert!(resolved_next[0].protected);
+
+        // 下次会话同时存在“按盘符绑定”和“按 GUID 绑定且已挂载”两个不同实例时必须报歧义
+        let true_ambiguity = vec![
+            raw_vol(false, Some("D:"), Some("Volume{by-letter}"), true, true),
+            raw_vol(
+                false,
+                Some("D:"),
+                Some("Volume{mounted-guid}"),
+                false,
+                false,
+            ),
+        ];
+        let err = resolve_volumes(true_ambiguity, |_| {
+            Ok(Some(r"\\?\Volume{mounted-guid}\".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, UwfError::VolumeAmbiguous(ref d) if d == "D:"));
+
+        // 同会话同盘符同 GUID 重复出现同样报错
+        let dup_identity = vec![
+            raw_vol(true, Some("E:"), Some("Volume{same}"), false, false),
+            raw_vol(true, Some("E:"), Some("VOLUME{SAME}"), false, false),
+        ];
+        assert!(matches!(
+            resolve_volumes(dup_identity, |_| Ok(None)),
+            Err(UwfError::VolumeAmbiguous(ref d)) if d == "E:"
+        ));
     }
 }

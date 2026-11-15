@@ -27,6 +27,11 @@ pub enum UwfError {
     #[error("未找到卷 {0} 对应的 UWF 实例")]
     VolumeNotFound(String),
 
+    /// 同一会话同一盘符存在多个无法通过当前挂载卷消歧的 UWF 实例
+    #[cfg_attr(not(windows), allow(dead_code))]
+    #[error("卷 {0} 存在多个冲突的 UWF 实例且无法消歧")]
+    VolumeAmbiguous(String),
+
     /// R3 两步删除的部分成功：文件已删，但 WMI 固化删除失败
     #[cfg_attr(not(windows), allow(dead_code))]
     #[error("文件 {path} 已删除，但 UWF 固化删除失败：{message}")]

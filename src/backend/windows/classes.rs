@@ -41,9 +41,22 @@ pub struct UWF_OverlayConfig {
 pub struct UWF_Volume {
     #[serde(rename = "__Path")]
     pub path: String,
-    pub DriveLetter: String,
+    pub CurrentSession: bool,
+    /// 无盘符分区（如恢复/EFI 分区）可能为 NULL 或空串
+    pub DriveLetter: Option<String>,
+    /// 创建下次会话实例必需的卷 GUID 名（如 `Volume{...}`）
+    pub VolumeName: Option<String>,
+    pub BindByDriveLetter: Option<bool>,
     /// 与原版一致：属性可能为 null，缺省视为不保护
     pub Protected: Option<bool>,
+}
+
+/// `ROOT\CIMV2` 挂载卷信息，仅在同盘符多条 `UWF_Volume` 记录冲突时按需查询。
+#[derive(Deserialize)]
+#[allow(non_snake_case, non_camel_case_types)]
+pub struct Win32_Volume {
+    pub DeviceID: Option<String>,
+    pub DriveLetter: Option<String>,
 }
 
 #[derive(Deserialize)]

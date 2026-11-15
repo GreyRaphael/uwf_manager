@@ -6,16 +6,19 @@
 //!
 //! 业务规则落位（对照 PLAN §6.3 映射表）：
 //! - R1：set_overlay_type/max_size 先查当前筛选器状态，启用则拒绝
-//! - R2：protect/unprotect 作用于**下次会话**实例；list_volumes 双查询合并
+//! - R2：protect/unprotect 作用于**下次会话**实例（若缺失则由当前会话自动注册）；
+//!   读取时对同会话同盘符多实例按当前挂载卷消歧
 //! - R3：commit_file → 当前会话实例；commit_file_deletion → 先删真实文件
 //!   （容忍 NotFound）再调下次会话实例
-//! - R4：排除项增删作用于下次会话实例，查询支持双视图
+//! - R4：排除项增删作用于下次会话实例（新增缺失时自动注册），查询支持双视图
 //! - R5：注册表提交作用于当前会话实例（路径拆分在后端线程已完成）
 
 mod classes;
 mod elevate;
 
 pub(crate) use elevate::is_elevated;
+
+use std::collections::HashMap;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -25,7 +28,10 @@ use crate::error::{Result, UwfError};
 use crate::model::*;
 use classes::*;
 
-use super::UwfBackend;
+use super::{
+    RawVolumeInstance, ResolvedVolume, UwfBackend, find_session_volume, normalize_drive_letter,
+    resolve_volumes,
+};
 
 /// UWF WMI 命名空间
 const NAMESPACE: &str = "root\\standardcimv2\\embedded";
@@ -136,26 +142,114 @@ impl WindowsWmiBackend {
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
-    /// 按会话查询卷实例（跳过空盘符实例，与原版一致）
-    fn volumes_for(&mut self, current_session: bool) -> Result<Vec<UWF_Volume>> {
-        let wql = format!(
-            "SELECT * FROM UWF_Volume WHERE CurrentSession = {}",
-            session_kw(current_session)
-        );
-        let rows: Vec<UWF_Volume> = self.raw_query(&wql)?;
-        Ok(rows
+    /// 单次全量读取 `UWF_Volume`，跳过无效盘符实例并消歧同会话同盘符冲突。
+    fn read_volumes(&mut self) -> Result<Vec<ResolvedVolume>> {
+        let rows: Vec<UWF_Volume> = self.raw_query("SELECT * FROM UWF_Volume")?;
+        let raw_instances = rows
             .into_iter()
-            .filter(|v| !v.DriveLetter.is_empty())
+            .map(|v| RawVolumeInstance {
+                path: v.path,
+                current_session: v.CurrentSession,
+                drive_letter: v.DriveLetter,
+                volume_name: v.VolumeName,
+                bind_by_drive_letter: v.BindByDriveLetter.unwrap_or(false),
+                protected: v.Protected.unwrap_or(false),
+            })
+            .collect();
+        let mut mounted_by_drive: Option<HashMap<String, String>> = None;
+        resolve_volumes(raw_instances, |drive| {
+            if mounted_by_drive.is_none() {
+                mounted_by_drive = Some(Self::mounted_volumes_by_drive()?);
+            }
+            Ok(mounted_by_drive
+                .as_ref()
+                .and_then(|map| map.get(drive))
+                .cloned())
+        })
+    }
+
+    /// 仅在同会话出现重复盘符时查询 `ROOT\CIMV2` 中的 `Win32_Volume` 建立 `盘符 → DeviceID` 映射。
+    fn mounted_volumes_by_drive() -> Result<HashMap<String, String>> {
+        let cimv2 = WMIConnection::new()?;
+        let rows: Vec<Win32_Volume> = cimv2.raw_query(
+            "SELECT DeviceID, DriveLetter FROM Win32_Volume WHERE DriveLetter IS NOT NULL",
+        )?;
+        let mut map = HashMap::new();
+        for row in rows {
+            if let (Some(drive), Some(device_id)) = (
+                row.DriveLetter.as_deref().and_then(normalize_drive_letter),
+                row.DeviceID,
+            ) {
+                map.insert(drive, device_id);
+            }
+        }
+        Ok(map)
+    }
+
+    /// 按会话过滤已消歧的卷实例。
+    fn volumes_for(&mut self, current_session: bool) -> Result<Vec<ResolvedVolume>> {
+        Ok(self
+            .read_volumes()?
+            .into_iter()
+            .filter(|v| v.current_session == current_session)
             .collect())
     }
 
-    /// 按盘符定位指定会话的卷实例路径
+    /// 按盘符定位指定会话的卷实例路径。
     fn find_volume_path(&mut self, current_session: bool, drive_letter: &str) -> Result<String> {
-        self.volumes_for(current_session)?
-            .into_iter()
-            .find(|v| v.DriveLetter.eq_ignore_ascii_case(drive_letter))
-            .map(|v| v.path)
+        let volumes = self.read_volumes()?;
+        find_session_volume(&volumes, current_session, drive_letter)
+            .map(|v| v.path.clone())
             .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))
+    }
+
+    /// 定位下次会话卷实例路径；若仅当前会话存在该卷（未曾被 UWF 配置过），
+    /// 则先向 WMI 写入 `CurrentSession = FALSE` 实例再回读真实 `__Path`。
+    fn ensure_next_volume_path(&mut self, drive_letter: &str) -> Result<String> {
+        let volumes = self.read_volumes()?;
+        if let Some(next) = find_session_volume(&volumes, false, drive_letter) {
+            return Ok(next.path.clone());
+        }
+        let current = find_session_volume(&volumes, true, drive_letter)
+            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
+        if current.volume_name.is_empty() {
+            return Err(UwfError::VolumeNotFound(drive_letter.into()));
+        }
+        let drive = current.drive_letter.clone();
+        let volume_name = current.volume_name.clone();
+
+        self.put_next_volume(&drive, &volume_name)?;
+
+        let refreshed = self.read_volumes()?;
+        find_session_volume(&refreshed, false, &drive)
+            .map(|v| v.path.clone())
+            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))
+    }
+
+    fn put_next_volume(&mut self, drive_letter: &str, volume_name: &str) -> Result<()> {
+        const WBEM_E_ALREADY_EXISTS: i32 = 0x8004_1009_u32 as i32;
+        let con = self.con()?;
+        match Self::spawn_and_put_next_volume(con, drive_letter, volume_name) {
+            Ok(()) => Ok(()),
+            Err(wmi::WMIError::HResultError { hres }) if hres == WBEM_E_ALREADY_EXISTS => Ok(()),
+            Err(e) => {
+                self.con = None;
+                Err(e.into())
+            }
+        }
+    }
+
+    fn spawn_and_put_next_volume(
+        con: &WMIConnection,
+        drive_letter: &str,
+        volume_name: &str,
+    ) -> wmi::WMIResult<()> {
+        let class_obj = con.get_object("UWF_Volume")?;
+        let inst = class_obj.spawn_instance()?;
+        inst.put_property("CurrentSession", false)?;
+        inst.put_property("DriveLetter", drive_letter)?;
+        inst.put_property("VolumeName", volume_name)?;
+        con.put_instance(&inst)
     }
 
     fn registry_filter_path(&mut self, current_session: bool) -> Result<String> {
@@ -287,27 +381,28 @@ impl UwfBackend for WindowsWmiBackend {
     // ── Volume ──
 
     fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
-        // R2 / PLAN：current/next 两次查询按盘符合并，next-only 卷也必须可见。
-        let current = self
-            .volumes_for(true)?
-            .into_iter()
-            .map(|v| (v.DriveLetter, v.Protected.unwrap_or(false)));
-        let next = self
-            .volumes_for(false)?
-            .into_iter()
-            .map(|v| (v.DriveLetter, v.Protected.unwrap_or(false)));
+        // R2 / PLAN：单次全量消歧查询后按会话合并，next-only 卷与未注册的 current-only 卷均可见。
+        let volumes = self.read_volumes()?;
+        let current = volumes
+            .iter()
+            .filter(|v| v.current_session)
+            .map(|v| (v.drive_letter.clone(), v.protected));
+        let next = volumes
+            .iter()
+            .filter(|v| !v.current_session)
+            .map(|v| (v.drive_letter.clone(), v.protected));
         Ok(super::merge_volume_infos(current, next))
     }
 
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {
-        // R2：作用于下次会话实例（取代原版改 CurrentSession 属性再 Put 的 hack）
-        let path = self.find_volume_path(false, drive_letter)?;
+        // R2：作用于下次会话实例；未曾保护过的卷先按当前会话 GUID 自动创建下次会话实例
+        let path = self.ensure_next_volume_path(drive_letter)?;
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(&path, "Protect", ())?;
         Self::ensure_ok("Protect", out)
     }
 
     fn unprotect_volume(&mut self, drive_letter: &str) -> Result<()> {
-        let path = self.find_volume_path(false, drive_letter)?;
+        let path = self.ensure_next_volume_path(drive_letter)?;
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(&path, "Unprotect", ())?;
         Self::ensure_ok("Unprotect", out)
     }
@@ -373,19 +468,19 @@ impl UwfBackend for WindowsWmiBackend {
                     Ok(out) => {
                         self.warnings.push(format!(
                             "卷 {} 读取排除项失败: ReturnValue=0x{:08X}",
-                            volume.DriveLetter, out.ReturnValue
+                            volume.drive_letter, out.ReturnValue
                         ));
                         continue;
                     }
                     Err(e) => {
                         self.warnings
-                            .push(format!("卷 {} 读取排除项失败: {e}", volume.DriveLetter));
+                            .push(format!("卷 {} 读取排除项失败: {e}", volume.drive_letter));
                         continue;
                     }
                 };
             for file in out.ExcludedFiles.unwrap_or_default() {
                 items.push(FileExclusion::new(
-                    volume.DriveLetter.clone(),
+                    volume.drive_letter.clone(),
                     file.FileName,
                 ));
             }
@@ -399,8 +494,8 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn add_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R4：作用于下次会话实例
-        let path = self.find_volume_path(false, drive_letter)?;
+        // R4：作用于下次会话实例；若卷尚未注册下次会话则先自动创建
+        let path = self.ensure_next_volume_path(drive_letter)?;
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "AddExclusion",
