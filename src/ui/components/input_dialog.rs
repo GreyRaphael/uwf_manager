@@ -1,14 +1,14 @@
 //! 通用单行输入弹窗。
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::ui::theme;
 
-use super::centered_rect;
+use super::{centered_rect, clear_surface, is_left_click};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
@@ -26,6 +26,9 @@ pub struct InputState {
     pub action: InputAction,
     /// 是否支持 [F2] 打开文件选择器（仅 AddFileExclusion）
     pub browse: bool,
+    confirm_btn: Rect,
+    browse_btn: Rect,
+    cancel_btn: Rect,
 }
 
 pub enum InputOutcome {
@@ -50,18 +53,23 @@ impl InputState {
             cursor: 0,
             action,
             browse,
+            confirm_btn: Rect::default(),
+            browse_btn: Rect::default(),
+            cancel_btn: Rect::default(),
+        }
+    }
+
+    fn try_submit(&self) -> InputOutcome {
+        if self.buffer.trim().is_empty() {
+            InputOutcome::Stay
+        } else {
+            InputOutcome::Submit(self.action, self.buffer.trim().to_string())
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> InputOutcome {
         match key.code {
-            KeyCode::Enter => {
-                if self.buffer.trim().is_empty() {
-                    InputOutcome::Stay
-                } else {
-                    InputOutcome::Submit(self.action, self.buffer.trim().to_string())
-                }
-            }
+            KeyCode::Enter => self.try_submit(),
             KeyCode::Esc => InputOutcome::Cancel,
             KeyCode::F(2) if self.browse => InputOutcome::Browse,
             KeyCode::Left => {
@@ -107,6 +115,21 @@ impl InputState {
                 InputOutcome::Stay
             }
             _ => InputOutcome::Stay,
+        }
+    }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> InputOutcome {
+        let Some(pos) = is_left_click(&mouse) else {
+            return InputOutcome::Stay;
+        };
+        if self.confirm_btn.contains(pos) {
+            self.try_submit()
+        } else if self.browse && self.browse_btn.contains(pos) {
+            InputOutcome::Browse
+        } else if self.cancel_btn.contains(pos) {
+            InputOutcome::Cancel
+        } else {
+            InputOutcome::Stay
         }
     }
 }
@@ -156,33 +179,97 @@ fn visible_window(s: &str, cursor_char: usize, max_cols: usize) -> (&str, u16) {
     (slice, cursor_col as u16)
 }
 
-pub fn render(frame: &mut Frame, state: &InputState, area: Rect) {
-    let rect = centered_rect(66, 30, area);
-    let block = Block::bordered().title(format!(" {} ", state.title));
-    frame.render_widget(Clear, rect);
-
-    let keys_hint = if state.browse {
-        "[Enter] 确认    [F2] 浏览…    [Esc] 取消"
-    } else {
-        "[Enter] 确认    [Esc] 取消"
+pub fn render(frame: &mut Frame, state: &mut InputState, area: Rect) {
+    let rect = centered_rect(68, 32, area);
+    let rect = Rect {
+        height: rect.height.max(7).min(area.height),
+        width: rect.width.max(30).min(area.width),
+        ..rect
     };
+    clear_surface(frame, rect);
+    let block = Block::bordered()
+        .title(format!(" {} ", state.title))
+        .title_style(theme::title())
+        .border_style(theme::focus_border(true))
+        .style(theme::surface());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let [hint_area, _, input_area, _, btn_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(state.hint.clone(), theme::dim())).style(theme::surface()),
+        hint_area,
+    );
+
     // 横向滚动：按显示列宽窗口展示，兼容中文宽字符路径。
-    let inner_width = rect.width.saturating_sub(4) as usize; // border 2 + "> " 2
+    let inner_width = input_area.width.saturating_sub(2) as usize;
     let (display, cursor_col) = visible_window(&state.buffer, state.cursor, inner_width);
+    frame.render_widget(
+        Paragraph::new(Line::from(format!("> {display}"))).style(theme::active_row()),
+        input_area,
+    );
 
-    let lines = vec![
-        Line::styled(state.hint.clone(), theme::dim()),
-        Line::from(""),
-        Line::from(format!("> {display}")),
-        Line::from(""),
-        Line::styled(keys_hint, theme::dim()),
+    let confirm_text = " 确认(Enter) ";
+    let browse_text = " 浏览(F2) ";
+    let cancel_text = " 取消(Esc) ";
+    let confirm_w = Line::raw(confirm_text).width() as u16;
+    let browse_w = if state.browse {
+        Line::raw(browse_text).width() as u16
+    } else {
+        0
+    };
+    let cancel_w = Line::raw(cancel_text).width() as u16;
+
+    let mut x = btn_area.x;
+    state.confirm_btn = Rect::new(x, btn_area.y, confirm_w.min(btn_area.width), 1);
+    x += confirm_w + 2;
+    let mut spans = vec![
+        Span::styled(confirm_text, theme::button(true, false, false)),
+        Span::raw("  "),
     ];
-    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    if state.browse {
+        state.browse_btn = Rect::new(
+            x,
+            btn_area.y,
+            browse_w.min(btn_area.right().saturating_sub(x)),
+            1,
+        );
+        x += browse_w + 2;
+        spans.push(Span::styled(
+            browse_text,
+            theme::button(false, false, false),
+        ));
+        spans.push(Span::raw("  "));
+    } else {
+        state.browse_btn = Rect::default();
+    }
+    state.cancel_btn = Rect::new(
+        x,
+        btn_area.y,
+        cancel_w.min(btn_area.right().saturating_sub(x)),
+        1,
+    );
+    spans.push(Span::styled(
+        cancel_text,
+        theme::button(false, false, false),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::surface()),
+        btn_area,
+    );
 
-    // 显示文本光标：border(1) + "> "(2) = rect.x + 3，窄终端下安全钳制避免下溢。
-    let cursor_x = (rect.x + 3 + cursor_col).min(rect.x + rect.width.saturating_sub(2));
-    let cursor_y = (rect.y + 3).min(rect.y + rect.height.saturating_sub(2));
-    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    if input_area.width > 2 && input_area.height > 0 {
+        let cursor_x = (input_area.x + 2 + cursor_col).min(input_area.right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
 }
 
 #[cfg(test)]
@@ -231,7 +318,6 @@ mod tests {
             ("C:\\中文", 7)
         );
 
-        // 移到 "中" 后插入 'X'，再用 Delete 删 "文"
         state.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         state.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
         assert_eq!(state.buffer, "C:\\中X文");
@@ -255,8 +341,8 @@ mod tests {
     fn render_on_tiny_terminal_does_not_underflow() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let state = InputState::new("t", "h", InputAction::AddFileExclusion, false);
+        let mut state = InputState::new("t", "h", InputAction::AddFileExclusion, false);
         let mut terminal = Terminal::new(TestBackend::new(4, 4)).unwrap();
-        terminal.draw(|f| render(f, &state, f.area())).unwrap();
+        terminal.draw(|f| render(f, &mut state, f.area())).unwrap();
     }
 }

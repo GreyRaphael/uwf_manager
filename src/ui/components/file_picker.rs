@@ -6,16 +6,15 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use crate::ui::theme;
 
-use super::centered_rect;
+use super::{centered_rect, clear_surface, is_left_click};
 
 /// 选择模式：File 仅可选文件；Any 文件与目录皆可（Space 选中目录）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +48,11 @@ pub struct FilePickerState {
     /// 可视高度（render 时更新，供 PageUp/PageDown 使用）
     pub page_size: usize,
     pub error: Option<String>,
+    list_area: Rect,
+    enter_btn: Rect,
+    pick_btn: Rect,
+    parent_btn: Rect,
+    cancel_btn: Rect,
     #[cfg(windows)]
     drive_rx: Option<std::sync::mpsc::Receiver<Vec<PickerEntry>>>,
 }
@@ -72,6 +76,11 @@ impl FilePickerState {
             list_state: ListState::default(),
             page_size: 10,
             error: None,
+            list_area: Rect::default(),
+            enter_btn: Rect::default(),
+            pick_btn: Rect::default(),
+            parent_btn: Rect::default(),
+            cancel_btn: Rect::default(),
             #[cfg(windows)]
             drive_rx: None,
         };
@@ -134,7 +143,6 @@ impl FilePickerState {
         let Some(cwd) = &self.cwd else {
             #[cfg(windows)]
             {
-                // 盘符探测放到后台线程，避免网络盘/软驱阻塞 UI。
                 self.start_drive_probe();
                 let _ = self.poll();
             }
@@ -183,11 +191,9 @@ impl FilePickerState {
         let Some(cwd) = &self.cwd else { return };
         match cwd.parent() {
             Some(parent) => {
-                let parent = parent.to_path_buf();
-                self.cwd = Some(parent);
+                self.cwd = Some(parent.to_path_buf());
             }
             None => {
-                // Windows：卷的上一级 = 盘符列表
                 if cfg!(windows) {
                     self.cwd = None;
                 }
@@ -203,6 +209,30 @@ impl FilePickerState {
             }
             (PickerMode::File, true) => None,
         }
+    }
+
+    fn activate_selected(&mut self) -> PickerOutcome {
+        let Some(entry) = self
+            .list_state
+            .selected()
+            .and_then(|i| self.entries.get(i))
+            .cloned()
+        else {
+            return PickerOutcome::Stay;
+        };
+        if entry.is_dir {
+            self.enter(entry.path);
+            PickerOutcome::Stay
+        } else {
+            self.pick(&entry).unwrap_or(PickerOutcome::Stay)
+        }
+    }
+
+    fn pick_selected(&self) -> PickerOutcome {
+        let Some(entry) = self.list_state.selected().and_then(|i| self.entries.get(i)) else {
+            return PickerOutcome::Stay;
+        };
+        self.pick(entry).unwrap_or(PickerOutcome::Stay)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> PickerOutcome {
@@ -241,28 +271,53 @@ impl FilePickerState {
                 self.go_parent();
                 PickerOutcome::Stay
             }
-            KeyCode::Enter => {
-                let Some(entry) = self.list_state.selected().and_then(|i| self.entries.get(i))
-                else {
-                    return PickerOutcome::Stay;
-                };
-                if entry.is_dir {
-                    let path = entry.path.clone();
-                    self.enter(path);
-                    PickerOutcome::Stay
-                } else {
-                    self.pick(entry).unwrap_or(PickerOutcome::Stay)
-                }
-            }
-            KeyCode::Char(' ') => {
-                let Some(entry) = self.list_state.selected().and_then(|i| self.entries.get(i))
-                else {
-                    return PickerOutcome::Stay;
-                };
-                self.pick(entry).unwrap_or(PickerOutcome::Stay)
-            }
+            KeyCode::Enter => self.activate_selected(),
+            KeyCode::Char(' ') => self.pick_selected(),
             _ => PickerOutcome::Stay,
         }
+    }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> PickerOutcome {
+        match mouse.kind {
+            MouseEventKind::ScrollUp if !self.entries.is_empty() => {
+                let cur = self.list_state.selected().unwrap_or(0);
+                self.select(Some(cur.saturating_sub(1)));
+                return PickerOutcome::Stay;
+            }
+            MouseEventKind::ScrollDown if !self.entries.is_empty() => {
+                let cur = self.list_state.selected().unwrap_or(0);
+                self.select(Some((cur + 1).min(self.entries.len() - 1)));
+                return PickerOutcome::Stay;
+            }
+            _ => {}
+        }
+        let Some(pos) = is_left_click(&mouse) else {
+            return PickerOutcome::Stay;
+        };
+        if self.cancel_btn.contains(pos) {
+            return PickerOutcome::Cancel;
+        }
+        if self.parent_btn.contains(pos) {
+            self.go_parent();
+            return PickerOutcome::Stay;
+        }
+        if self.enter_btn.contains(pos) {
+            return self.activate_selected();
+        }
+        if self.mode == PickerMode::Any && self.pick_btn.contains(pos) {
+            return self.pick_selected();
+        }
+        if self.list_area.contains(pos) && !self.entries.is_empty() {
+            let row = (pos.y - self.list_area.y) as usize + self.list_state.offset();
+            if row < self.entries.len() {
+                let already = self.list_state.selected() == Some(row);
+                self.select(Some(row));
+                if already {
+                    return self.activate_selected();
+                }
+            }
+        }
+        PickerOutcome::Stay
     }
 }
 
@@ -289,18 +344,24 @@ fn entry_label(entry: &PickerEntry) -> String {
 }
 
 pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
-    let rect = centered_rect(72, 70, area);
+    let rect = centered_rect(78, 72, area);
+    clear_surface(frame, rect);
     let cwd_label = match &state.cwd {
         Some(cwd) => cwd.display().to_string(),
         None => "盘符列表".to_string(),
     };
-    let block = Block::bordered().title(format!(" 文件选择 - {cwd_label} "));
-    frame.render_widget(Clear, rect);
-
-    let [list_area, hint_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(block.inner(rect));
+    let block = Block::bordered()
+        .title(format!(" 文件选择 - {cwd_label} "))
+        .title_style(theme::title())
+        .border_style(theme::focus_border(true))
+        .style(theme::surface());
+    let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    let [list_area, btn_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
+
+    state.list_area = list_area;
     state.page_size = list_area.height.max(1) as usize;
 
     let items: Vec<ListItem> = if state.entries.is_empty() {
@@ -321,22 +382,69 @@ pub fn render(frame: &mut Frame, state: &mut FilePickerState, area: Rect) {
                 let style = if entry.is_dir {
                     theme::title()
                 } else {
-                    ratatui::style::Style::default()
+                    theme::text()
                 };
                 ListItem::new(Line::from(Span::styled(entry_label(entry), style)))
             })
             .collect()
     };
     let list = List::new(items)
+        .style(theme::surface())
         .highlight_style(theme::selected())
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, list_area, &mut state.list_state);
 
-    let hint = match state.mode {
-        PickerMode::File => "[Enter] 进入/选择  [Backspace] 上级  [Esc] 取消",
-        PickerMode::Any => "[Enter] 进入/选择  [Space] 选中此项  [Backspace] 上级  [Esc] 取消",
-    };
-    frame.render_widget(Paragraph::new(Line::styled(hint, theme::dim())), hint_area);
+    let mut x = btn_area.x;
+    let enter_lbl = " 打开(Enter) ";
+    let pick_lbl = " 选中(Space) ";
+    let parent_lbl = " 上级(Bksp) ";
+    let cancel_lbl = " 取消(Esc) ";
+
+    let enter_w = Line::raw(enter_lbl).width() as u16;
+    let pick_w = Line::raw(pick_lbl).width() as u16;
+    let parent_w = Line::raw(parent_lbl).width() as u16;
+    let cancel_w = Line::raw(cancel_lbl).width() as u16;
+
+    state.enter_btn = Rect::new(x, btn_area.y, enter_w.min(btn_area.width), 1);
+    x += enter_w + 1;
+    let mut spans = vec![
+        Span::styled(enter_lbl, theme::button(true, false, false)),
+        Span::raw(" "),
+    ];
+    if state.mode == PickerMode::Any {
+        state.pick_btn = Rect::new(
+            x,
+            btn_area.y,
+            pick_w.min(btn_area.right().saturating_sub(x)),
+            1,
+        );
+        x += pick_w + 1;
+        spans.push(Span::styled(pick_lbl, theme::button(false, false, false)));
+        spans.push(Span::raw(" "));
+    } else {
+        state.pick_btn = Rect::default();
+    }
+    state.parent_btn = Rect::new(
+        x,
+        btn_area.y,
+        parent_w.min(btn_area.right().saturating_sub(x)),
+        1,
+    );
+    x += parent_w + 1;
+    spans.push(Span::styled(parent_lbl, theme::button(false, false, false)));
+    spans.push(Span::raw(" "));
+    state.cancel_btn = Rect::new(
+        x,
+        btn_area.y,
+        cancel_w.min(btn_area.right().saturating_sub(x)),
+        1,
+    );
+    spans.push(Span::styled(cancel_lbl, theme::button(false, false, false)));
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::surface()),
+        btn_area,
+    );
 }
 
 #[cfg(test)]
@@ -378,8 +486,6 @@ mod tests {
     fn directory_label_has_exactly_one_separator() {
         let separator = std::path::MAIN_SEPARATOR;
         let expected = format!("C:{separator}");
-        // 同时覆盖普通目录名和带尾部分隔符的盘符形态（当前 list_drives 已 trim，
-        // 第二种是防御性覆盖）。
         for name in ["C:".to_string(), expected.clone()] {
             let entry = PickerEntry {
                 name,

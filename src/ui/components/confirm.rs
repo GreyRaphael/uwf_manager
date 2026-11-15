@@ -1,16 +1,16 @@
-//! 危险操作确认弹窗（重置/重启/关机/删除提交）。
+//! 危险操作确认弹窗（重置/重启/关机/删除提交/退出确认）。
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
-use ratatui::layout::Alignment;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::ui::theme;
 
-use super::centered_rect;
+use super::{centered_rect, clear_surface, is_left_click};
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
@@ -27,6 +27,8 @@ pub struct ConfirmState {
     pub title: String,
     pub message: String,
     pub action: ConfirmAction,
+    confirm_btn: Rect,
+    cancel_btn: Rect,
 }
 
 pub enum ConfirmOutcome {
@@ -45,6 +47,8 @@ impl ConfirmState {
             title: title.into(),
             message: message.into(),
             action,
+            confirm_btn: Rect::default(),
+            cancel_btn: Rect::default(),
         }
     }
 
@@ -57,14 +61,40 @@ impl ConfirmState {
             _ => ConfirmOutcome::Stay,
         }
     }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> ConfirmOutcome {
+        let Some(pos) = is_left_click(&mouse) else {
+            return ConfirmOutcome::Stay;
+        };
+        if self.confirm_btn.contains(pos) {
+            ConfirmOutcome::Confirm(self.action.clone())
+        } else if self.cancel_btn.contains(pos) {
+            ConfirmOutcome::Cancel
+        } else {
+            ConfirmOutcome::Stay
+        }
+    }
 }
 
-pub fn render(frame: &mut Frame, state: &ConfirmState, area: ratatui::layout::Rect) {
+pub fn render(frame: &mut Frame, state: &mut ConfirmState, area: Rect) {
     let rect = centered_rect(64, 42, area);
+    let rect = Rect {
+        height: rect.height.max(8).min(area.height),
+        width: rect.width.max(30).min(area.width),
+        ..rect
+    };
+    clear_surface(frame, rect);
     let block = Block::bordered()
         .title(format!(" {} ", state.title))
-        .border_style(theme::warn());
-    frame.render_widget(Clear, rect);
+        .title_style(theme::warn())
+        .border_style(theme::warn())
+        .style(theme::surface());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let [msg_area, btn_area] =
+        Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).areas(inner);
+
     let mut lines = vec![Line::from("")];
     lines.extend(
         state
@@ -72,13 +102,38 @@ pub fn render(frame: &mut Frame, state: &ConfirmState, area: ratatui::layout::Re
             .lines()
             .map(|line| Line::from(line.to_string())),
     );
-    lines.push(Line::from(""));
-    lines.push(Line::styled("[Enter] 确认    [Esc / N] 取消", theme::dim()));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block)
             .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        rect,
+            .wrap(Wrap { trim: false })
+            .style(theme::surface()),
+        msg_area,
+    );
+
+    let confirm_label = " 确认(Enter) ";
+    let cancel_label = " 取消(Esc) ";
+    let c_w = Line::raw(confirm_label).width() as u16;
+    let x_w = Line::raw(cancel_label).width() as u16;
+    let total_w = c_w + 2 + x_w;
+    let start_x = btn_area.x + btn_area.width.saturating_sub(total_w) / 2;
+    state.confirm_btn = Rect::new(start_x, btn_area.y, c_w.min(btn_area.width), 1);
+    let cancel_x = (start_x + c_w + 2).min(btn_area.right());
+    state.cancel_btn = Rect::new(
+        cancel_x,
+        btn_area.y,
+        x_w.min(btn_area.right().saturating_sub(cancel_x)),
+        1,
+    );
+
+    let btns = Line::from(vec![
+        Span::styled(confirm_label, theme::button(true, false, false)),
+        Span::raw("  "),
+        Span::styled(cancel_label, theme::button(false, false, false)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(btns)
+            .alignment(Alignment::Center)
+            .style(theme::surface()),
+        btn_area,
     );
 }

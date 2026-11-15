@@ -21,10 +21,7 @@ def char_width(ch):
 
 
 def run_tui(schedule, duration=8.0, cwd=None):
-    """在 pty 中运行 TUI，返回 (exit_code, 每帧屏幕快照列表)。
-
-    默认在 RUN_DIR 临时目录运行，导出文件不会落到仓库。
-    """
+    """在 pty 中运行 TUI，返回 (exit_code, 每帧屏幕快照列表)。"""
     cwd = cwd or RUN_DIR
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -55,15 +52,13 @@ class VirtualScreen:
     终端会连带清除该宽字符的另一半。"""
 
     def __init__(self):
-        self.grid = {}  # (y, x) -> (ch, width)，宽字符只占左半一格
+        self.grid = {}
         self.cx = self.cy = 0
 
     def put(self, ch):
         w = char_width(ch)
-        # 写入位置是左邻宽字符的右半 → 左邻被连坐清除
         if self.grid.get((self.cy, self.cx - 1), (" ", 1))[1] == 2:
             del self.grid[(self.cy, self.cx - 1)]
-        # 写入位置本身是宽字符左半 → 其右半（可能压着的字符）清除
         if self.grid.get((self.cy, self.cx), (" ", 1))[1] == 2:
             self.grid.pop((self.cy, self.cx + 1), None)
         self.grid[(self.cy, self.cx)] = (ch, w)
@@ -103,26 +98,23 @@ class VirtualScreen:
 
 
 def any_frame(frames, needle):
-    """宽字符在网格中占 2 单元（视觉连续但带空格），比对前去除全部空白。"""
     squashed = needle.replace(" ", "")
     return any(squashed in f.replace(" ", "") for f in frames)
 
 
 def scenario_1():
-    """排除项增删/导入导出/帮助/Overlay 锁定/模拟重启。"""
+    """单屏四区展示 / R1 锁定提示 / 排除项增删与导入导出 / 帮助 / 模拟重启。"""
     sched = [
-        (0.8, b"s"), (1.3, b"\x1b"),                    # Overlay 弹窗查看 R1 锁定
-        (1.6, b"3"),                                     # Tab3 排除项
-        (1.9, b"a"), (2.3, b"C:\\MyTools"), (2.9, b"\r"),  # 输入添加文件排除
-        (3.5, b"x"),                                     # 导出（2 文件 + 1 注册表 = 3 项）
-        (3.9, b"\x1b[H"),                                # Home 选中首项 C:\MyTools
-        (4.1, b"d"),                                     # 删除选中
-        (4.7, b"?"), (5.2, b"\x1b"),                     # 帮助
-        (5.4, b"1"),                                     # 回到仪表盘（F10 仅在此页有效）
-        (5.7, b"\x1b[21~"), (6.2, b"\r"),                # F10 + Enter 模拟重启
-        (7.2, b"q"),
+        (0.7, b"\t\t\t"),                               # Tab×3 到 4.排除列表
+        (1.1, b"a"), (1.5, b"C:\\MyTools"), (2.0, b"\r"),  # 添加文件排除
+        (2.6, b"x"),                                     # 导出（2 文件 + 1 注册表 = 3 项）
+        (3.1, b"\x1b[H"),                                # Home 选中首项 C:\MyTools
+        (3.4, b"d"),                                     # 删除选中
+        (4.0, b"?"), (4.5, b"\x1b"),                     # 帮助弹窗
+        (4.9, b"\x1b[21~"), (5.4, b"\r"),                # F10 + Enter 模拟重启
+        (6.3, b"q"),
     ]
-    code, frames = run_tui(sched)
+    code, frames = run_tui(sched, duration=7.2)
     exported = glob.glob(os.path.join(RUN_DIR, "EXCLUSIONLIST_*.txt"))
     export_ok = False
     if exported:
@@ -131,48 +123,54 @@ def scenario_1():
                         ["C:\\MyTools", "C:\\Windows\\Temp", "HKLM\\SOFTWARE\\UwfManagerDemo"])
         for f in exported: os.remove(f)
     return {
-        "R1 锁定提示(已锁定/仅阈值)": any_frame(frames, "已锁定") and any_frame(frames, "仅阈值可改"),
-        "弹窗预填(2048/1536/1843)": any_frame(frames, "2048") and any_frame(frames, "1843"),
+        "单屏四区同屏展示": (
+            any_frame(frames, "1.基本设置")
+            and any_frame(frames, "2.缓存设置(MB)")
+            and any_frame(frames, "3.保护分区")
+            and any_frame(frames, "4.排除列表")
+        ),
+        "R1 锁定提示": any_frame(frames, "启用时最大缓存已锁定") and any_frame(frames, "[锁]"),
+        "表单预填(2048/1536/1843)": any_frame(frames, "2048") and any_frame(frames, "1843"),
         "添加文件排除反馈": any_frame(frames, "已添加文件排除: C:\\MyTools"),
         "新增项出现在列表": any_frame(frames, "C:\\MyTools"),
         "导出 3 项反馈": any_frame(frames, "已导出 3 项至"),
         "导出文件内容(3项)": export_ok,
         "删除文件排除反馈": any_frame(frames, "已删除文件排除: C:\\MyTools"),
-        "帮助弹窗": any_frame(frames, "快捷键帮助"),
+        "帮助弹窗": any_frame(frames, "操作说明"),
         "模拟重启反馈": any_frame(frames, "（模拟）已重启"),
         "干净退出": code == 0,
     }
 
 
 def scenario_2():
-    """R1 解锁周期 + 卷保护重启生效 + 文件选择器提交 + 删除提交确认。"""
+    """R1 解锁周期 + 覆盖类型与缓存保存 + 卷保护重启生效 + 提交工具菜单。"""
     sched = [
-        (0.8, b"d"),                    # 禁用筛选器（下次生效）
-        (1.4, b"\x1b[21~"), (1.9, b"\r"),  # F10 模拟重启 → current=disabled
-        (2.6, b"s"),                    # Overlay 配置：应已解锁
-        (3.0, b"\x1b[B"),               # Down 到 上限 行
-        (3.2, b"\x7f\x7f\x7f\x7f"),     # 清空 2048
-        (3.5, b"4096"),                 # 输入 4096
-        (3.8, b"\r"),                   # 保存
-        (4.4, b"2"),                    # Tab2 卷保护
-        (4.6, b"\x1b[B"),               # Down 选中 D:
-        (4.8, b"p"),                    # 保护 D:（下次生效）
-        (5.4, b"1"),                    # 回到仪表盘
-        (5.7, b"\x1b[21~"), (6.2, b"\r"),  # 重启 → D: current 受保护
-        (6.9, b"2"),                    # 回到卷保护页验证
-        (7.5, b"4"),                    # Tab4 提交工具
-        (7.8, b"d"),                    # 删除提交 → 文件选择器
+        (0.7, b"\r"),                    # 基本设置 -> 写入过滤: 禁用（下次生效）
+        (1.3, b"\x1b[21~"), (1.8, b"\r"),  # F10 模拟重启 → current=disabled
+        (2.5, b"\x1b[B"), (2.8, b"\r"),  # Down 到覆盖类型 -> 切换为 磁盘(Disk)
+        (3.3, b"\t"),                    # Tab 到 2.缓存设置（默认聚焦警告阈值）
+        (3.6, b"\x1b[A"),                # Up 到 最大缓存
+        (3.9, b"\x7f\x7f\x7f\x7f"),      # 清空 2048
+        (4.2, b"4096"),                  # 输入 4096
+        (4.6, b"\r"),                    # Enter 确认缓存
+        (5.2, b"\t"),                    # Tab 到 3.保护分区
+        (5.5, b"\x1b[B"),                # Down 选中 D:
+        (5.8, b"p"),                     # 保护 D:（下次生效）
+        (6.4, b"\x1b[21~"), (6.9, b"\r"),  # F10 模拟重启 → D: 当前/重启均为 已保护
+        (7.7, b"c"),                     # 打开 提交固化工具 菜单
+        (8.0, b"2"),                     # 选择 [2] 删除并固化文件 -> 文件选择器
         (8.4, b"\x1b"), (8.8, b"q"),
     ]
-    code, frames = run_tui(sched, duration=10.0)
+    code, frames = run_tui(sched, duration=9.8)
     return {
         "禁用筛选器反馈": any_frame(frames, "UWF 将在下次系统重启后禁用"),
-        "Overlay 配置已保存反馈": any_frame(frames, "Overlay 配置已保存"),
+        "覆盖类型切换反馈": any_frame(frames, "覆盖类型已设为 磁盘(Disk)"),
+        "缓存配置已保存反馈": any_frame(frames, "缓存配置已保存"),
         "上限 4096 生效": any_frame(frames, "4096"),
         "保护 D: 反馈": any_frame(frames, "D: 保护成功"),
-        "D: 重启后当前受保护": any_frame(frames, "D: 受保护 受保护"),
+        "D: 重启后当前已保护": any_frame(frames, "D: 已保护 已保护"),
         "模拟重启反馈": any_frame(frames, "（模拟）已重启"),
-        "文件选择器弹窗": any_frame(frames, "文件选择"),
+        "提交菜单与文件选择器": any_frame(frames, "提交固化工具") and any_frame(frames, "文件选择"),
         "干净退出": code == 0,
     }
 

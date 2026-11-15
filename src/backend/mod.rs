@@ -116,8 +116,8 @@ pub enum BackendCmd {
     EnableFilter,
     DisableFilter,
     ResetSettings,
-    SetOverlayConfig {
-        overlay_type: OverlayType,
+    SetOverlayType(OverlayType),
+    SetOverlayCache {
         max_mb: u32,
         warning_mb: u32,
         critical_mb: u32,
@@ -328,20 +328,18 @@ fn handle_mutation(
             |b| b.reset_settings(),
             "UWF 配置将在下次重启后重置为默认值",
         ),
-        BackendCmd::SetOverlayConfig {
-            overlay_type,
-            max_mb,
-            warning_mb,
-            critical_mb,
-        } => set_overlay_config(
+        BackendCmd::SetOverlayType(overlay_type) => mutate(
             id,
             backend,
             emit,
-            overlay_type,
+            |b| b.set_overlay_type(overlay_type),
+            format!("覆盖类型已设为 {}（下次启动生效）", overlay_type.label()),
+        ),
+        BackendCmd::SetOverlayCache {
             max_mb,
             warning_mb,
             critical_mb,
-        ),
+        } => set_overlay_cache(id, backend, emit, max_mb, warning_mb, critical_mb),
         BackendCmd::Protect(drive) => mutate(
             id,
             backend,
@@ -479,35 +477,32 @@ fn send_mutation_err(emit: &dyn Fn(BackendEvent), id: RequestId, err: UwfError) 
     }
 }
 
-/// P1-17：Overlay 配置是多步 WMI 写入；中途失败时前面的步骤已经生效。
+/// P1-17：缓存配置是多步 WMI 写入；中途失败时前面的步骤已经生效。
 /// 失败也必须刷新，并在错误文案中列出“已应用”的步骤。
-fn set_overlay_config(
+fn set_overlay_cache(
     id: RequestId,
     backend: &mut dyn UwfBackend,
     emit: &dyn Fn(BackendEvent),
-    overlay_type: OverlayType,
     max_mb: u32,
     warning_mb: u32,
     critical_mb: u32,
 ) {
     let mut applied: Vec<&'static str> = Vec::new();
     let result = (|| -> Result<String> {
-        // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定其余两项）
+        // R1 双保险：当前启用时仅应用阈值（UI 侧已锁定最大缓存）
         let locked = backend.get_filter_state()?.current_enabled;
         if !locked {
-            backend.set_overlay_type(overlay_type)?;
-            applied.push("类型");
             backend.set_overlay_max_size(max_mb)?;
-            applied.push("上限");
+            applied.push("最大缓存");
         }
         backend.set_warning_threshold(warning_mb)?;
-        applied.push("预警阈值");
+        applied.push("警告阈值");
         backend.set_critical_threshold(critical_mb)?;
-        applied.push("临界阈值");
+        applied.push("严重阈值");
         Ok(if locked {
-            "Overlay 阈值已保存（类型/上限已锁定）".to_string()
+            "缓存阈值已保存（最大缓存已锁定）".to_string()
         } else {
-            "Overlay 配置已保存（下次启动生效）".to_string()
+            "缓存配置已保存（下次启动生效）".to_string()
         })
     })();
 
@@ -1222,5 +1217,55 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_overlay_type_and_cache_respect_r1_lock() {
+        let mut backend = MockUwfBackend::demo(); // current_enabled = true
+        let (tx, rx) = test_sink();
+        let emit = |e| {
+            let _ = tx.send(e);
+        };
+
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 1,
+                cmd: BackendCmd::SetOverlayType(OverlayType::Disk),
+            },
+            &emit,
+        );
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Err(msg)] if msg.contains("不可修改")
+        ));
+
+        // 当前启用时仅保存阈值，最大缓存保持 2048
+        let (tx, rx) = test_sink();
+        let emit = |e| {
+            let _ = tx.send(e);
+        };
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 2,
+                cmd: BackendCmd::SetOverlayCache {
+                    max_mb: 9999,
+                    warning_mb: 1200,
+                    critical_mb: 1600,
+                },
+            },
+            &emit,
+        );
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Ok(msg)] if msg.contains("已锁定")
+        ));
+        assert_eq!(backend.get_overlay_config(false).unwrap().max_size_mb, 2048);
+        let rt = backend.get_overlay_runtime().unwrap();
+        assert_eq!(
+            (rt.warning_threshold_mb, rt.critical_threshold_mb),
+            (1200, 1600)
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Ratatui 界面层：布局主框架与各视图。
+//! Ratatui 界面层：简洁明亮的单屏四区布局与模态渲染。
 
 pub mod components;
 pub mod text;
@@ -6,53 +6,78 @@ mod theme;
 mod views;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Phase, Tab};
+use crate::app::{App, Phase, UiRegions};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let outer = Block::bordered()
-        .title(text::app_title())
-        .title_alignment(ratatui::layout::Alignment::Left)
-        .style(Style::default().fg(Color::White));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+    app.regions = UiRegions::default();
 
-    let [tabs_area, body_area, log_area, hotkey_area] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(6),
+    // 铺设统一明亮浅色底板
+    frame.render_widget(Block::default().style(theme::canvas()), area);
+
+    let [header_area, body_area, notice_area, log_area, hotkey_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(8),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(inner);
+    .areas(area);
 
-    // D6：UWF 未安装时以引导页取代正常视图（[F5] 重新检测，检测到后自动恢复）
+    views::render_header(frame, app, header_area);
+
     if app.phase == Phase::NotInstalled {
-        views::not_installed::render(frame, tabs_area, body_area);
+        views::not_installed::render(frame, app, body_area);
+        render_log(frame, app, log_area);
         render_hotkeys(frame, hotkey_area, true);
     } else {
-        views::render_tabs(frame, app, tabs_area);
-        match app.tab {
-            Tab::Dashboard => views::dashboard::render(frame, app, body_area),
-            Tab::Volumes => views::volumes::render(frame, app, body_area),
-            Tab::Exclusions => views::exclusions::render(frame, app, body_area),
-            Tab::Commit => views::commit::render(frame, body_area),
+        let [col_left, col_mid, col_right] = if body_area.width >= 96 {
+            Layout::horizontal([
+                Constraint::Length(28),
+                Constraint::Length(28),
+                Constraint::Min(36),
+            ])
+        } else {
+            Layout::horizontal([
+                Constraint::Length(24),
+                Constraint::Length(24),
+                Constraint::Min(28),
+            ])
         }
+        .spacing(1)
+        .areas(body_area);
+
+        views::settings::render(frame, app, col_left);
+        views::volumes::render(frame, app, col_mid);
+        views::exclusions::render(frame, app, col_right);
+
+        render_notice(frame, notice_area);
+        render_log(frame, app, log_area);
         render_hotkeys(frame, hotkey_area, false);
     }
-    render_log(frame, app, log_area);
 
-    // 模态浮层最后渲染（置于所有视图之上）
     if let Some(modal) = &mut app.modal {
         components::render_modal(frame, modal, area);
     }
 }
 
-/// 底部操作日志（最近一条）
-fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn render_notice(frame: &mut Frame, area: Rect) {
+    let msg = if area.width < 98 {
+        text::NOTICE_BAR_SHORT
+    } else {
+        text::NOTICE_BAR
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {msg}"), theme::warn())).style(theme::canvas()),
+        area,
+    );
+}
+
+fn render_log(frame: &mut Frame, app: &App, area: Rect) {
     let line = match app.last_log.as_ref() {
         Some(entry) => {
             let (label, style) = match entry.level {
@@ -60,44 +85,43 @@ fn render_log(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 crate::app::LogLevel::Warn => ("警告", theme::warn()),
                 crate::app::LogLevel::Err => ("失败", theme::err()),
             };
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(format!("{} [{label}] ", entry.time), style),
-                ratatui::text::Span::raw(&entry.text),
+            Line::from(vec![
+                Span::styled(format!(" {} [{label}] ", entry.time), style),
+                Span::styled(&entry.text, theme::text()),
             ])
         }
-        None => ratatui::text::Line::from(ratatui::text::Span::styled(text::READY, theme::dim())),
+        None => Line::from(Span::styled(format!(" {}", text::READY), theme::dim())),
     };
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(line).style(theme::canvas()), area);
 }
 
-/// 底部全局快捷键栏（未安装页使用独立提示，避免误导）
-fn render_hotkeys(frame: &mut Frame, area: ratatui::layout::Rect, not_installed: bool) {
+fn render_hotkeys(frame: &mut Frame, area: Rect, not_installed: bool) {
     let bar = if not_installed {
         text::NI_HOTKEY_BAR
+    } else if area.width < 88 {
+        text::HOTKEY_BAR_SHORT
     } else {
         text::HOTKEY_BAR
     };
-    frame.render_widget(Paragraph::new(bar).style(theme::dim()), area);
+    frame.render_widget(
+        Paragraph::new(format!(" {bar}")).style(theme::header().fg(theme::FG_MUTED)),
+        area,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::demo_snapshot;
-    use crate::app::{App, Modal, Phase, Tab};
-    use crate::backend::BackendKind;
+    use crate::app::tests::{demo_snapshot, ready_app};
+    use crate::app::{FocusPanel, Modal, Phase};
+    use crate::backend::{BackendCmd, BackendCommand, BackendKind};
+    use crate::model::{OverlayConfig, OverlayRuntime, OverlayType};
     use crate::ui::components::confirm::{ConfirmAction, ConfirmState};
-    use crate::ui::components::overlay_settings::OverlaySettingsState;
+    use crate::ui::components::help::HelpState;
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn test_app() -> App {
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (_, ui_rx) = std::sync::mpsc::channel();
-        App::new(cmd_tx, ui_rx, BackendKind::Mock)
-    }
-
-    /// 渲染整个界面到字符串（逐行拼接 TestBackend 缓冲）
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -111,71 +135,58 @@ mod tests {
             }
             out.push('\n');
         }
-        // CJK 宽字符占两格、后一格符号为空格：去除全部空白再做包含断言
         out.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     #[test]
-    fn dashboard_renders_snapshot() {
-        let mut app = test_app();
-        app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
+    fn single_screen_renders_all_four_panels_at_100x30() {
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
         let screen = render_to_string(&mut app, 100, 30);
-        assert!(screen.contains("[1]状态概览"), "缺少 Tab 标签:\n{screen}");
-        assert!(screen.contains("Mock演示数据"), "缺少后端徽标:\n{screen}");
-        assert!(screen.contains("当前状态"), "缺少筛选器状态:\n{screen}");
-        assert!(screen.contains("2048MB"), "缺少 Overlay 上限:\n{screen}");
+        assert!(screen.contains("1.基本设置"), "{screen}");
+        assert!(screen.contains("2.缓存设置(MB)"), "{screen}");
+        assert!(screen.contains("3.保护分区"), "{screen}");
+        assert!(screen.contains("4.排除列表"), "{screen}");
+        assert!(screen.contains("[Mock演示]"), "{screen}");
+        assert!(screen.contains("C:\\Windows\\Temp"), "{screen}");
         assert!(
-            screen.contains("已用:512MB/2048MB"),
-            "缺少 Gauge 文案:\n{screen}"
+            screen.contains("HKLM\\SOFTWARE\\UwfManagerDemo"),
+            "{screen}"
         );
-        assert!(screen.contains("C:"), "缺少卷摘要:\n{screen}");
+        assert!(screen.contains("已用:512/2048MB"), "{screen}");
+        assert!(screen.contains("25%"), "{screen}");
     }
 
     #[test]
-    fn not_installed_guide_page_replaces_tabs() {
-        let mut app = test_app();
+    fn single_screen_fits_cleanly_at_80x24() {
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(screen.contains("1.基本设置"), "{screen}");
+        assert!(screen.contains("2.缓存设置(MB)"), "{screen}");
+        assert!(screen.contains("3.保护分区"), "{screen}");
+        assert!(screen.contains("4.排除列表"), "{screen}");
+        assert!(screen.contains("确认缓存"), "{screen}");
+        assert!(screen.contains("保护(P)"), "{screen}");
+        assert!(screen.contains("重启"), "{screen}");
+        assert!(screen.contains("关机"), "{screen}");
+    }
+
+    #[test]
+    fn not_installed_guide_page_replaces_panels() {
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let (_, ui_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(cmd_tx, ui_rx, BackendKind::Mock);
         app.phase = Phase::NotInstalled;
         let screen = render_to_string(&mut app, 100, 30);
-        // D6 引导页：启用命令完整可见
-        assert!(
-            screen.contains("UWF功能未安装"),
-            "缺少引导页标题:\n{screen}"
-        );
-        assert!(
-            screen.contains("Enable-WindowsOptionalFeature"),
-            "缺少启用命令:\n{screen}"
-        );
-        assert!(
-            screen.contains("Client-UnifiedWriteFilter"),
-            "缺少功能名:\n{screen}"
-        );
-        // 正常 Tab 视图被取代
-        assert!(
-            !screen.contains("[2]卷保护管理"),
-            "引导页不应渲染 Tab 栏:\n{screen}"
-        );
+        assert!(screen.contains("UWF功能未安装"), "{screen}");
+        assert!(screen.contains("Enable-WindowsOptionalFeature"), "{screen}");
+        assert!(screen.contains("Client-UnifiedWriteFilter"), "{screen}");
+        assert!(!screen.contains("3.保护分区"), "{screen}");
     }
 
     #[test]
-    fn overlay_settings_modal_shows_r1_lock_hint() {
-        let mut app = test_app();
-        app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
-        app.modal = Some(Modal::OverlaySettings(OverlaySettingsState::from_snapshot(
-            &app.snapshot,
-        )));
-        let screen = render_to_string(&mut app, 100, 30);
-        assert!(screen.contains("Overlay配置"), "缺少弹窗标题:\n{screen}");
-        assert!(screen.contains("（已锁定）"), "缺少 R1 锁定标记:\n{screen}");
-        assert!(screen.contains("仅阈值可改"), "缺少 R1 提示:\n{screen}");
-    }
-    #[test]
     fn gauge_uses_current_session_max() {
-        use crate::model::{OverlayConfig, OverlayRuntime, OverlayType};
-        let mut app = test_app();
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
         app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
         app.snapshot.overlay_config_current = Some(OverlayConfig {
             overlay_type: OverlayType::Ram,
             max_size_mb: 2048,
@@ -191,35 +202,25 @@ mod tests {
             critical_threshold_mb: 1843,
         });
         let screen = render_to_string(&mut app, 100, 30);
-        assert!(
-            screen.contains("已用:512MB/2048MB"),
-            "Gauge 应使用 current 上限:\n{screen}"
-        );
-        assert!(screen.contains("25%"), "百分比应为 25%:\n{screen}");
-        assert!(
-            !screen.contains("已用:512MB/4096MB"),
-            "不应使用 next 上限:\n{screen}"
-        );
+        assert!(screen.contains("已用:512/2048MB"), "{screen}");
+        assert!(screen.contains("25%"), "{screen}");
+        assert!(!screen.contains("已用:512/4096MB"), "{screen}");
     }
+
     #[test]
     fn initial_load_failure_shows_retry_hint() {
-        let mut app = test_app();
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let (_, ui_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(cmd_tx, ui_rx, BackendKind::Mock);
         app.phase = Phase::LoadFailed;
         let screen = render_to_string(&mut app, 100, 30);
-        assert!(
-            screen.contains("加载失败，按[F5]重试"),
-            "加载失败应提示重新检测:\n{screen}"
-        );
-        assert!(
-            !screen.contains("加载中…"),
-            "失败态不应再显示加载中:\n{screen}"
-        );
+        assert!(screen.contains("加载失败，按[F5]重试"), "{screen}");
+        assert!(!screen.contains("加载中…"), "{screen}");
     }
 
     #[test]
     fn confirm_wraps_multiline_long_path_at_80x24() {
-        let mut app = test_app();
-        app.phase = Phase::Ready;
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
         let long_path =
             r"C:\Users\Administrator\AppData\Local\Temp\very_long_folder_name\target_subfile.log";
         app.modal = Some(Modal::Confirm(ConfirmState::new(
@@ -230,78 +231,69 @@ mod tests {
         let screen = render_to_string(&mut app, 80, 24);
         assert!(screen.contains("确认从卷中删除并固化？"), "{screen}");
         assert!(screen.contains("target_subfile.log"), "{screen}");
-        assert!(screen.contains("[Enter]确认"), "{screen}");
-    }
-
-    #[test]
-    fn volumes_and_exclusions_show_loading_and_failed_placeholders_at_80x24() {
-        let mut app = test_app();
-        for tab in [Tab::Volumes, Tab::Exclusions] {
-            app.tab = tab;
-            app.phase = Phase::Loading;
-            let loading = render_to_string(&mut app, 80, 24);
-            assert!(loading.contains("加载中…"), "{loading}");
-
-            app.phase = Phase::LoadFailed;
-            let failed = render_to_string(&mut app, 80, 24);
-            assert!(failed.contains("加载失败，按[F5]重试"), "{failed}");
-        }
-    }
-
-    #[test]
-    fn dashboard_and_hotkey_bar_fit_at_80x24() {
-        let mut app = test_app();
-        app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
-        let screen = render_to_string(&mut app, 80, 24);
-        assert!(screen.contains("预警:1536MB"), "{screen}");
-        assert!(screen.contains("临界:1843MB"), "{screen}");
-        assert!(screen.contains("[?]帮助"), "{screen}");
-        assert!(screen.contains("[Q]退出"), "{screen}");
-    }
-
-    #[test]
-    fn exclusions_tab_layout_fits_at_80x24() {
-        let mut app = test_app();
-        app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
-        app.tab = Tab::Exclusions;
-        let screen = render_to_string(&mut app, 80, 24);
-        assert!(screen.contains("[文件排除]下次生效"), "{screen}");
-        assert!(screen.contains("[注册表排除]"), "{screen}");
-        assert!(screen.contains("[A]添加文件"), "{screen}");
-        assert!(screen.contains("[S]切换视图"), "{screen}");
+        assert!(screen.contains("确认(Enter)"), "{screen}");
     }
 
     #[test]
     fn help_modal_shows_all_sections_at_80x24() {
-        let mut app = test_app();
-        app.phase = Phase::Ready;
-        app.modal = Some(Modal::Help);
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
+        app.modal = Some(Modal::Help(HelpState::default()));
         let screen = render_to_string(&mut app, 80, 24);
-        assert!(screen.contains("全局"), "{screen}");
-        assert!(screen.contains("提交工具"), "{screen}");
-        assert!(
-            screen.contains("弹窗通用:[Enter]确认[Esc]取消/关闭"),
-            "{screen}"
-        );
+        assert!(screen.contains("1.基本设置"), "{screen}");
+        assert!(screen.contains("2.缓存设置"), "{screen}");
+        assert!(screen.contains("3.保护分区"), "{screen}");
+        assert!(screen.contains("4.排除列表"), "{screen}");
     }
 
     #[test]
-    fn overlay_settings_hides_type_switch_hint_when_locked() {
-        let mut app = test_app();
-        app.snapshot = demo_snapshot();
-        app.phase = Phase::Ready;
-        let mut state = OverlaySettingsState::from_snapshot(&app.snapshot);
-        state.lock_type_size = true;
-        app.modal = Some(Modal::OverlaySettings(state));
-        let locked_screen = render_to_string(&mut app, 80, 24);
-        assert!(!locked_screen.contains("切换类型"), "{locked_screen}");
+    fn mouse_click_focuses_panels_and_triggers_buttons() {
+        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+        let _ = render_to_string(&mut app, 100, 30);
 
-        let mut unlocked_state = OverlaySettingsState::from_snapshot(&app.snapshot);
-        unlocked_state.lock_type_size = false;
-        app.modal = Some(Modal::OverlaySettings(unlocked_state));
-        let unlocked_screen = render_to_string(&mut app, 80, 24);
-        assert!(unlocked_screen.contains("切换类型"), "{unlocked_screen}");
+        let click = |app: &mut App, pick: fn(&crate::app::UiRegions) -> Rect| {
+            let rect = pick(&app.regions);
+            assert!(rect.width > 0 && rect.height > 0);
+            app.handle_ui_event(crate::app::UiEvent::Terminal(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })));
+        };
+
+        // 点击 [保护(P)] 按钮保护选中的 C:
+        click(&mut app, |r| r.protect_btn);
+        assert_eq!(app.focus, FocusPanel::Volumes);
+        match cmd_rx.try_recv().unwrap() {
+            BackendCommand::Mutate {
+                id,
+                cmd: BackendCmd::Protect(drive),
+            } => {
+                assert_eq!(drive, "C:");
+                app.handle_ui_event(crate::app::UiEvent::Backend(
+                    crate::backend::BackendEvent::Finished {
+                        id,
+                        outcome: crate::backend::Outcome::Ok("ok".into()),
+                    },
+                ));
+            }
+            other => panic!("期望 Protect，实际 {other:?}"),
+        }
+
+        // 点击 [切换视图] 按钮切换为只读当前视图
+        click(&mut app, |r| r.excl_view_btn);
+        assert_eq!(app.focus, FocusPanel::Exclusions);
+        assert!(app.exclusion_session_current);
+
+        // 点击 [C]提交 打开提交菜单弹窗，再点取消
+        click(&mut app, |r| r.commit_btn);
+        assert!(matches!(app.modal, Some(Modal::CommitMenu(_))));
+        let _ = render_to_string(&mut app, 100, 30);
+    }
+
+    #[test]
+    fn tiny_terminal_renders_without_panic() {
+        let (mut app, _rx) = ready_app(BackendKind::Mock);
+        let _ = render_to_string(&mut app, 20, 10);
     }
 }
