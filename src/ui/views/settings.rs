@@ -1,316 +1,273 @@
-//! 左栏：1. 基本设置 + 2. 缓存设置(MB) 与实时用量监测。
+//! 左侧控制与监控栏：筛选器总开关 + 写入缓存 (Overlay) 监控与配置。
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, Paragraph};
+use eframe::egui::{
+    self, Align, CornerRadius, FontId, Layout, Margin, ProgressBar, RichText, Stroke,
+};
 
-use crate::app::{App, BasicField, CacheField, FocusPanel, NumericField, is_overlay_locked};
-use crate::model::UsageLevel;
+use crate::app::{UwfApp, is_overlay_locked};
+use crate::model::OverlayType;
 use crate::ui::{text, theme};
 
-pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [basic_area, cache_area] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(8)]).areas(area);
-
-    render_basic(frame, app, basic_area);
-    render_cache(frame, app, cache_area);
+pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
+    render_filter_card(ui, app);
+    ui.add_space(12.0);
+    render_overlay_card(ui, app);
 }
 
-fn render_basic(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == FocusPanel::BasicSettings;
-    app.regions.panel_basic = area;
-    let block = Block::bordered()
-        .title(" 1.基本设置 ")
-        .title_style(theme::focus_title(focused))
-        .border_style(theme::focus_border(focused))
-        .style(theme::surface());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
+    theme::card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        theme::card_header(ui, "筛选器控制", Some("系统写入保护总开关"));
+        ui.add_space(8.0);
 
-    if super::render_load_placeholder(frame, app, inner) {
-        return;
-    }
+        let Some(fs) = app.snapshot.filter_state else {
+            ui.label(
+                RichText::new("尚未获取筛选器状态")
+                    .font(FontId::proportional(12.5))
+                    .color(theme::TEXT_MUTED),
+            );
+            return;
+        };
 
-    let Some(fs) = app.snapshot.filter_state else {
-        return;
-    };
-    let locked = fs.current_enabled;
-    let overlay_type = app
-        .snapshot
-        .overlay_config_next
-        .map(|c| c.overlay_type.label())
-        .unwrap_or("-");
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("当前会话")
+                    .font(FontId::proportional(12.5))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if fs.current_enabled {
+                    theme::status_pill(ui, "● 已启用", theme::OK_FG, theme::OK_BG);
+                } else {
+                    theme::status_pill(ui, "○ 已禁用", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                }
+            });
+        });
 
-    let [row0, row1] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("重启后状态")
+                    .font(FontId::proportional(12.5))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pending_change = fs.current_enabled != fs.next_enabled;
+                if pending_change {
+                    let label = if fs.next_enabled {
+                        "将启用 (待重启)"
+                    } else {
+                        "将禁用 (待重启)"
+                    };
+                    theme::status_pill(ui, label, theme::WARN_FG, theme::WARN_BG);
+                } else if fs.next_enabled {
+                    theme::status_pill(ui, "已启用", theme::OK_FG, theme::OK_BG);
+                } else {
+                    theme::status_pill(ui, "已禁用", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                }
+            });
+        });
 
-    let wf_selected = focused && app.basic_field == BasicField::WriteFilter;
-    let wf_btn = format!(" {} ⇄ ", text::toggle_zh(fs.next_enabled));
-    let wf_style = if wf_selected {
-        theme::button(true, false, false)
-    } else if fs.next_enabled {
-        theme::button(false, false, false).fg(theme::STATUS_OK)
-    } else {
-        theme::button(false, false, false)
-    };
-    let label_w = 10u16.min(row0.width);
-    app.regions.filter_toggle = Rect::new(
-        row0.x + label_w,
-        row0.y,
-        row0.width.saturating_sub(label_w),
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" 写入过滤:", theme::text()),
-            Span::styled(wf_btn, wf_style),
-        ]))
-        .style(theme::surface()),
-        row0,
-    );
+        ui.add_space(10.0);
+        let busy = app.is_busy();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                let clicked = if fs.next_enabled {
+                    theme::secondary_button(ui, "停用筛选器").clicked()
+                } else {
+                    theme::primary_button(ui, "启用筛选器").clicked()
+                };
+                if clicked {
+                    app.toggle_write_filter();
+                }
 
-    let ot_selected = focused && app.basic_field == BasicField::OverlayType;
-    let compact = row1.width < 24;
-    let ot_text = if compact {
-        match app.snapshot.overlay_config_next.map(|c| c.overlay_type) {
-            Some(crate::model::OverlayType::Ram) => "内存",
-            Some(crate::model::OverlayType::Disk) => "磁盘",
-            None => "-",
-        }
-    } else {
-        overlay_type
-    };
-    let lock_mark = if locked { "[锁]" } else { "⇄" };
-    let ot_btn = format!(" {ot_text} {lock_mark} ");
-    let ot_style = theme::button(ot_selected, false, locked);
-    app.regions.overlay_type_toggle = Rect::new(
-        row1.x + label_w,
-        row1.y,
-        row1.width.saturating_sub(label_w),
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" 覆盖类型:", theme::text()),
-            Span::styled(ot_btn, ot_style),
-        ]))
-        .style(theme::surface()),
-        row1,
-    );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::danger_button(ui, "重置配置").clicked() {
+                        app.open_reset_confirm();
+                    }
+                });
+            });
+        });
+    });
 }
 
-fn render_cache(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == FocusPanel::CacheSettings;
-    app.regions.panel_cache = area;
+fn render_overlay_card(ui: &mut egui::Ui, app: &mut UwfApp) {
+    theme::card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let subtitle = if app.cache.dirty {
+            Some("* 有未保存改动")
+        } else {
+            Some("实时缓存监控与上限配额")
+        };
+        theme::card_header(ui, "写入缓存 (Overlay)", subtitle);
+        ui.add_space(8.0);
 
-    let mut title_spans = vec![Span::styled(" 2.缓存设置(MB)", theme::focus_title(focused))];
-    if app.cache.dirty {
-        title_spans.push(Span::styled("*未保存", theme::warn()));
-    }
-    title_spans.push(Span::raw(" "));
+        render_usage_section(ui, app);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        render_overlay_config_section(ui, app);
+    });
+}
 
-    let block = Block::bordered()
-        .title(Line::from(title_spans))
-        .border_style(theme::focus_border(focused))
-        .style(theme::surface());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if super::render_load_placeholder(frame, app, inner) {
-        return;
-    }
-
-    let [
-        r_max,
-        r_warn,
-        r_crit,
-        r_msg,
-        r_btn,
-        _gap,
-        r_usage_txt,
-        r_gauge,
-        r_avail,
-    ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .areas(inner);
-
-    let locked = is_overlay_locked(&app.snapshot);
-
-    let max_cursor = render_numeric_row(
-        frame,
-        r_max,
-        " 最大缓存:",
-        &app.cache.max_size,
-        focused && app.cache.field == CacheField::MaxSize && !locked,
-        locked,
-        &mut app.regions.max_size_input,
-    );
-    let warn_cursor = render_numeric_row(
-        frame,
-        r_warn,
-        " 警告阈值:",
-        &app.cache.warning,
-        focused && app.cache.field == CacheField::WarningThreshold,
-        false,
-        &mut app.regions.warning_input,
-    );
-    let crit_cursor = render_numeric_row(
-        frame,
-        r_crit,
-        " 严重阈值:",
-        &app.cache.critical,
-        focused && app.cache.field == CacheField::CriticalThreshold,
-        false,
-        &mut app.regions.critical_input,
-    );
-
-    if let Some(err) = &app.cache.error {
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {err}"), theme::err())).style(theme::surface()),
-            r_msg,
-        );
-    } else if locked {
-        frame.render_widget(
-            Paragraph::new(Line::styled(" 启用时最大缓存已锁定", theme::dim()))
-                .style(theme::surface()),
-            r_msg,
-        );
-    }
-
-    // [ 确认缓存 ] 按钮
-    let btn_label = " 确认缓存 ";
-    let btn_w = (Line::raw(btn_label).width() as u16).min(r_btn.width);
-    let btn_x = r_btn.x + r_btn.width.saturating_sub(btn_w) / 2;
-    app.regions.cache_confirm_btn = Rect::new(btn_x, r_btn.y, btn_w, 1);
-    let btn_focused = focused && app.cache.field == CacheField::ConfirmButton;
-    frame.render_widget(
-        Paragraph::new(btn_label).style(theme::button(btn_focused, false, false)),
-        app.regions.cache_confirm_btn,
-    );
-
-    // 实时用量条（R7：consumption / current.max_size_mb）
+fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
     if let (Some(current), Some(runtime)) = (
         app.snapshot.overlay_config_current,
         app.snapshot.overlay_runtime,
     ) {
         let max_size = current.max_size_mb.max(1);
         let percent = runtime.usage_percent(max_size);
+        let ratio = (percent as f32) / 100.0;
         let level = runtime.usage_level();
-
-        frame.render_widget(
-            Paragraph::new(format!(
-                " 已用: {} / {} MB",
-                runtime.consumption_mb, max_size
-            ))
-            .style(theme::surface().fg(theme::FG_MUTED)),
-            r_usage_txt,
-        );
-        let [_, gauge_inner, _] = Layout::horizontal([
-            Constraint::Length(1),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
-        .areas(r_gauge);
-        let gauge = Gauge::default()
-            .gauge_style(theme::gauge(level))
-            .percent(percent)
-            .label(format!("{percent}%"));
-        frame.render_widget(gauge, gauge_inner);
-
-        let (health, h_style) = match level {
-            UsageLevel::Normal => ("● 健康", theme::ok()),
-            UsageLevel::Warning => ("● 预警", theme::warn()),
-            UsageLevel::Critical => ("● 临界", theme::err()),
+        let (fg, bar_color, status_text) = theme::usage_colors(level);
+        let bg = match level {
+            crate::model::UsageLevel::Normal => theme::OK_BG,
+            crate::model::UsageLevel::Warning => theme::WARN_BG,
+            crate::model::UsageLevel::Critical => theme::ERR_BG,
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" 剩余: {} MB ", runtime.available_space_mb),
-                    theme::dim(),
-                ),
-                Span::styled(health, h_style),
-            ]))
-            .style(theme::surface()),
-            r_avail,
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("当前缓存用量")
+                    .font(FontId::proportional(12.5))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                theme::status_pill(ui, &format!("● {status_text} {percent}%"), fg, bg);
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.add(
+            ProgressBar::new(ratio)
+                .desired_width(ui.available_width())
+                .desired_height(18.0)
+                .fill(bar_color)
+                .corner_radius(CornerRadius::same(6))
+                .text(format!("已用 {} / {} MB", runtime.consumption_mb, max_size)),
         );
-    }
 
-    // 在无弹窗且聚焦于未锁定的输入框时展示实体输入光标
-    if app.modal.is_none() && focused {
-        let cursor_pos = match app.cache.field {
-            CacheField::MaxSize if !locked => max_cursor,
-            CacheField::WarningThreshold => warn_cursor,
-            CacheField::CriticalThreshold => crit_cursor,
-            _ => None,
-        };
-        if let Some(pos) = cursor_pos {
-            frame.set_cursor_position(pos);
-        }
-    }
-}
-
-fn render_numeric_row(
-    frame: &mut Frame,
-    area: Rect,
-    label: &str,
-    field: &NumericField,
-    is_focused: bool,
-    is_locked: bool,
-    hit_rect: &mut Rect,
-) -> Option<Position> {
-    if area.height == 0 || area.width < 12 {
-        *hit_rect = Rect::default();
-        return None;
-    }
-    let label_w = 10u16;
-    let box_area = Rect::new(
-        area.x + label_w,
-        area.y,
-        area.width.saturating_sub(label_w + 1),
-        1,
-    );
-    *hit_rect = box_area;
-
-    let inner_w = box_area.width.saturating_sub(2) as usize;
-    let (visible, cursor_off) = slice_input(&field.text, field.cursor, inner_w);
-    let pad = inner_w.saturating_sub(visible.len());
-    let bracket_l = if is_focused { "▸" } else { "[" };
-    let bracket_r = if is_focused { "◂" } else { "]" };
-    let box_text = format!("{bracket_l}{visible}{:pad$}{bracket_r}", "");
-
-    let line = Line::from(vec![
-        Span::styled(label, theme::text()),
-        Span::styled(box_text, theme::input(is_focused, is_locked)),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(theme::surface()), area);
-
-    if is_focused && !is_locked && inner_w > 0 {
-        let cx = (box_area.x + 1 + cursor_off as u16).min(box_area.right().saturating_sub(2));
-        Some(Position::new(cx, box_area.y))
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("可用剩余空间：{} MB", runtime.available_space_mb))
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
     } else {
-        None
+        egui::Frame::NONE
+            .fill(theme::BG_SUBTLE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("筛选器当前未开启，启用并重启后将实时监测缓存使用率")
+                        .font(FontId::proportional(12.0))
+                        .color(theme::TEXT_MUTED),
+                );
+            });
     }
 }
 
-fn slice_input(s: &str, cursor: usize, max_cols: usize) -> (&str, usize) {
-    if max_cols == 0 || s.is_empty() {
-        return ("", 0);
+fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
+    let busy = app.is_busy();
+    let locked = is_overlay_locked(&app.snapshot);
+
+    // 缓存模式：内存(RAM) / 磁盘(Disk)（R1：当前启用时锁定）
+    if let Some(cfg_next) = app.snapshot.overlay_config_next {
+        let mut selected_type = cfg_next.overlay_type;
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [78.0, 24.0],
+                egui::Label::new(
+                    RichText::new("缓存模式")
+                        .font(FontId::proportional(12.5))
+                        .color(if !locked {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        }),
+                ),
+            );
+            ui.add_enabled_ui(!busy && !locked, |ui| {
+                if theme::segmented_toggle(
+                    ui,
+                    &mut selected_type,
+                    &[
+                        (OverlayType::Ram, "内存 RAM"),
+                        (OverlayType::Disk, "磁盘 Disk"),
+                    ],
+                ) {
+                    app.set_overlay_type(selected_type);
+                }
+            });
+        });
+        ui.add_space(4.0);
     }
-    let cursor = cursor.min(s.len());
-    if s.len() <= max_cols {
-        return (s, cursor);
+
+    let input_w = (ui.available_width() - 118.0).max(80.0);
+    let mut edited = false;
+
+    edited |= theme::labeled_input_row(
+        ui,
+        "最大容量",
+        &mut app.cache.max_size_text,
+        Some("MB"),
+        !busy && !locked,
+        input_w,
+    )
+    .changed();
+
+    edited |= theme::labeled_input_row(
+        ui,
+        "警告阈值",
+        &mut app.cache.warning_text,
+        Some("MB"),
+        !busy,
+        input_w,
+    )
+    .changed();
+
+    edited |= theme::labeled_input_row(
+        ui,
+        "严重阈值",
+        &mut app.cache.critical_text,
+        Some("MB"),
+        !busy,
+        input_w,
+    )
+    .changed();
+
+    if edited {
+        app.cache.on_edited();
     }
-    let start = cursor.saturating_sub(max_cols);
-    let end = (start + max_cols).min(s.len());
-    (&s[start..end], cursor - start)
+
+    ui.add_space(4.0);
+    if let Some(err) = &app.cache.error {
+        ui.label(
+            RichText::new(err)
+                .font(FontId::proportional(12.0))
+                .color(theme::ERR_FG),
+        );
+    } else if locked {
+        ui.label(
+            RichText::new(text::OVERLAY_LOCK_HINT)
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!busy, |ui| {
+            if theme::primary_button(ui, "应用缓存设置").clicked() {
+                app.submit_cache_settings();
+            }
+            if app.cache.dirty && theme::secondary_button(ui, "还原").clicked() {
+                app.reset_cache_form();
+            }
+        });
+    });
 }

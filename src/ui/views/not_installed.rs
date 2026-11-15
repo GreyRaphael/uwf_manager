@@ -1,73 +1,100 @@
-//! D6：UWF 功能未安装引导页。
+//! UWF 未安装/未启用引导卡片。
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use eframe::egui::{self, Align, CornerRadius, FontId, Layout, Margin, RichText, Stroke};
 
-use crate::app::App;
+use crate::app::UwfApp;
 use crate::ui::{text, theme};
 
-pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::bordered()
-        .title(text::NI_TITLE)
-        .title_style(theme::warn())
-        .border_style(theme::focus_border(true))
-        .style(theme::surface());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
+    let available = ui.available_size();
+    let card_w = 600.0_f32.min((available.x - 32.0).max(360.0));
 
-    let [content_area, btn_area] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(inner);
+    ui.vertical_centered(|ui| {
+        let top_pad = ((available.y - 340.0) * 0.35).max(24.0);
+        ui.add_space(top_pad);
 
-    let lines = vec![
-        Line::from(""),
-        Line::styled(format!("  {}", text::NI_LEAD), theme::text()),
-        Line::from(""),
-        Line::styled(format!("  {}", text::NI_REASON_TITLE), theme::title()),
-        Line::styled(format!("   {}", text::NI_REASON_1), theme::dim()),
-        Line::styled(format!("   {}", text::NI_REASON_2), theme::dim()),
-        Line::from(""),
-        Line::styled(format!("  {}", text::NI_ENABLE_TITLE), theme::title()),
-        Line::from(Span::styled(
-            format!("   {}", text::NI_ENABLE_CMD),
-            theme::ok(),
-        )),
-        Line::from(""),
-        Line::styled(format!("  {}", text::NI_FOOTER), theme::dim()),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .style(theme::surface()),
-        content_area,
-    );
+        ui.allocate_ui(egui::vec2(card_w, 0.0), |ui| {
+            theme::card_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::status_pill(ui, "未安装", theme::WARN_FG, theme::WARN_BG);
+                    ui.label(
+                        RichText::new(text::NI_TITLE)
+                            .font(FontId::proportional(17.0))
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
+                    );
+                });
 
-    let retry_lbl = " 重新检测 (F5) ";
-    let quit_lbl = " 退出 (Q) ";
-    let retry_w = Line::raw(retry_lbl).width() as u16;
-    let quit_w = Line::raw(quit_lbl).width() as u16;
-    app.regions.ni_retry_btn = Rect::new(
-        btn_area.x + 2,
-        btn_area.y,
-        retry_w.min(btn_area.width.saturating_sub(2)),
-        1,
-    );
-    let q_x = btn_area.x + 2 + retry_w + 2;
-    app.regions.ni_quit_btn = Rect::new(
-        q_x,
-        btn_area.y,
-        quit_w.min(btn_area.right().saturating_sub(q_x)),
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(retry_lbl, theme::button(true, false, false)),
-            Span::raw("  "),
-            Span::styled(quit_lbl, theme::button(false, false, false)),
-        ]))
-        .style(theme::surface()),
-        btn_area,
-    );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(text::NI_LEAD)
+                        .font(FontId::proportional(13.0))
+                        .color(theme::TEXT_SECONDARY),
+                );
+
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(text::NI_REASON_TITLE)
+                        .font(FontId::proportional(13.0))
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                for reason in [text::NI_REASON_1, text::NI_REASON_2] {
+                    ui.label(
+                        RichText::new(reason)
+                            .font(FontId::proportional(12.5))
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                }
+
+                ui.add_space(14.0);
+                let cmd_label = ui.label(
+                    RichText::new(text::NI_ENABLE_TITLE)
+                        .font(FontId::proportional(13.0))
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(6.0);
+
+                egui::Frame::NONE
+                    .fill(theme::BG_SUBTLE)
+                    .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut cmd_ref: &str = text::NI_ENABLE_CMD;
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cmd_ref)
+                                    .desired_width((ui.available_width() - 96.0).max(180.0))
+                                    .font(FontId::monospace(12.0)),
+                            )
+                            .labelled_by(cmd_label.id);
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if theme::secondary_button(ui, "复制命令").clicked() {
+                                    ui.ctx().copy_text(text::NI_ENABLE_CMD.to_string());
+                                    app.push_ok("已将 PowerShell 启用命令复制到剪贴板");
+                                }
+                            });
+                        });
+                    });
+
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(text::NI_FOOTER)
+                        .font(FontId::proportional(12.0))
+                        .color(theme::TEXT_MUTED),
+                );
+
+                ui.add_space(14.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::primary_button(ui, "重新检测").clicked() {
+                        app.refresh_all();
+                    }
+                });
+            });
+        });
+    });
 }

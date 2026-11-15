@@ -229,6 +229,7 @@ impl BackendHandle {
 
 struct DisconnectGuard<E: From<BackendEvent>> {
     tx: Sender<E>,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     clean_quit: bool,
 }
 
@@ -236,29 +237,36 @@ impl<E: From<BackendEvent>> Drop for DisconnectGuard<E> {
     fn drop(&mut self) {
         if !self.clean_quit {
             let _ = self.tx.send(E::from(BackendEvent::Disconnected));
+            (self.wake)();
         }
     }
 }
 
-/// 启动后端线程（actor）：工厂在本线程内构造 backend（WMI 连接随之在
-/// 本线程建立），顺序执行命令，`Quit` 退出。若意外退出（如 panic），
-/// `Drop` 哨兵立即发送 [`BackendEvent::Disconnected`] 唤醒 UI。
-pub fn spawn_backend_thread<E>(
+/// 启动带唤醒回调的后端线程（actor）：工厂在本线程内构造 backend（WMI 连接随之在
+/// 本线程建立），顺序执行命令，`Quit` 退出；每次向 UI 通道投递事件后触发 `wake`
+/// （如 `egui::Context::request_repaint`）。若意外退出（如 panic），`Drop` 哨兵立即发送
+/// [`BackendEvent::Disconnected`] 并唤醒 UI。
+pub fn spawn_backend_thread_with_wake<E, W>(
     factory: BackendFactory,
     rx: Receiver<BackendCommand>,
     tx: Sender<E>,
+    wake: W,
 ) -> BackendHandle
 where
     E: From<BackendEvent> + Send + 'static,
+    W: Fn() + Send + Sync + 'static,
 {
+    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(wake);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let join = thread::spawn(move || {
         let mut guard = DisconnectGuard {
             tx: tx.clone(),
+            wake: std::sync::Arc::clone(&wake),
             clean_quit: false,
         };
         let emit = |evt| {
             let _ = tx.send(E::from(evt));
+            (wake)();
         };
         let mut backend = factory();
         while let Ok(command) = rx.recv() {

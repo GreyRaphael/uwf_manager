@@ -1,139 +1,90 @@
-# UWF Manager
+# UWF 管理器 (UWF Manager)
 
-Windows 统一写入筛选器（UWF）的终端用户界面（TUI）管理工具 —— 由 C# WinForms 项目
-[UWFPRO](file:///home/gewei/UWFPRO) 以 Rust（Edition 2024）重写，单可执行文件、
-零运行时依赖（无 .NET / 无异步运行时）。
+Windows 统一写入筛选器（Unified Write Filter, UWF）的现代桌面管理工具 —— 由原 C# WinForms 项目 [UWFPRO](file:///home/gewei/UWFPRO) 以 Rust（Edition 2024）与 **`egui` / `eframe` `0.37`** 重构，单可执行文件、无 .NET 与异步运行时依赖。
 
-设计与实施细节见 [PLAN.md](PLAN.md)。
+> 历史 TUI 阶段的 WMI 接口调研与 R1–R7 业务规则定义见归档文档 [PLAN.md](PLAN.md)。
 
-## 功能
+## 功能亮点
 
-- **单屏亮色四区布局**：`1.基本设置`、`2.缓存设置(MB)`、`3.保护分区`、`4.排除列表` 同屏直观展示，支持**鼠标点击/滚轮**与**全键盘**操作
-- **UWF 筛选器**：启用 / 禁用、覆盖类型切换（`内存(RAM)` / `磁盘(Disk)`）、重置全部配置、重启 / 关机
-- **Overlay 缓存**：最大缓存与警告/严重阈值内联编辑（筛选器当前启用时自动按 R1 规则锁定覆盖类型与最大缓存）、**每 2 秒**动态用量监测条
-- **保护分区**：逐卷保护切换（`已保护` / `不保护`，当前 / 重启后双状态）
-- **排除列表**：统一展示文件与注册表排除项（`重启后·可编辑` / `当前生效·只读` 双视图）、**txt 列表导入导出**
-- **提交工具 (`[C]`)**：文件修改提交、文件删除提交（先删文件再固化）、注册表键值提交
-- 跨平台可开发：Windows 走 WMI（`wmi` crate，serde 化）；Linux/macOS 走 Mock 仿真数据，
-  `cargo run` 即可预览全部界面（含模拟重启后"下次→当前"生效演示）
+- **现代 Fluent 亮色桌面仪表盘**：
+  - **顶部全局命令栏**：应用标识与后端模式徽章（`WMI 实机` / `Mock 演示`）、筛选器当前/重启后状态药丸、`刷新 (F5)`、`提交操作…`、`电源 (重启/关机)` 与 `帮助 (F1)`。
+  - **左侧控制与监控边栏**：**筛选器控制卡**（启用/停用总开关 + 重置配置）与 **写入缓存 (Overlay) 卡**（顶部实时用量进度条 + 健康/预警/临界三态色标 + `内存 RAM / 磁盘 Disk` 分段切换 + 最大容量/预警/严重阈值表单）。
+  - **右侧宽幅工作区**：**受保护分区表**（展示盘符与当前/重启后保护状态，自动处理新分区首次保护的 `UWF_Volume` 实例注册与同盘符多实例消歧）与**排除项规则列表**（支持 `全部` / `文件与目录` / `注册表` 分组过滤、`重启后生效(可编辑)` / `当前生效(只读)` 双视图切换，以及系统原生文件/文件夹选择器和 UTF-8 `.txt` 导入导出）。
+  - **底部紧凑反馈与可展开日志抽屉**：展示最新操作状态、单行生效提示，点击「操作日志」可展开查看并复制完整执行日志。
+- **跨平台可开发预览**：Windows 实机走 WMI（`wmi` crate，serde 化）；Linux / macOS 自动走 `MockUwfBackend` 仿真数据，`cargo run` 或 `--mock` 即可启动桌面窗交互预览全部流程。
 
 ## 构建
 
-### 依赖
+### 环境要求
 
 | 用途 | 要求 |
 | :--- | :--- |
 | 任意平台开发预览 | Rust 1.99+（stable） |
-| Windows 本机构建 | 通常需要 `rc.exe`（VS Build Tools / Windows SDK）或 `windres`；`embed-resource` 会调用工具链资源编译器 |
-| Linux 交叉 check / build | `llvm-rc`（或 `x86_64-w64-mingw32-windres`）；构建 exe 另需 `x86_64-w64-mingw32-gcc` 链接器 |
+| Windows 本机构建 | VS Build Tools / Windows SDK（提供 `rc.exe` 供 `embed-resource` 编译清单与图标） |
+| Linux 交叉 check / build | `llvm-rc`（或 `x86_64-w64-mingw32-windres`）；构建 exe 另需 `x86_64-w64-mingw32-gcc` |
 
 ### Linux / macOS 开发预览（Mock 数据）
 
 ```bash
-cargo run          # 非 Windows 平台自动使用 Mock 后端
+cargo run            # 非 Windows 平台自动使用 Mock 后端
 cargo run -- --mock  # 任意平台强制 Mock
 ```
 
-> Windows 注意：`--mock` 只跳过运行时的管理员检测，**不会改变内嵌的
-> `requireAdministrator` manifest**。因此从资源管理器/终端启动 exe 时仍会
-> 触发 UAC；如需完全免提权的预览构建，需要单独的 `asInvoker` manifest
-> 或独立 mock 二进制（当前未提供）。
+> Windows 注意：Release 构建启用了 `windows_subsystem = "windows"` 以隐藏控制台黑框，`--mock` 仅跳过运行时权限检测，**不会改变内嵌的 `requireAdministrator` 清单**。
 
 ### Windows 本机构建
 
 ```powershell
 cargo build --release
-# 产物 target\release\uwf_manager.exe 已内嵌 requireAdministrator UAC 清单与图标
+# 产物 target\release\uwf_manager.exe 已内嵌 UAC 清单与应用图标，无控制台窗口
 ```
 
-### Linux 交叉编译
+### Linux 交叉编译（Windows 目标）
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
-
-# 编译验证（资源脚本经 build.rs 实际编译，需资源编译器）：
-#   ① CentOS/RHEL：sudo dnf install llvm        （提供 /usr/bin/llvm-rc）
-#   ② Debian/Ubuntu：sudo apt install llvm      （同上）或 binutils-mingw-w64-x86-64
 cargo check --target x86_64-pc-windows-gnu
-
-# 构建 exe（另需 mingw 链接器）：
-#   Debian/Ubuntu：sudo apt install gcc-mingw-w64-x86-64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-> build.rs 资源编译器回退链：`RC`/`RC_<target>` 环境变量 → `x86_64-w64-mingw32-windres`
-> → PATH 上的 `llvm-rc`（无交叉 gcc 时 .rc 预处理回落宿主编译器，纯宏展开无副作用）。
-> UAC 清单为硬性需求，资源编译失败即构建失败。
+## 使用与交互说明
 
-## 使用
+### 权限与未安装引导
 
-### 权限（UAC）
-
-- 正式版 exe 内嵌 `requireAdministrator` 清单：从非提权终端启动时，Windows 弹 UAC
-  确认后进程在**新控制台窗口**中运行（Windows 机制使然，非缺陷）。
-- 运行时另有 `TokenElevation` 兜底检测：无清单的 dev 构建以非管理员启动时，
-  打印中文引导并以退出码 2 退出；`--mock` 模式不受限。
-
-### UWF 未安装
-
-进入 TUI 引导页（不退出），按提示在**管理员 PowerShell** 执行并重启：
+- Release 产物内嵌 `requireAdministrator` UAC 清单；若以无管理员权限方式运行非 `--mock` 构建，程序会在启动图形界面前弹出系统错误对话框提示并退出（退出码 2）。
+- 若当前 Windows 未启用 UWF 可选功能，界面将展示引导卡片，提供一键复制的管理员 PowerShell 启用命令：
 
 ```powershell
 Enable-WindowsOptionalFeature -Online -FeatureName Client-UnifiedWriteFilter
 ```
 
-重启后回到本工具按 `[F5]` 重新检测即可。（UWF 仅 Windows 企业版 / 教育版 / IoT 提供。）
+执行并重启系统后，点击引导页中的「重新检测」或按 `[F5]` 即可进入主界面。
 
-### 交互与快捷键
+### 快捷键
 
-界面采用单屏四区布局，支持**鼠标左键点击 / 滚轮滚动**（包含主界面按钮、开关、输入框、列表行与弹窗）以及全键盘操作：
-
-| 位置 | 按键 | 说明 |
-| :--- | :--- | :--- |
-| 全局 | `[Tab]` / `[Shift+Tab]` / `[Alt+1..4]` | 切换焦点面板（1.基本设置 / 2.缓存设置 / 3.保护分区 / 4.排除列表） |
-| 全局 | `[C]` | 打开提交固化菜单（1.提交文件修改 / 2.删除并固化文件 / 3.提交注册表键值） |
-| 全局 | `[F5]` / `[F9]` | 全部刷新 / 重置全部 UWF 配置（确认弹窗） |
-| 全局 | `[F10]` / `[F11]` | 重启系统 / 关机（确认弹窗） |
-| 全局 | `[I]` / `[X]` | 导入 `.txt` 排除列表 / 导出当前排除视图 |
-| 全局 | `[?]` / `[F1]` | 帮助弹窗 |
-| 全局 | `[Q]` / `[Esc]` | 退出（弹窗打开时关闭弹窗；编辑缓存未保存时 `[Esc]` 先撤销修改） |
-| `1.基本设置` | `[↑/↓]` `[Enter]`/`[Space]`/`[←/→]` | 选择并切换写入过滤（`启用`/`禁用`）或覆盖类型（`内存(RAM)`/`磁盘(Disk)`） |
-| | `[E]` / `[D]` | 快捷启用 / 禁用写入过滤（下次启动生效） |
-| `2.缓存设置(MB)` | `[↑/↓]` `[0-9]` `[Backspace]` `[Enter]` | 选择数字框或`确认缓存`按钮，输入数值并保存 Overlay 缓存配置 |
-| `3.保护分区` | `[↑/↓]` `[Home]`/`[End]` | 选择分区 |
-| | `[P]` / `[U]` / `[Enter]`/`[Space]` | 保护 / 取消保护 / 切换保护状态（下次启动生效） |
-| `4.排除列表` | `[↑/↓]` `[Home]`/`[End]` | 在统一列表（文件优先、注册表在后）中选择条目 |
-| | `[A]` / `[R]` / `[D]`/`[Delete]` | 添加文件或目录（支持 `F2` 文件选择器）/ 添加注册表项 / 删除选中项 |
-| | `[S]` | 切换 `重启后·可编辑` 与 `当前生效·只读` 视图 |
+| 按键 | 说明 |
+| :--- | :--- |
+| `F5` | 刷新全部 UWF 状态 |
+| `F1` | 打开/关闭使用说明弹窗 |
+| `Esc` | 关闭当前弹窗，或收起底部操作日志面板 |
+| `Delete` | 无文本聚焦且处于可编辑视图时，移除当前选中的排除项 |
+| `Enter` | 确认输入/确认弹窗 |
 
 ### 关键业务规则
 
-- **R1**：筛选器**当前已启用**时，Overlay 类型与上限锁定（UI 置灰 + 后端校验）；
-  预警/临界阈值随时可改。
-- **R2/R4**：卷保护切换、排除项增删均作用于**下次会话**，重启后生效；
-  查询支持当前 / 下次双视图。
-- **R3**：文件提交作用于当前会话；删除提交为两步语义（先删文件，再 WMI 固化删除）。
-- **R5**：注册表提交按最后一个 `\` 拆分为键路径 + 值名称。
-- **导入格式**：txt 每行一条，`HK` 前缀 → 注册表排除，其余 → 文件排除（绝对路径）。
-
-### 与原版的差异
-
-接入 UI 的扩展（原版有实现但未接线）：`ResetSettings`、`RestartSystem`、`ShutdownSystem`。
-有意省略（原版为空壳/损坏，登记备查）：`UWF_Servicing`、`GetOverlayFiles`、
-`SetBindByDriveLetter`、`FindExclusion`、`CommitRegistryDeletion`（详见 PLAN §6.6）。
+- **R1**：筛选器**当前会话已启用**时，缓存模式与最大容量锁定（界面禁用并提示，后端同步校验）；警告/严重阈值随时可调。
+- **R2 / R4**：筛选器开关、缓存配置、卷保护切换及排除项增删均作用于**下次会话**，重启后生效；排除项支持对照查看当前生效与重启后规则。
+- **R3**：文件修改提交与文件删除提交（两步安全确认：先物理删除，再 WMI 固化删除）立即生效；删除提交强制两次交互确认。
+- **R5**：注册表提交按最后一个 `\` 拆分为键路径与值名称。
+- **导入格式**：`.txt` 每行一条，`HK` 前缀 → 注册表排除，其余 → 文件/目录绝对路径排除。
 
 ## 开发与验证
 
 ```bash
-cargo clippy --all-targets -- -D warnings   # 零告警基线（双 target 均通过）
-cargo build                                 # smoke 测试需要先构建 debug 二进制
-cargo test                                  # 单元 + reducer + UI 渲染断言
-cargo check --target x86_64-pc-windows-gnu  # Windows 目标编译验证
-python3 scripts/tui_smoke.py                # pty 端到端冒烟（仅 Unix；在临时目录运行）
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked   # 包含模型、WMI 消歧逻辑、状态机及 egui_kittest 无头 UI 交互测试
+cargo build --locked
 ```
 
-架构：UI 线程（终端读取线程 + 后端回包转发线程统一汇入 `UiEvent` channel，
-2s tick 驱动 Overlay 轮询）⇄ `std::sync::mpsc` ⇄ 后端线程（actor 模式独占
-`UwfBackend`，COM 套间约束天然规避）；全程序无异步运行时。运行时代码的
-`unsafe` 仅 `backend/windows/elevate.rs` 一处（模块内显式豁免）；`build.rs`
-另有一处 `set_var`。
+架构：UI 线程运行 `eframe` / `egui`（含非阻塞 `rfd` 原生文件对话框后台线程）⇄ `std::sync::mpsc` ⇄ 后端 actor 线程（独占 `dyn UwfBackend`，天然满足 COM 套间约束）；后端回包通过 `egui::Context::request_repaint` 立即唤醒重绘。运行时 `unsafe` 仅 `backend/windows/elevate.rs` 一处（模块内显式 allow）。

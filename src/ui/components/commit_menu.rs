@@ -1,14 +1,12 @@
-//! 提交固化选择弹窗（文件提交 / 删除提交 / 注册表提交）。
+//! 提交固化菜单弹窗（提交文件修改 / 删除并固化文件 / 提交注册表键值）。
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use eframe::egui::{
+    self, Align, Button, Color32, CornerRadius, FontId, Layout, Margin, RichText, Stroke,
+};
 
 use crate::ui::theme;
 
-use super::{centered_rect, clear_surface, is_left_click};
+use super::show_modal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitChoice {
@@ -17,135 +15,122 @@ pub enum CommitChoice {
     Registry,
 }
 
-const ITEMS: [(CommitChoice, &str, &str); 3] = [
-    (
-        CommitChoice::File,
-        "[1] 提交文件修改",
-        "浏览并选择文件，将更改固化到物理磁盘（当前会话）",
-    ),
-    (
-        CommitChoice::FileDeletion,
-        "[2] 删除并固化文件",
-        "先删除文件再固化该删除（两步操作，需二次确认）",
-    ),
-    (
-        CommitChoice::Registry,
-        "[3] 提交注册表键值",
-        "输入完整路径（如 HKLM\\SOFTWARE\\X\\Value）",
-    ),
-];
-
-pub struct CommitMenuState {
-    pub list_state: ListState,
-    list_area: Rect,
-    cancel_btn: Rect,
-}
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitMenuOutcome {
     Stay,
     Cancel,
     Select(CommitChoice),
 }
 
-impl CommitMenuState {
-    pub fn new() -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-        Self {
-            list_state,
-            list_area: Rect::default(),
-            cancel_btn: Rect::default(),
-        }
-    }
+const ITEMS: [(CommitChoice, &str, &str, &str, bool); 3] = [
+    (
+        CommitChoice::File,
+        "提交文件修改",
+        "将当前受保护卷中某文件的改动立即写回物理磁盘",
+        "选择文件…",
+        false,
+    ),
+    (
+        CommitChoice::FileDeletion,
+        "删除并固化文件",
+        "立即删除目标文件并固化该删除，重启后不再恢复（需二次确认）",
+        "选择待删文件…",
+        true,
+    ),
+    (
+        CommitChoice::Registry,
+        "提交注册表键值",
+        "将受保护注册表项下的指定键值立即写入物理配置（格式：键路径\\值名）",
+        "输入键值…",
+        false,
+    ),
+];
 
-    pub fn on_key(&mut self, key: KeyEvent) -> CommitMenuOutcome {
-        let cur = self.list_state.selected().unwrap_or(0);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => CommitMenuOutcome::Cancel,
-            KeyCode::Up => {
-                self.list_state
-                    .select(Some((cur + ITEMS.len() - 1) % ITEMS.len()));
-                CommitMenuOutcome::Stay
-            }
-            KeyCode::Down => {
-                self.list_state.select(Some((cur + 1) % ITEMS.len()));
-                CommitMenuOutcome::Stay
-            }
-            KeyCode::Enter => CommitMenuOutcome::Select(ITEMS[cur].0),
-            KeyCode::Char('1') | KeyCode::Char('f') | KeyCode::Char('F') => {
-                CommitMenuOutcome::Select(CommitChoice::File)
-            }
-            KeyCode::Char('2') | KeyCode::Char('d') | KeyCode::Char('D') => {
-                CommitMenuOutcome::Select(CommitChoice::FileDeletion)
-            }
-            KeyCode::Char('3') | KeyCode::Char('r') | KeyCode::Char('R') => {
-                CommitMenuOutcome::Select(CommitChoice::Registry)
-            }
-            _ => CommitMenuOutcome::Stay,
-        }
-    }
+pub fn render(ctx: &egui::Context) -> CommitMenuOutcome {
+    let mut outcome = CommitMenuOutcome::Stay;
+    let (_, should_close) = show_modal(
+        ctx,
+        "commit_menu_modal",
+        "提交固化操作（立即写入磁盘/注册表）",
+        theme::TEXT_PRIMARY,
+        460.0,
+        |ui| {
+            ui.label(
+                RichText::new("以下操作直接作用于当前会话受保护对象，请选择要执行的固化类型：")
+                    .font(FontId::proportional(12.5))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.add_space(8.0);
 
-    pub fn on_mouse(&mut self, mouse: MouseEvent) -> CommitMenuOutcome {
-        let Some(pos) = is_left_click(&mouse) else {
-            return CommitMenuOutcome::Stay;
-        };
-        if self.cancel_btn.contains(pos) {
-            return CommitMenuOutcome::Cancel;
-        }
-        if self.list_area.contains(pos) {
-            let idx = (pos.y - self.list_area.y) as usize / 2;
-            if idx < ITEMS.len() {
-                return CommitMenuOutcome::Select(ITEMS[idx].0);
+            for (choice, title, desc, btn_label, danger) in ITEMS {
+                let fill = if danger {
+                    Color32::from_rgb(255, 250, 250)
+                } else {
+                    theme::BG_SUBTLE
+                };
+                let stroke = if danger {
+                    Stroke::new(1.0, Color32::from_rgb(254, 202, 202))
+                } else {
+                    Stroke::new(1.0, theme::BORDER_STRONG)
+                };
+                let title_color = if danger { theme::ERR_FG } else { theme::ACCENT };
+
+                egui::Frame::NONE
+                    .fill(fill)
+                    .stroke(stroke)
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width((ui.available_width() - 118.0).max(180.0));
+                                ui.label(
+                                    RichText::new(title)
+                                        .font(FontId::proportional(13.5))
+                                        .strong()
+                                        .color(title_color),
+                                );
+                                ui.label(
+                                    RichText::new(desc)
+                                        .font(FontId::proportional(12.0))
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let btn = if danger {
+                                    ui.add(
+                                        Button::new(RichText::new(btn_label).color(theme::ERR_FG))
+                                            .fill(theme::ERR_BG)
+                                            .stroke(Stroke::new(
+                                                1.0,
+                                                Color32::from_rgb(252, 165, 165),
+                                            ))
+                                            .corner_radius(CornerRadius::same(6)),
+                                    )
+                                } else {
+                                    theme::secondary_button(ui, btn_label)
+                                };
+                                if btn.clicked() {
+                                    outcome = CommitMenuOutcome::Select(choice);
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(6.0);
             }
-        }
-        CommitMenuOutcome::Stay
-    }
-}
 
-pub fn render(frame: &mut Frame, state: &mut CommitMenuState, area: Rect) {
-    let rect = centered_rect(66, 42, area);
-    let rect = Rect {
-        width: rect.width.max(36).min(area.width),
-        height: rect.height.max(10).min(area.height),
-        ..rect
-    };
-    clear_surface(frame, rect);
-    let block = Block::bordered()
-        .title(" 提交固化工具（当前受保护卷即时生效） ")
-        .title_style(theme::title())
-        .border_style(theme::focus_border(true))
-        .style(theme::surface());
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let [list_area, hint_area] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(inner);
-    state.list_area = list_area;
-
-    let items: Vec<ListItem> = ITEMS
-        .iter()
-        .map(|(_, title, desc)| {
-            ListItem::new(vec![
-                Line::from(Span::styled(*title, theme::title())),
-                Line::from(Span::styled(format!("    {desc}"), theme::dim())),
-            ])
-        })
-        .collect();
-    let list = List::new(items)
-        .style(theme::surface())
-        .highlight_style(theme::selected())
-        .highlight_symbol("▶ ");
-    frame.render_stateful_widget(list, list_area, &mut state.list_state);
-
-    let [hint_left, cancel_area] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(12)]).areas(hint_area);
-    state.cancel_btn = cancel_area;
-    frame.render_widget(
-        Paragraph::new(" [↑/↓] 选择  [Enter/1-3] 执行").style(theme::dim()),
-        hint_left,
+            ui.add_space(6.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::secondary_button(ui, "取消").clicked() {
+                    outcome = CommitMenuOutcome::Cancel;
+                }
+            });
+        },
     );
-    frame.render_widget(
-        Paragraph::new(" 取消 (Esc) ").style(theme::button(false, false, false)),
-        cancel_area,
-    );
+
+    if matches!(outcome, CommitMenuOutcome::Stay) && should_close {
+        CommitMenuOutcome::Cancel
+    } else {
+        outcome
+    }
 }

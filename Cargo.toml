@@ -5,11 +5,16 @@ edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
-ratatui = { version = "0.30", features = ["crossterm_0_29"] }
-crossterm = "0.29"
+eframe = "0.37.0"
+egui_extras = "0.37.0"
+image = { version = "0.25", default-features = false, features = ["ico"] }
+rfd = "0.18.0"
 thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["eframe"] }
 
 [target.'cfg(windows)'.dependencies]
 wmi = { version = "0.18", default-features = false }

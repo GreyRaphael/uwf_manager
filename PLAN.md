@@ -1,6 +1,6 @@
-# UWF Manager (Rust 1.99 TUI) 重写方案设计 v2
+# UWF Manager (Rust 1.99 TUI) 重写方案设计 v2（历史归档）
 
-> 本文档为将 C# WinForms 项目 `UWFPRO` 重构为 Rust 1.99 终端用户界面（TUI）应用 `uwf_manager` 的详细技术设计与实施方案。
+> **历史归档说明**：本文档记录了 `uwf_manager` `v0.1.0–v0.3.1` 阶段的 `ratatui` TUI 架构设计、C# 原版差异对照以及 §6 中的 Windows WMI 接口契约与 R1–R7 业务规则。自当前版本起，表现层已彻底迁移为基于 **`eframe` / `egui` `v0.37`** 的现代桌面 GUI（移除 TUI 依赖），WMI 驱动与业务规则继续沿用本文档 §6 定义。
 
 **v2 修订说明**（基于对原 C# 项目 2052 行源码的逐项核对与依赖联网核实）：
 1. 补齐功能遗漏：**排除项列表导入/导出**（原版 `MainForm.cs:306,328`）。

@@ -24,8 +24,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Build & PTY smoke test
-        run: cargo build --locked && python3 scripts/tui_smoke.py
+      - name: Build binary
+        run: cargo build --locked
 
   windows-check:
     name: Compile & test (Windows MSVC)

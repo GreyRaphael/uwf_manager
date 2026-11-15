@@ -1,179 +1,37 @@
-//! 主应用状态机：单屏四区布局控制、事件循环、键盘/鼠标路由、后端回包应用。
+//! 主应用状态机与 `eframe::App` 实现：协调后端命令/回包、表单校验、模态弹窗与视图交互。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::DefaultTerminal;
-use ratatui::layout::{Position, Rect};
-use ratatui::widgets::{ListState, TableState};
+use eframe::egui;
 
 use crate::backend::{
     BackendCmd, BackendCommand, BackendEvent, BackendKind, FullSnapshot, Outcome, RequestId,
 };
-use crate::model::{FileExclusion, OverlayType};
-use crate::ui::components::commit_menu::{CommitChoice, CommitMenuOutcome, CommitMenuState};
-use crate::ui::components::confirm::{ConfirmAction, ConfirmOutcome, ConfirmState};
-use crate::ui::components::file_picker::{
-    FilePickerState, PickerAction, PickerMode, PickerOutcome,
+use crate::model::{FileExclusion, OverlayType, VolumeInfo};
+use crate::ui::components::commit_menu::CommitChoice;
+use crate::ui::components::confirm::{ConfirmAction, ConfirmState};
+use crate::ui::components::input_dialog::{BrowseKind, InputAction, InputState};
+use crate::ui::file_dialog::{
+    FileDialogKind, FileDialogService, FileDialogTarget, RfdFileDialogService,
 };
-use crate::ui::components::help::HelpState;
-use crate::ui::components::input_dialog::{InputAction, InputOutcome, InputState};
+use crate::ui::theme;
 
-/// UI 线程统一事件：终端输入与后端回包走同一个 channel，
-/// 后端回包可立即唤醒 `recv_timeout`，不再依赖短轮询。
-pub enum UiEvent {
-    Terminal(Event),
-    Backend(BackendEvent),
-}
-
-impl From<BackendEvent> for UiEvent {
-    fn from(evt: BackendEvent) -> Self {
-        Self::Backend(evt)
-    }
-}
-
-/// Overlay 轮询周期（与原版 2 秒后台刷新一致）
+/// Overlay 运行时用量后台刷新周期（2 秒）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
+/// 底层状态无事可做时的最大周期唤醒间隔（兼顾 2s 轮询与低空转）
+const IDLE_REPAINT: Duration = Duration::from_millis(500);
+/// 操作日志抽屉最大保留条数
+const MAX_LOG_ENTRIES: usize = 50;
 
-/// 主界面四个交互区块（按 Tab 顺序轮转）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusPanel {
-    BasicSettings,
-    CacheSettings,
-    Volumes,
-    Exclusions,
-}
-
-impl FocusPanel {
-    pub const ALL: [FocusPanel; 4] = [
-        FocusPanel::BasicSettings,
-        FocusPanel::CacheSettings,
-        FocusPanel::Volumes,
-        FocusPanel::Exclusions,
-    ];
-
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
-    }
-
-    pub fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
-    }
-
-    pub fn prev(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
-}
-
-/// 1. 基本设置区聚焦项
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BasicField {
-    WriteFilter,
-    OverlayType,
-}
-
-/// 2. 缓存设置区聚焦项
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CacheField {
-    MaxSize,
-    #[default]
-    WarningThreshold,
-    CriticalThreshold,
-    ConfirmButton,
-}
-
-impl CacheField {
-    const ALL: [CacheField; 4] = [
-        CacheField::MaxSize,
-        CacheField::WarningThreshold,
-        CacheField::CriticalThreshold,
-        CacheField::ConfirmButton,
-    ];
-
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(1)
-    }
-}
-
-/// 简洁数字输入框（支持光标移动与插入删除）
-#[derive(Debug, Clone, Default)]
-pub struct NumericField {
-    pub text: String,
-    pub cursor: usize,
-}
-
-impl NumericField {
-    pub fn set(&mut self, value: impl Into<String>) {
-        self.text = value.into();
-        self.cursor = self.text.len();
-    }
-
-    pub fn move_end(&mut self) {
-        self.cursor = self.text.len();
-    }
-
-    pub fn on_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                false
-            }
-            KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.text.len());
-                false
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                false
-            }
-            KeyCode::End => {
-                self.cursor = self.text.len();
-                false
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.text.remove(self.cursor);
-                    true
-                } else {
-                    false
-                }
-            }
-            KeyCode::Delete => {
-                if self.cursor < self.text.len() {
-                    self.text.remove(self.cursor);
-                    true
-                } else {
-                    false
-                }
-            }
-            KeyCode::Char(c)
-                if c.is_ascii_digit()
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.text.len() < 10 =>
-            {
-                self.text.insert(self.cursor, c);
-                self.cursor += 1;
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-/// 2. 缓存设置表单状态
+/// 写入缓存设置表单状态
 #[derive(Debug, Default)]
 pub struct CacheForm {
-    pub field: CacheField,
-    pub max_size: NumericField,
-    pub warning: NumericField,
-    pub critical: NumericField,
+    pub max_size_text: String,
+    pub warning_text: String,
+    pub critical_text: String,
     /// 是否有未保存编辑；为 true 时自动刷新不覆盖用户输入
     pub dirty: bool,
     pub error: Option<String>,
@@ -181,53 +39,30 @@ pub struct CacheForm {
 
 impl CacheForm {
     pub fn sync_from_snapshot(&mut self, snapshot: &FullSnapshot) {
-        if let Some(cfg) = snapshot.overlay_config_next {
-            self.max_size.set(cfg.max_size_mb.to_string());
-        } else {
-            self.max_size.set("");
-        }
+        self.max_size_text = snapshot
+            .overlay_config_next
+            .map(|c| c.max_size_mb.to_string())
+            .unwrap_or_default();
         if let Some(rt) = snapshot.overlay_runtime {
-            self.warning.set(rt.warning_threshold_mb.to_string());
-            self.critical.set(rt.critical_threshold_mb.to_string());
+            self.warning_text = rt.warning_threshold_mb.to_string();
+            self.critical_text = rt.critical_threshold_mb.to_string();
         } else {
-            self.warning.set("");
-            self.critical.set("");
+            self.warning_text.clear();
+            self.critical_text.clear();
         }
         self.dirty = false;
         self.error = None;
-        self.ensure_unlocked_field(is_overlay_locked(snapshot));
     }
 
-    pub fn ensure_unlocked_field(&mut self, locked: bool) {
-        if locked && self.field == CacheField::MaxSize {
-            self.field = CacheField::WarningThreshold;
-        }
-    }
-
-    pub fn move_field(&mut self, delta: isize, locked: bool) {
-        let mut idx = self.field.index() as isize;
-        for _ in 0..CacheField::ALL.len() {
-            idx = (idx + delta).rem_euclid(CacheField::ALL.len() as isize);
-            let candidate = CacheField::ALL[idx as usize];
-            if !(locked && candidate == CacheField::MaxSize) {
-                self.field = candidate;
-                return;
-            }
-        }
-    }
-
-    pub fn active_input_mut(&mut self, locked: bool) -> Option<&mut NumericField> {
-        match self.field {
-            CacheField::MaxSize if !locked => Some(&mut self.max_size),
-            CacheField::WarningThreshold => Some(&mut self.warning),
-            CacheField::CriticalThreshold => Some(&mut self.critical),
-            _ => None,
-        }
+    pub fn on_edited(&mut self) {
+        self.dirty = true;
+        self.error = None;
     }
 
     pub fn validate(&self, snapshot: &FullSnapshot) -> Result<(u32, u32, u32), String> {
         let parse = |s: &str, what: &str| -> Result<u32, String> {
-            s.parse::<u32>()
+            s.trim()
+                .parse::<u32>()
                 .map_err(|_| format!("{what}须为 0-4294967295 的整数"))
         };
         let locked = is_overlay_locked(snapshot);
@@ -237,33 +72,39 @@ impl CacheForm {
                 .map(|c| c.max_size_mb)
                 .ok_or_else(|| "配置尚未加载完成，无法保存".to_string())?
         } else {
-            parse(&self.max_size.text, "最大缓存")?
+            parse(&self.max_size_text, "最大容量")?
         };
-        let warning_mb = parse(&self.warning.text, "警告阈值")?;
-        let critical_mb = parse(&self.critical.text, "严重阈值")?;
+        let warning_mb = parse(&self.warning_text, "警告阈值")?;
+        let critical_mb = parse(&self.critical_text, "严重阈值")?;
 
         if max_mb == 0 {
-            return Err("最大缓存必须大于 0".to_string());
+            return Err("最大容量必须大于 0 MB".to_string());
         }
         if warning_mb >= critical_mb {
             return Err("警告阈值必须小于严重阈值".to_string());
         }
         if critical_mb > max_mb {
-            return Err("严重阈值不能大于最大缓存".to_string());
+            return Err("严重阈值不能大于最大容量".to_string());
         }
         Ok((max_mb, warning_mb, critical_mb))
     }
 }
 
-/// R1：筛选器当前启用时，覆盖类型与最大缓存锁定
+/// R1：筛选器当前会话已启用时，缓存模式与最大容量锁定
 pub fn is_overlay_locked(snapshot: &FullSnapshot) -> bool {
-    snapshot
-        .filter_state
-        .map(|f| f.current_enabled)
-        .unwrap_or(false)
+    snapshot.filter_state.is_some_and(|f| f.current_enabled)
 }
 
-/// 统一排除列表条目（文件/文件夹排除 或 注册表排除）
+/// 排除列表类型展示过滤
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExclusionFilter {
+    #[default]
+    All,
+    Files,
+    Registry,
+}
+
+/// 统一排除列表条目（文件/目录排除 或 注册表排除）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionItem {
     File(FileExclusion),
@@ -273,71 +114,24 @@ pub enum ExclusionItem {
 impl ExclusionItem {
     pub fn display(&self) -> String {
         match self {
-            ExclusionItem::File(f) => f.display(),
-            ExclusionItem::Registry(k) => k.clone(),
+            Self::File(f) => f.display(),
+            Self::Registry(k) => k.clone(),
         }
     }
 
     pub fn is_registry(&self) -> bool {
-        matches!(self, ExclusionItem::Registry(_))
+        matches!(self, Self::Registry(_))
     }
 }
 
-/// 渲染时记录的可点击/可滚动区域（供鼠标精准交互）
-#[derive(Debug, Default, Clone)]
-pub struct UiRegions {
-    // 顶部栏按钮
-    pub commit_btn: Rect,
-    pub reset_btn: Rect,
-    pub refresh_btn: Rect,
-    pub help_btn: Rect,
-    pub quit_btn: Rect,
-
-    // 1. 基本设置
-    pub panel_basic: Rect,
-    pub filter_toggle: Rect,
-    pub overlay_type_toggle: Rect,
-
-    // 2. 缓存设置
-    pub panel_cache: Rect,
-    pub max_size_input: Rect,
-    pub warning_input: Rect,
-    pub critical_input: Rect,
-    pub cache_confirm_btn: Rect,
-
-    // 3. 保护分区
-    pub panel_volumes: Rect,
-    pub volume_rows: Rect,
-    pub protect_btn: Rect,
-    pub unprotect_btn: Rect,
-
-    // 4. 排除列表 + 底部动作按钮
-    pub panel_exclusions: Rect,
-    pub exclusion_rows: Rect,
-    pub excl_add_file_btn: Rect,
-    pub excl_add_reg_btn: Rect,
-    pub excl_delete_btn: Rect,
-    pub excl_view_btn: Rect,
-    pub import_btn: Rect,
-    pub export_btn: Rect,
-    pub restart_btn: Rect,
-    pub shutdown_btn: Rect,
-
-    // 未安装引导页按钮
-    pub ni_retry_btn: Rect,
-    pub ni_quit_btn: Rect,
-}
-
-/// 当前打开的模态弹窗
+/// 当前打开的模态窗口
 pub enum Modal {
+    CommitMenu,
     Input(InputState),
-    FilePicker(FilePickerState),
     Confirm(ConfirmState),
-    CommitMenu(CommitMenuState),
-    Help(HelpState),
+    Help,
 }
 
-/// 已确认、等待后端回包的电源动作（决定回包后是退出还是继续演示）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowerAction {
     Restart,
@@ -351,7 +145,7 @@ pub enum LogLevel {
     Err,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StatusEntry {
     pub time: String,
     pub level: LogLevel,
@@ -368,67 +162,77 @@ pub enum Phase {
     BackendLost,
 }
 
-pub struct App {
-    pub focus: FocusPanel,
-    pub basic_field: BasicField,
-    pub cache: CacheForm,
-    pub should_quit: bool,
+pub struct UwfApp {
     pub backend_kind: BackendKind,
     pub phase: Phase,
     pub snapshot: FullSnapshot,
-    pub volumes_state: TableState,
+    pub cache: CacheForm,
+    pub selected_volume_drive: Option<String>,
     /// 排除列表视图：true = 当前生效（只读），false = 重启后生效（默认，可编辑）
     pub exclusion_session_current: bool,
-    pub exclusion_state: ListState,
-    /// 刷新/排序后用于恢复选中身份的稳定 key
-    selected_exclusion_key: Option<ExclusionItem>,
+    pub exclusion_filter: ExclusionFilter,
+    /// 跨刷新/切换视图保持选中身份的稳定 key
+    pub selected_exclusion_key: Option<ExclusionItem>,
     pub modal: Option<Modal>,
-    pub last_log: Option<StatusEntry>,
-    pub regions: UiRegions,
-    /// 当前在途的变更请求；只有匹配 id 的 Finished / NotInstalled 才能清除
+    pub logs: VecDeque<StatusEntry>,
+    pub show_log_drawer: bool,
+    /// 当前在途变更请求 id；仅匹配回包可解除锁定
     pub mutation: Option<RequestId>,
-    /// 记录提交中的缓存保存请求 id，成功后清除 dirty 并同步表单
     pending_cache_save: Option<RequestId>,
-    /// 电源动作绑定到具体请求 id，避免被无关回包误触发
     power_action: Option<(RequestId, PowerAction)>,
     next_request_id: RequestId,
     last_overlay_tick: Instant,
+    pub should_quit: bool,
+    force_close_confirmed: bool,
     cmd_tx: Sender<BackendCommand>,
-    ui_rx: Receiver<UiEvent>,
+    event_rx: Receiver<BackendEvent>,
+    file_dialog: Box<dyn FileDialogService>,
+    active_file_dialog: Option<(FileDialogTarget, Receiver<Option<PathBuf>>)>,
 }
 
-impl App {
+impl UwfApp {
     pub fn new(
         cmd_tx: Sender<BackendCommand>,
-        ui_rx: Receiver<UiEvent>,
+        event_rx: Receiver<BackendEvent>,
         backend_kind: BackendKind,
     ) -> Self {
-        let mut volumes_state = TableState::default();
-        volumes_state.select(Some(0));
-        let mut exclusion_state = ListState::default();
-        exclusion_state.select(Some(0));
+        Self::new_with_file_dialog(
+            cmd_tx,
+            event_rx,
+            backend_kind,
+            Box::new(RfdFileDialogService),
+        )
+    }
+
+    pub fn new_with_file_dialog(
+        cmd_tx: Sender<BackendCommand>,
+        event_rx: Receiver<BackendEvent>,
+        backend_kind: BackendKind,
+        file_dialog: Box<dyn FileDialogService>,
+    ) -> Self {
         Self {
-            focus: FocusPanel::BasicSettings,
-            basic_field: BasicField::WriteFilter,
-            cache: CacheForm::default(),
-            should_quit: false,
             backend_kind,
             phase: Phase::Loading,
             snapshot: FullSnapshot::default(),
-            volumes_state,
+            cache: CacheForm::default(),
+            selected_volume_drive: None,
             exclusion_session_current: false,
-            exclusion_state,
+            exclusion_filter: ExclusionFilter::All,
             selected_exclusion_key: None,
-            last_log: None,
-            regions: UiRegions::default(),
+            modal: None,
+            logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
+            show_log_drawer: false,
             mutation: None,
             pending_cache_save: None,
             power_action: None,
             next_request_id: 1,
             last_overlay_tick: Instant::now(),
-            modal: None,
+            should_quit: false,
+            force_close_confirmed: false,
             cmd_tx,
-            ui_rx,
+            event_rx,
+            file_dialog,
+            active_file_dialog: None,
         }
     }
 
@@ -438,6 +242,18 @@ impl App {
 
     pub fn is_pending(&self) -> bool {
         self.mutation.is_some()
+    }
+
+    pub fn is_file_dialog_open(&self) -> bool {
+        self.active_file_dialog.is_some()
+    }
+
+    pub fn last_log(&self) -> Option<&StatusEntry> {
+        self.logs.back()
+    }
+
+    pub fn push_ok(&mut self, msg: impl AsRef<str>) {
+        self.log(true, msg.as_ref());
     }
 
     fn next_request_id(&mut self) -> RequestId {
@@ -471,7 +287,7 @@ impl App {
         }
     }
 
-    fn send_overlay_refresh(&mut self) {
+    pub fn send_overlay_refresh(&mut self) {
         if self.phase != Phase::Ready || self.is_pending() {
             return;
         }
@@ -480,7 +296,7 @@ impl App {
         }
     }
 
-    fn begin_mutation(&mut self, cmd: BackendCmd) -> Option<RequestId> {
+    pub fn begin_mutation(&mut self, cmd: BackendCmd) -> Option<RequestId> {
         if self.phase == Phase::BackendLost {
             self.log(false, "后端线程已退出，请重启应用");
             return None;
@@ -505,52 +321,44 @@ impl App {
         let _ = self.send(BackendCommand::Quit);
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        while !self.should_quit {
-            if let Some(Modal::FilePicker(picker)) = &mut self.modal {
-                picker.poll();
-            }
-            terminal.draw(|frame| crate::ui::render(frame, self))?;
+    // ── 后端与原生对话框事件排空 ──
 
-            let mut timeout = OVERLAY_POLL.saturating_sub(self.last_overlay_tick.elapsed());
-            if let Some(Modal::FilePicker(picker)) = &self.modal
-                && picker.is_polling()
-            {
-                timeout = timeout.min(Duration::from_millis(50));
-            }
-            match self.ui_rx.recv_timeout(timeout) {
-                Ok(evt) => {
-                    self.handle_ui_event(evt);
-                    while let Ok(evt) = self.ui_rx.try_recv() {
-                        self.handle_ui_event(evt);
+    pub fn drain_events(&mut self) {
+        while let Ok(evt) = self.event_rx.try_recv() {
+            self.apply_event(evt);
+        }
+    }
+
+    fn poll_file_dialog(&mut self) {
+        let Some((target, rx)) = self.active_file_dialog.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(path)) => match target {
+                FileDialogTarget::InputFill => {
+                    if let Some(Modal::Input(state)) = &mut self.modal {
+                        state.set_browsed_path(&path);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                FileDialogTarget::ImportExclusions => {
+                    let _ = self.begin_mutation(BackendCmd::ImportExclusions { path });
+                }
+                FileDialogTarget::ExportExclusions => {
+                    let _ = self.begin_mutation(BackendCmd::ExportExclusions {
+                        path,
+                        current_session: self.exclusion_session_current,
+                    });
+                }
+            },
+            Ok(None) => {}
+            Err(TryRecvError::Empty) => {
+                self.active_file_dialog = Some((target, rx));
             }
-
-            if self.last_overlay_tick.elapsed() >= OVERLAY_POLL {
-                self.last_overlay_tick = Instant::now();
-                self.send_overlay_refresh();
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn handle_ui_event(&mut self, evt: UiEvent) {
-        match evt {
-            UiEvent::Terminal(Event::Key(key))
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-            {
-                self.on_key(key)
-            }
-            UiEvent::Terminal(Event::Mouse(mouse)) => self.on_mouse(mouse),
-            UiEvent::Terminal(_) => {}
-            UiEvent::Backend(evt) => self.apply_event(evt),
+            Err(TryRecvError::Disconnected) => {}
         }
     }
 
-    fn apply_event(&mut self, evt: BackendEvent) {
+    pub fn apply_event(&mut self, evt: BackendEvent) {
         match evt {
             BackendEvent::Snapshot(snapshot) => {
                 let first_ready = self.phase != Phase::Ready;
@@ -558,12 +366,8 @@ impl App {
                 self.phase = Phase::Ready;
                 if first_ready || !self.cache.dirty {
                     self.cache.sync_from_snapshot(&self.snapshot);
-                } else {
-                    self.cache
-                        .ensure_unlocked_field(is_overlay_locked(&self.snapshot));
                 }
-                self.clamp_selections();
-                self.restore_selection();
+                self.reconcile_selections();
                 self.log(true, "已刷新 UWF 全部状态");
                 if !self.snapshot.warnings.is_empty() {
                     let combined = self.snapshot.warnings.join("；");
@@ -572,6 +376,10 @@ impl App {
             }
             BackendEvent::OverlayRuntime(runtime) => {
                 self.snapshot.overlay_runtime = Some(runtime);
+                if !self.cache.dirty {
+                    self.cache.warning_text = runtime.warning_threshold_mb.to_string();
+                    self.cache.critical_text = runtime.critical_threshold_mb.to_string();
+                }
             }
             BackendEvent::RefreshFailed(msg) => {
                 self.log(false, &msg);
@@ -672,14 +480,57 @@ impl App {
     }
 
     fn push_log(&mut self, level: LogLevel, text: &str) {
-        self.last_log = Some(StatusEntry {
+        if self.logs.len() >= MAX_LOG_ENTRIES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(StatusEntry {
             time: chrono::Local::now().format("%H:%M:%S").to_string(),
             level,
             text: text.to_string(),
         });
     }
 
-    /// 当前排除列表视图下的全部条目（文件在前、注册表在后）
+    // ── 选择状态与身份保持 ──
+
+    fn reconcile_selections(&mut self) {
+        // 卷选中：若原选盘符仍在列表则保持，否则默认选第一行
+        let still_exists = self.selected_volume_drive.as_ref().is_some_and(|sel| {
+            self.snapshot
+                .volumes
+                .iter()
+                .any(|v| v.drive_letter.eq_ignore_ascii_case(sel))
+        });
+        if !still_exists {
+            self.selected_volume_drive = self
+                .snapshot
+                .volumes
+                .first()
+                .map(|v| v.drive_letter.clone());
+        }
+
+        // 排除项选中：仅在非空可见区且原 key 消失时回退首个，保留跨空视图切换的身份记忆
+        let visible = self.visible_exclusions();
+        if let Some(key) = &self.selected_exclusion_key {
+            if !visible.is_empty() && !visible.contains(key) && !self.exclusion_session_current {
+                self.selected_exclusion_key = visible.into_iter().next();
+            }
+        } else if !visible.is_empty() {
+            self.selected_exclusion_key = visible.into_iter().next();
+        }
+    }
+
+    pub fn selected_volume(&self) -> Option<&VolumeInfo> {
+        let drive = self.selected_volume_drive.as_ref()?;
+        self.snapshot
+            .volumes
+            .iter()
+            .find(|v| v.drive_letter.eq_ignore_ascii_case(drive))
+    }
+
+    pub fn select_volume(&mut self, drive_letter: String) {
+        self.selected_volume_drive = Some(drive_letter);
+    }
+
     pub fn visible_exclusions(&self) -> Vec<ExclusionItem> {
         let (files, regs) = if self.exclusion_session_current {
             (
@@ -698,402 +549,51 @@ impl App {
         items
     }
 
-    pub fn selected_exclusion(&self) -> Option<ExclusionItem> {
-        let items = self.visible_exclusions();
-        self.exclusion_state
-            .selected()
-            .and_then(|i| items.get(i).cloned())
-    }
-
-    fn remember_selection(&mut self) {
-        self.selected_exclusion_key = self.selected_exclusion();
-    }
-
-    fn restore_selection(&mut self) {
-        let items = self.visible_exclusions();
-        let hit = self
-            .selected_exclusion_key
-            .as_ref()
-            .and_then(|key| items.iter().position(|item| item == key));
-        match hit {
-            Some(i) => self.exclusion_state.select(Some(i)),
-            None => self.selected_exclusion_key = self.selected_exclusion(),
-        }
-    }
-
-    fn clamp_selections(&mut self) {
-        let volumes_len = self.snapshot.volumes.len();
-        let exclusions_len = self.visible_exclusions().len();
-        clamp(self.volumes_state.selected_mut(), volumes_len);
-        clamp(self.exclusion_state.selected_mut(), exclusions_len);
-    }
-
-    fn selected_volume(&self) -> Option<&crate::model::VolumeInfo> {
-        self.volumes_state
-            .selected()
-            .and_then(|i| self.snapshot.volumes.get(i))
-    }
-
-    // ── 键盘路由 ──
-
-    fn on_key(&mut self, key: KeyEvent) {
-        if self.modal.is_some() {
-            self.on_modal_key(key);
-            return;
-        }
-        match self.phase {
-            Phase::NotInstalled => match key.code {
-                KeyCode::F(5) => self.refresh_all(),
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
-                KeyCode::Char('?') | KeyCode::F(1) => {
-                    self.modal = Some(Modal::Help(HelpState::default()))
-                }
-                _ => {}
-            },
-            Phase::BackendLost => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Char('?') | KeyCode::F(1) => {
-                    self.modal = Some(Modal::Help(HelpState::default()))
-                }
-                _ => self.log(false, "后端线程已退出，请重启应用"),
-            },
-            Phase::Loading | Phase::LoadFailed => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
-                KeyCode::Tab => self.cycle_focus(true),
-                KeyCode::BackTab => self.cycle_focus(false),
-                KeyCode::Char('?') | KeyCode::F(1) => {
-                    self.modal = Some(Modal::Help(HelpState::default()))
-                }
-                KeyCode::F(5) => self.refresh_all(),
-                _ => {}
-            },
-            Phase::Ready => self.on_ready_key(key),
-        }
-    }
-
-    fn on_ready_key(&mut self, key: KeyEvent) {
-        // Alt+1..4 直达分区
-        if key.modifiers.contains(KeyModifiers::ALT)
-            && let KeyCode::Char(c @ '1'..='4') = key.code
-        {
-            self.focus = FocusPanel::ALL[c as usize - '1' as usize];
-            self.on_focus_entered();
-            return;
-        }
-
-        match key.code {
-            KeyCode::Tab => self.cycle_focus(true),
-            KeyCode::BackTab => self.cycle_focus(false),
-            KeyCode::F(1) | KeyCode::Char('?') => {
-                self.modal = Some(Modal::Help(HelpState::default()))
-            }
-            KeyCode::F(5) => self.refresh_all(),
-            KeyCode::F(9) => self.open_reset_confirm(),
-            KeyCode::F(10) => self.open_restart_confirm(),
-            KeyCode::F(11) => self.open_shutdown_confirm(),
-            KeyCode::Char('c') | KeyCode::Char('C') => self.open_commit_menu(),
-            KeyCode::Char('i') | KeyCode::Char('I') => self.open_import_picker(),
-            KeyCode::Char('x') | KeyCode::Char('X') => self.export_exclusions(),
-            KeyCode::Char('q') | KeyCode::Char('Q') => self.request_quit(),
-            KeyCode::Esc => {
-                if self.focus == FocusPanel::CacheSettings && self.cache.dirty {
-                    self.cache.sync_from_snapshot(&self.snapshot);
-                    self.log_warn("已放弃未保存的缓存设置修改");
-                } else {
-                    self.request_quit();
-                }
-            }
-            _ => match self.focus {
-                FocusPanel::BasicSettings => self.on_basic_key(key),
-                FocusPanel::CacheSettings => self.on_cache_key(key),
-                FocusPanel::Volumes => self.on_volumes_key(key),
-                FocusPanel::Exclusions => self.on_exclusions_key(key),
-            },
-        }
-    }
-
-    fn cycle_focus(&mut self, forward: bool) {
-        self.focus = if forward {
-            self.focus.next()
-        } else {
-            self.focus.prev()
-        };
-        self.on_focus_entered();
-    }
-
-    fn on_focus_entered(&mut self) {
-        if self.focus == FocusPanel::CacheSettings {
-            self.cache
-                .ensure_unlocked_field(is_overlay_locked(&self.snapshot));
-        }
-    }
-
-    fn on_basic_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up | KeyCode::Down => {
-                self.basic_field = match self.basic_field {
-                    BasicField::WriteFilter => BasicField::OverlayType,
-                    BasicField::OverlayType => BasicField::WriteFilter,
-                };
-            }
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
-                match self.basic_field {
-                    BasicField::WriteFilter => self.toggle_write_filter(),
-                    BasicField::OverlayType => self.toggle_overlay_type(),
-                }
-            }
-            KeyCode::Char('e') | KeyCode::Char('E') => {
-                let _ = self.begin_mutation(BackendCmd::EnableFilter);
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                let _ = self.begin_mutation(BackendCmd::DisableFilter);
-            }
-            _ => {}
-        }
-    }
-
-    fn on_cache_key(&mut self, key: KeyEvent) {
-        let locked = is_overlay_locked(&self.snapshot);
-        match key.code {
-            KeyCode::Up => self.cache.move_field(-1, locked),
-            KeyCode::Down => self.cache.move_field(1, locked),
-            KeyCode::Enter => self.submit_cache_settings(),
-            KeyCode::Char(' ') if self.cache.field == CacheField::ConfirmButton => {
-                self.submit_cache_settings()
-            }
-            _ => {
-                if let Some(field) = self.cache.active_input_mut(locked) {
-                    let changed = field.on_key(key);
-                    if changed {
-                        self.cache.dirty = true;
-                        self.cache.error = None;
+    /// 供 UI 渲染使用：按 [`ExclusionFilter`] 过滤，并标明是否已存在于当前会话。
+    pub fn filtered_exclusions(&self) -> Vec<(ExclusionItem, bool)> {
+        self.visible_exclusions()
+            .into_iter()
+            .filter(|item| match self.exclusion_filter {
+                ExclusionFilter::All => true,
+                ExclusionFilter::Files => !item.is_registry(),
+                ExclusionFilter::Registry => item.is_registry(),
+            })
+            .map(|item| {
+                let in_current = match &item {
+                    ExclusionItem::File(f) => self.snapshot.file_exclusions_current.contains(f),
+                    ExclusionItem::Registry(k) => {
+                        self.snapshot.registry_exclusions_current.contains(k)
                     }
-                }
-            }
-        }
+                };
+                (item, in_current)
+            })
+            .collect()
     }
 
-    fn on_volumes_key(&mut self, key: KeyEvent) {
-        let len = self.snapshot.volumes.len();
-        match key.code {
-            KeyCode::Up => move_selection(self.volumes_state.selected_mut(), len, -1),
-            KeyCode::Down => move_selection(self.volumes_state.selected_mut(), len, 1),
-            KeyCode::Home => select_edge(self.volumes_state.selected_mut(), len, false),
-            KeyCode::End => select_edge(self.volumes_state.selected_mut(), len, true),
-            KeyCode::Char('p') | KeyCode::Char('P') => self.protect_selected(true),
-            KeyCode::Char('u') | KeyCode::Char('U') => self.protect_selected(false),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(vol) = self.selected_volume() {
-                    let target = !vol.next_protected;
-                    self.protect_selected(target);
-                }
-            }
-            _ => {}
-        }
+    pub fn select_exclusion(&mut self, item: ExclusionItem) {
+        self.selected_exclusion_key = Some(item);
     }
 
-    fn on_exclusions_key(&mut self, key: KeyEvent) {
-        let len = self.visible_exclusions().len();
-        match key.code {
-            KeyCode::Up => {
-                move_selection(self.exclusion_state.selected_mut(), len, -1);
-                self.remember_selection();
-            }
-            KeyCode::Down => {
-                move_selection(self.exclusion_state.selected_mut(), len, 1);
-                self.remember_selection();
-            }
-            KeyCode::Home => {
-                select_edge(self.exclusion_state.selected_mut(), len, false);
-                self.remember_selection();
-            }
-            KeyCode::End => {
-                select_edge(self.exclusion_state.selected_mut(), len, true);
-                self.remember_selection();
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_exclusion_view(),
-            KeyCode::Char('a') | KeyCode::Char('A') => self.open_add_file_exclusion(),
-            KeyCode::Char('r') | KeyCode::Char('R') => self.open_add_registry_exclusion(),
-            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete
-                if self.ensure_mutable_exclusions() =>
-            {
-                self.delete_selected_exclusion();
-            }
-            _ => {}
-        }
+    pub fn selected_exclusion(&self) -> Option<ExclusionItem> {
+        let key = self.selected_exclusion_key.as_ref()?;
+        self.filtered_exclusions()
+            .into_iter()
+            .find(|(item, _)| item == key)
+            .map(|(item, _)| item)
     }
 
-    // ── 鼠标路由 ──
-
-    fn on_mouse(&mut self, mouse: MouseEvent) {
-        if let Some(modal) = self.modal.take() {
-            self.on_modal_mouse(modal, mouse);
-            return;
-        }
-        if self.phase == Phase::NotInstalled {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let pos = Position::new(mouse.column, mouse.row);
-                if self.regions.ni_retry_btn.contains(pos) {
-                    self.refresh_all();
-                } else if self.regions.ni_quit_btn.contains(pos) {
-                    self.request_quit();
-                }
-            }
-            return;
-        }
-        if self.phase == Phase::BackendLost {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let pos = Position::new(mouse.column, mouse.row);
-                if self.regions.quit_btn.contains(pos) {
-                    self.should_quit = true;
-                } else if self.regions.help_btn.contains(pos) {
-                    self.modal = Some(Modal::Help(HelpState::default()));
-                }
-            }
-            return;
-        }
-
-        let pos = Position::new(mouse.column, mouse.row);
-        match mouse.kind {
-            MouseEventKind::ScrollUp if self.phase == Phase::Ready => {
-                if self.regions.panel_volumes.contains(pos) {
-                    self.focus = FocusPanel::Volumes;
-                    let len = self.snapshot.volumes.len();
-                    move_selection(self.volumes_state.selected_mut(), len, -1);
-                } else if self.regions.panel_exclusions.contains(pos) {
-                    self.focus = FocusPanel::Exclusions;
-                    let len = self.visible_exclusions().len();
-                    move_selection(self.exclusion_state.selected_mut(), len, -1);
-                    self.remember_selection();
-                }
-            }
-            MouseEventKind::ScrollDown if self.phase == Phase::Ready => {
-                if self.regions.panel_volumes.contains(pos) {
-                    self.focus = FocusPanel::Volumes;
-                    let len = self.snapshot.volumes.len();
-                    move_selection(self.volumes_state.selected_mut(), len, 1);
-                } else if self.regions.panel_exclusions.contains(pos) {
-                    self.focus = FocusPanel::Exclusions;
-                    let len = self.visible_exclusions().len();
-                    move_selection(self.exclusion_state.selected_mut(), len, 1);
-                    self.remember_selection();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => self.on_left_click(pos),
-            _ => {}
-        }
+    pub fn set_exclusion_session(&mut self, current: bool) {
+        self.exclusion_session_current = current;
+        self.reconcile_selections();
     }
 
-    fn on_left_click(&mut self, pos: Position) {
-        // 顶部通用按钮在 Loading / LoadFailed / Ready 均可用
-        if self.regions.refresh_btn.contains(pos) {
-            self.refresh_all();
-            return;
-        }
-        if self.regions.help_btn.contains(pos) {
-            self.modal = Some(Modal::Help(HelpState::default()));
-            return;
-        }
-        if self.regions.quit_btn.contains(pos) {
-            self.request_quit();
-            return;
-        }
-        if self.phase != Phase::Ready {
-            return;
-        }
-
-        if self.regions.commit_btn.contains(pos) {
-            self.open_commit_menu();
-        } else if self.regions.reset_btn.contains(pos) {
-            self.open_reset_confirm();
-        } else if self.regions.filter_toggle.contains(pos) {
-            self.focus = FocusPanel::BasicSettings;
-            self.basic_field = BasicField::WriteFilter;
-            self.toggle_write_filter();
-        } else if self.regions.overlay_type_toggle.contains(pos) {
-            self.focus = FocusPanel::BasicSettings;
-            self.basic_field = BasicField::OverlayType;
-            self.toggle_overlay_type();
-        } else if self.regions.max_size_input.contains(pos) {
-            self.focus = FocusPanel::CacheSettings;
-            if is_overlay_locked(&self.snapshot) {
-                self.log(false, "筛选器当前已启用，最大缓存不可修改");
-            } else {
-                self.cache.field = CacheField::MaxSize;
-                self.cache.max_size.move_end();
-            }
-        } else if self.regions.warning_input.contains(pos) {
-            self.focus = FocusPanel::CacheSettings;
-            self.cache.field = CacheField::WarningThreshold;
-            self.cache.warning.move_end();
-        } else if self.regions.critical_input.contains(pos) {
-            self.focus = FocusPanel::CacheSettings;
-            self.cache.field = CacheField::CriticalThreshold;
-            self.cache.critical.move_end();
-        } else if self.regions.cache_confirm_btn.contains(pos) {
-            self.focus = FocusPanel::CacheSettings;
-            self.cache.field = CacheField::ConfirmButton;
-            self.submit_cache_settings();
-        } else if self.regions.volume_rows.contains(pos) {
-            self.focus = FocusPanel::Volumes;
-            let row = (pos.y - self.regions.volume_rows.y) as usize + self.volumes_state.offset();
-            if row < self.snapshot.volumes.len() {
-                self.volumes_state.select(Some(row));
-            }
-        } else if self.regions.protect_btn.contains(pos) {
-            self.focus = FocusPanel::Volumes;
-            self.protect_selected(true);
-        } else if self.regions.unprotect_btn.contains(pos) {
-            self.focus = FocusPanel::Volumes;
-            self.protect_selected(false);
-        } else if self.regions.exclusion_rows.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            let items = self.visible_exclusions();
-            let row =
-                (pos.y - self.regions.exclusion_rows.y) as usize + self.exclusion_state.offset();
-            if row < items.len() {
-                self.exclusion_state.select(Some(row));
-                self.remember_selection();
-            }
-        } else if self.regions.excl_add_file_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            self.open_add_file_exclusion();
-        } else if self.regions.excl_add_reg_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            self.open_add_registry_exclusion();
-        } else if self.regions.excl_delete_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            if self.ensure_mutable_exclusions() {
-                self.delete_selected_exclusion();
-            }
-        } else if self.regions.excl_view_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            self.toggle_exclusion_view();
-        } else if self.regions.import_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            self.open_import_picker();
-        } else if self.regions.export_btn.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-            self.export_exclusions();
-        } else if self.regions.restart_btn.contains(pos) {
-            self.open_restart_confirm();
-        } else if self.regions.shutdown_btn.contains(pos) {
-            self.open_shutdown_confirm();
-        } else if self.regions.panel_basic.contains(pos) {
-            self.focus = FocusPanel::BasicSettings;
-        } else if self.regions.panel_cache.contains(pos) {
-            self.focus = FocusPanel::CacheSettings;
-            self.on_focus_entered();
-        } else if self.regions.panel_volumes.contains(pos) {
-            self.focus = FocusPanel::Volumes;
-        } else if self.regions.panel_exclusions.contains(pos) {
-            self.focus = FocusPanel::Exclusions;
-        }
+    pub fn set_exclusion_filter(&mut self, filter: ExclusionFilter) {
+        self.exclusion_filter = filter;
     }
 
-    // ── 业务动作分派 ──
+    // ── 业务操作派发 ──
 
-    fn toggle_write_filter(&mut self) {
+    pub fn toggle_write_filter(&mut self) {
         let Some(state) = self.snapshot.filter_state else {
             return;
         };
@@ -1105,22 +605,22 @@ impl App {
         let _ = self.begin_mutation(cmd);
     }
 
-    fn toggle_overlay_type(&mut self) {
+    pub fn set_overlay_type(&mut self, next_type: OverlayType) {
         if is_overlay_locked(&self.snapshot) {
-            self.log(false, "筛选器当前已启用，需禁用并重启后才可修改覆盖类型");
+            self.log(false, "筛选器当前已启用，需禁用并重启后才可修改缓存模式");
             return;
         }
-        let Some(cfg) = self.snapshot.overlay_config_next else {
+        if self
+            .snapshot
+            .overlay_config_next
+            .is_some_and(|c| c.overlay_type == next_type)
+        {
             return;
-        };
-        let next_type = match cfg.overlay_type {
-            OverlayType::Ram => OverlayType::Disk,
-            OverlayType::Disk => OverlayType::Ram,
-        };
+        }
         let _ = self.begin_mutation(BackendCmd::SetOverlayType(next_type));
     }
 
-    fn submit_cache_settings(&mut self) {
+    pub fn submit_cache_settings(&mut self) {
         match self.cache.validate(&self.snapshot) {
             Ok((max_mb, warning_mb, critical_mb)) => {
                 self.cache.error = None;
@@ -1139,7 +639,11 @@ impl App {
         }
     }
 
-    fn protect_selected(&mut self, protect: bool) {
+    pub fn reset_cache_form(&mut self) {
+        self.cache.sync_from_snapshot(&self.snapshot);
+    }
+
+    pub fn protect_selected(&mut self, protect: bool) {
         let Some(drive) = self.selected_volume().map(|v| v.drive_letter.clone()) else {
             return;
         };
@@ -1151,53 +655,121 @@ impl App {
         let _ = self.begin_mutation(cmd);
     }
 
-    fn toggle_exclusion_view(&mut self) {
-        self.exclusion_session_current = !self.exclusion_session_current;
-        self.clamp_selections();
-        if !self.exclusion_session_current {
-            self.restore_selection();
-        }
-    }
-
-    fn open_add_file_exclusion(&mut self) {
+    pub fn open_add_file_exclusion(&mut self, folder: bool) {
         if !self.ensure_mutable_exclusions() {
             return;
         }
+        let (title, hint, browse) = if folder {
+            (
+                "添加文件夹排除",
+                "输入文件夹绝对路径（如 C:\\Windows\\Temp），或点击右侧选择目录",
+                BrowseKind::Folder,
+            )
+        } else {
+            (
+                "添加文件排除",
+                "输入文件绝对路径（如 C:\\data\\app.log），或点击右侧浏览文件",
+                BrowseKind::File,
+            )
+        };
         self.open_action_modal(Modal::Input(InputState::new(
-            "添加文件/目录排除",
-            "输入绝对路径（如 C:\\Windows\\Temp），或按 [F2] / 点击浏览选择",
+            title,
+            "目标绝对路径",
+            hint,
             InputAction::AddFileExclusion,
-            true,
+            browse,
         )));
     }
 
-    fn open_add_registry_exclusion(&mut self) {
+    pub fn open_add_registry_exclusion(&mut self) {
         if !self.ensure_mutable_exclusions() {
             return;
         }
         self.open_action_modal(Modal::Input(InputState::new(
             "添加注册表排除",
-            "输入注册表键路径（如 HKLM\\SOFTWARE\\Example）",
+            "注册表键路径",
+            "输入完整注册表路径（如 HKLM\\SOFTWARE\\Example）",
             InputAction::AddRegistryExclusion,
-            false,
+            BrowseKind::None,
         )));
     }
 
-    fn open_import_picker(&mut self) {
+    pub fn delete_selected_exclusion(&mut self) {
         if !self.ensure_mutable_exclusions() {
             return;
         }
-        self.open_action_modal(Modal::FilePicker(FilePickerState::new(
-            PickerMode::File,
-            PickerAction::ImportExclusions,
-        )));
+        match self.selected_exclusion() {
+            Some(ExclusionItem::File(f)) => {
+                let _ = self.begin_mutation(BackendCmd::RemoveFileExclusion(f.display()));
+            }
+            Some(ExclusionItem::Registry(k)) => {
+                let _ = self.begin_mutation(BackendCmd::RemoveRegistryExclusion(k));
+            }
+            None => {}
+        }
     }
 
-    fn open_commit_menu(&mut self) {
-        self.open_action_modal(Modal::CommitMenu(CommitMenuState::new()));
+    pub fn open_import_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ensure_mutable_exclusions() || self.phase != Phase::Ready || self.is_busy() {
+            return;
+        }
+        self.launch_file_dialog(
+            FileDialogTarget::ImportExclusions,
+            FileDialogKind::PickImportTxt {
+                title: "选择要导入的排除列表 (.txt)".to_string(),
+            },
+            ctx,
+        );
     }
 
-    fn open_reset_confirm(&mut self) {
+    pub fn open_export_dialog(&mut self, ctx: &egui::Context) {
+        if self.phase != Phase::Ready || self.is_busy() {
+            return;
+        }
+        let default_name = chrono::Local::now()
+            .format("EXCLUSIONLIST_%Y_%m_%d_%H_%M_%S.txt")
+            .to_string();
+        self.launch_file_dialog(
+            FileDialogTarget::ExportExclusions,
+            FileDialogKind::SaveExportTxt {
+                title: "导出排除列表为文本文件".to_string(),
+                default_name,
+            },
+            ctx,
+        );
+    }
+
+    pub fn open_input_browse(&mut self, kind: BrowseKind, ctx: &egui::Context) {
+        let dialog_kind = match kind {
+            BrowseKind::File => FileDialogKind::PickFile {
+                title: "选择目标文件".to_string(),
+            },
+            BrowseKind::Folder => FileDialogKind::PickFolder {
+                title: "选择目标文件夹".to_string(),
+            },
+            BrowseKind::None => return,
+        };
+        self.launch_file_dialog(FileDialogTarget::InputFill, dialog_kind, ctx);
+    }
+
+    fn launch_file_dialog(
+        &mut self,
+        target: FileDialogTarget,
+        kind: FileDialogKind,
+        ctx: &egui::Context,
+    ) {
+        if self.active_file_dialog.is_some() {
+            return;
+        }
+        let rx = self.file_dialog.open(kind, ctx);
+        self.active_file_dialog = Some((target, rx));
+    }
+
+    pub fn open_commit_menu(&mut self) {
+        self.open_action_modal(Modal::CommitMenu);
+    }
+
+    pub fn open_reset_confirm(&mut self) {
         self.open_action_modal(Modal::Confirm(ConfirmState::new(
             "重置配置确认",
             "将重置全部 UWF 配置（写入过滤 / 缓存 / 分区保护 / 排除项），\n下次重启后恢复默认值。确定继续？",
@@ -1205,7 +777,7 @@ impl App {
         )));
     }
 
-    fn open_restart_confirm(&mut self) {
+    pub fn open_restart_confirm(&mut self) {
         self.open_action_modal(Modal::Confirm(ConfirmState::new(
             "重启系统确认",
             "系统将立即重启，未保存的工作将丢失。\n确定继续？",
@@ -1213,7 +785,7 @@ impl App {
         )));
     }
 
-    fn open_shutdown_confirm(&mut self) {
+    pub fn open_shutdown_confirm(&mut self) {
         self.open_action_modal(Modal::Confirm(ConfirmState::new(
             "关机确认",
             "系统将立即关机，未保存的工作将丢失。\n确定继续？",
@@ -1221,16 +793,8 @@ impl App {
         )));
     }
 
-    fn request_quit(&mut self) {
-        if self.is_pending() {
-            self.modal = Some(Modal::Confirm(ConfirmState::new(
-                "退出确认",
-                "有操作正在执行，退出可能中断 WMI 调用。确定退出？",
-                ConfirmAction::Quit,
-            )));
-        } else {
-            self.should_quit = true;
-        }
+    pub fn open_help(&mut self) {
+        self.modal = Some(Modal::Help);
     }
 
     fn open_action_modal(&mut self, modal: Modal) {
@@ -1246,119 +810,84 @@ impl App {
 
     fn ensure_mutable_exclusions(&mut self) -> bool {
         if self.exclusion_session_current {
-            self.log(
-                false,
-                "当前生效视图只读，请按 [S] 或点击视图按钮切换到重启后视图",
-            );
+            self.log(false, "当前生效视图只读，请切换到「重启后生效 (可编辑)」");
             false
         } else {
             true
         }
     }
 
-    // ── 模态按键/鼠标与结果执行 ──
+    // ── 弹窗回调 ──
 
-    fn on_modal_key(&mut self, key: KeyEvent) {
-        let Some(modal) = self.modal.take() else {
-            return;
-        };
-        match modal {
-            Modal::Help(state) => {
-                if !state.on_key(key) {
-                    self.modal = Some(Modal::Help(state));
-                }
-            }
-            Modal::Confirm(mut state) => match state.on_key(key) {
-                ConfirmOutcome::Stay => self.modal = Some(Modal::Confirm(state)),
-                ConfirmOutcome::Cancel => {}
-                ConfirmOutcome::Confirm(action) => self.execute_confirm(action),
-            },
-            Modal::Input(mut state) => match state.on_key(key) {
-                InputOutcome::Stay => self.modal = Some(Modal::Input(state)),
-                InputOutcome::Cancel => {}
-                InputOutcome::Submit(action, text) => self.execute_input(action, text),
-                InputOutcome::Browse => {
-                    self.modal = Some(Modal::FilePicker(FilePickerState::new(
-                        PickerMode::Any,
-                        PickerAction::AddFileExclusion,
-                    )));
-                }
-            },
-            Modal::FilePicker(mut state) => match state.on_key(key) {
-                PickerOutcome::Stay => self.modal = Some(Modal::FilePicker(state)),
-                PickerOutcome::Cancel => {}
-                PickerOutcome::Pick(action, path) => self.execute_pick(action, path),
-            },
-            Modal::CommitMenu(mut state) => match state.on_key(key) {
-                CommitMenuOutcome::Stay => self.modal = Some(Modal::CommitMenu(state)),
-                CommitMenuOutcome::Cancel => {}
-                CommitMenuOutcome::Select(choice) => self.execute_commit_choice(choice),
-            },
-        }
-    }
-
-    fn on_modal_mouse(&mut self, modal: Modal, mouse: MouseEvent) {
-        match modal {
-            Modal::Help(state) => {
-                if !state.on_mouse(mouse) {
-                    self.modal = Some(Modal::Help(state));
-                }
-            }
-            Modal::Confirm(mut state) => match state.on_mouse(mouse) {
-                ConfirmOutcome::Stay => self.modal = Some(Modal::Confirm(state)),
-                ConfirmOutcome::Cancel => {}
-                ConfirmOutcome::Confirm(action) => self.execute_confirm(action),
-            },
-            Modal::Input(mut state) => match state.on_mouse(mouse) {
-                InputOutcome::Stay => self.modal = Some(Modal::Input(state)),
-                InputOutcome::Cancel => {}
-                InputOutcome::Submit(action, text) => self.execute_input(action, text),
-                InputOutcome::Browse => {
-                    self.modal = Some(Modal::FilePicker(FilePickerState::new(
-                        PickerMode::Any,
-                        PickerAction::AddFileExclusion,
-                    )));
-                }
-            },
-            Modal::FilePicker(mut state) => match state.on_mouse(mouse) {
-                PickerOutcome::Stay => self.modal = Some(Modal::FilePicker(state)),
-                PickerOutcome::Cancel => {}
-                PickerOutcome::Pick(action, path) => self.execute_pick(action, path),
-            },
-            Modal::CommitMenu(mut state) => match state.on_mouse(mouse) {
-                CommitMenuOutcome::Stay => self.modal = Some(Modal::CommitMenu(state)),
-                CommitMenuOutcome::Cancel => {}
-                CommitMenuOutcome::Select(choice) => self.execute_commit_choice(choice),
-            },
-        }
-    }
-
-    fn execute_commit_choice(&mut self, choice: CommitChoice) {
+    pub fn execute_commit_choice(&mut self, choice: CommitChoice) {
         match choice {
             CommitChoice::File => {
-                self.open_action_modal(Modal::FilePicker(FilePickerState::new(
-                    PickerMode::File,
-                    PickerAction::CommitFile,
+                self.open_action_modal(Modal::Input(InputState::new(
+                    "提交文件修改",
+                    "受保护卷中的文件绝对路径",
+                    "将目标文件当前会话的更改立即固化到物理磁盘（如 C:\\data\\config.ini）",
+                    InputAction::CommitFile,
+                    BrowseKind::File,
                 )));
             }
             CommitChoice::FileDeletion => {
-                self.open_action_modal(Modal::FilePicker(FilePickerState::new(
-                    PickerMode::File,
-                    PickerAction::CommitFileDeletion,
+                self.open_action_modal(Modal::Input(InputState::new(
+                    "删除并固化文件（第 1 / 2 步）",
+                    "待删除的文件绝对路径",
+                    "先物理删除目标文件，随后向 UWF 固化删除（下一步需二次确认）",
+                    InputAction::CommitFileDeletion,
+                    BrowseKind::File,
                 )));
             }
             CommitChoice::Registry => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "注册表提交",
-                    "输入注册表完整路径（如 HKLM\\SOFTWARE\\Example\\ValueName）",
+                    "提交注册表键值",
+                    "注册表完整路径（含值名）",
+                    "格式为 键路径\\值名称（如 HKLM\\SOFTWARE\\Example\\ValueName）",
                     InputAction::CommitRegistry,
-                    false,
+                    BrowseKind::None,
                 )));
             }
         }
     }
 
-    fn execute_confirm(&mut self, action: ConfirmAction) {
+    pub fn execute_input(&mut self, action: InputAction, text: String) {
+        match action {
+            InputAction::AddFileExclusion => {
+                self.exclusion_filter = match self.exclusion_filter {
+                    ExclusionFilter::Registry => ExclusionFilter::All,
+                    other => other,
+                };
+                let _ = self.begin_mutation(BackendCmd::AddFileExclusion(text));
+            }
+            InputAction::AddRegistryExclusion => {
+                self.exclusion_filter = match self.exclusion_filter {
+                    ExclusionFilter::Files => ExclusionFilter::All,
+                    other => other,
+                };
+                let _ = self.begin_mutation(BackendCmd::AddRegistryExclusion(text));
+            }
+            InputAction::CommitFile => {
+                let _ = self.begin_mutation(BackendCmd::CommitFile(text));
+            }
+            InputAction::CommitFileDeletion => {
+                let path = PathBuf::from(&text);
+                self.modal = Some(Modal::Confirm(ConfirmState::new(
+                    "删除并固化文件确认（第 2 / 2 步）",
+                    format!(
+                        "警告：即将立即物理删除文件：\n{}\n并固化该删除，计算机重启后不会恢复。\n\n确定继续？",
+                        path.display()
+                    ),
+                    ConfirmAction::CommitFileDeletion(path),
+                )));
+            }
+            InputAction::CommitRegistry => {
+                let _ = self.begin_mutation(BackendCmd::CommitRegistry(text));
+            }
+        }
+    }
+
+    pub fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::ResetSettings => {
                 if let Some(id) = self.begin_mutation(BackendCmd::ResetSettings) {
@@ -1380,109 +909,92 @@ impl App {
                     path.to_string_lossy().into_owned(),
                 ));
             }
-            ConfirmAction::Quit => self.should_quit = true,
-        }
-    }
-
-    fn execute_input(&mut self, action: InputAction, text: String) {
-        match action {
-            InputAction::AddFileExclusion => {
-                let _ = self.begin_mutation(BackendCmd::AddFileExclusion(text));
-            }
-            InputAction::AddRegistryExclusion => {
-                let _ = self.begin_mutation(BackendCmd::AddRegistryExclusion(text));
-            }
-            InputAction::CommitRegistry => {
-                let _ = self.begin_mutation(BackendCmd::CommitRegistry(text));
+            ConfirmAction::Quit => {
+                self.force_close_confirmed = true;
+                self.should_quit = true;
             }
         }
-    }
-
-    fn execute_pick(&mut self, action: PickerAction, path: PathBuf) {
-        let path_str = path.to_string_lossy().into_owned();
-        match action {
-            PickerAction::CommitFile => {
-                let _ = self.begin_mutation(BackendCmd::CommitFile(path_str));
-            }
-            PickerAction::AddFileExclusion => {
-                let _ = self.begin_mutation(BackendCmd::AddFileExclusion(path_str));
-            }
-            PickerAction::ImportExclusions => {
-                let _ = self.begin_mutation(BackendCmd::ImportExclusions { path });
-            }
-            PickerAction::CommitFileDeletion => {
-                self.modal = Some(Modal::Confirm(ConfirmState::new(
-                    "删除提交确认",
-                    format!(
-                        "将立即删除文件:\n{}\n并固化该删除（重启后依然生效）。确定继续？",
-                        path.display()
-                    ),
-                    ConfirmAction::CommitFileDeletion(path),
-                )));
-            }
-        }
-    }
-
-    fn delete_selected_exclusion(&mut self) {
-        match self.selected_exclusion() {
-            Some(ExclusionItem::File(f)) => {
-                let _ = self.begin_mutation(BackendCmd::RemoveFileExclusion(f.display()));
-            }
-            Some(ExclusionItem::Registry(k)) => {
-                let _ = self.begin_mutation(BackendCmd::RemoveRegistryExclusion(k));
-            }
-            None => {}
-        }
-    }
-
-    fn export_exclusions(&mut self) {
-        let filename = chrono::Local::now()
-            .format("EXCLUSIONLIST_%Y_%m_%d_%H_%M_%S.txt")
-            .to_string();
-        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let path = dir.join(&filename);
-        let _ = self.begin_mutation(BackendCmd::ExportExclusions {
-            path,
-            current_session: self.exclusion_session_current,
-        });
     }
 }
 
-fn clamp(selected: &mut Option<usize>, len: usize) {
-    *selected = match (*selected, len) {
-        (_, 0) => None,
-        (None, _) => Some(0),
-        (Some(i), _) => Some(i.min(len - 1)),
-    };
-}
-
-fn select_edge(selected: &mut Option<usize>, len: usize, end: bool) {
-    *selected = if len == 0 {
-        None
-    } else if end {
-        Some(len - 1)
-    } else {
-        Some(0)
-    };
-}
-
-fn move_selection(selected: &mut Option<usize>, len: usize, delta: isize) {
-    if len == 0 {
-        *selected = None;
-        return;
+impl eframe::App for UwfApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BG_CANVAS.to_normalized_gamma_f32()
     }
-    let len = len as isize;
-    let current = selected.unwrap_or(0) as isize;
-    *selected = Some(((current + delta).rem_euclid(len)) as usize);
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events();
+        self.poll_file_dialog();
+
+        if self.last_overlay_tick.elapsed() >= OVERLAY_POLL {
+            self.last_overlay_tick = Instant::now();
+            self.send_overlay_refresh();
+        }
+
+        if self.phase == Phase::Ready {
+            ctx.request_repaint_after(IDLE_REPAINT);
+        }
+
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.is_pending()
+            && !self.force_close_confirmed
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.modal = Some(Modal::Confirm(ConfirmState::new(
+                "退出确认",
+                "当前仍有 UWF 后台操作正在执行，直接退出可能导致状态不同步。\n是否确认强制退出？",
+                ConfirmAction::Quit,
+            )));
+        }
+
+        if self.should_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::ui::render(ui, self);
+    }
+
+    fn on_exit(&mut self) {
+        self.send_quit();
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{
-        FileExclusion, FilterState, OverlayConfig, OverlayRuntime, OverlayType, VolumeInfo,
-    };
-    use crossterm::event;
+    use crate::model::{FilterState, OverlayConfig, OverlayRuntime};
+    use egui_kittest::{Harness, kittest::Queryable as _};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone, Default)]
+    struct StubFileDialog {
+        replies: Rc<RefCell<VecDeque<Option<PathBuf>>>>,
+    }
+
+    impl StubFileDialog {
+        fn with_replies(items: impl IntoIterator<Item = Option<PathBuf>>) -> Self {
+            Self {
+                replies: Rc::new(RefCell::new(items.into_iter().collect())),
+            }
+        }
+    }
+
+    impl FileDialogService for StubFileDialog {
+        fn open(
+            &mut self,
+            _kind: FileDialogKind,
+            ctx: &egui::Context,
+        ) -> Receiver<Option<PathBuf>> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reply = self.replies.borrow_mut().pop_front().flatten();
+            let _ = tx.send(reply);
+            ctx.request_repaint();
+            rx
+        }
+    }
 
     pub(crate) fn demo_snapshot() -> FullSnapshot {
         FullSnapshot {
@@ -1524,10 +1036,24 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_app(kind: BackendKind) -> (App, Receiver<BackendCommand>) {
+    fn test_app(kind: BackendKind) -> (UwfApp, Receiver<BackendCommand>) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (_, ui_rx) = std::sync::mpsc::channel();
-        (App::new(cmd_tx, ui_rx, kind), cmd_rx)
+        let (_, event_rx) = std::sync::mpsc::channel();
+        (
+            UwfApp::new_with_file_dialog(
+                cmd_tx,
+                event_rx,
+                kind,
+                Box::new(StubFileDialog::default()),
+            ),
+            cmd_rx,
+        )
+    }
+
+    fn ready_app(kind: BackendKind) -> (UwfApp, Receiver<BackendCommand>) {
+        let (mut app, cmd_rx) = test_app(kind);
+        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
+        (app, cmd_rx)
     }
 
     fn recv_cmd(rx: &Receiver<BackendCommand>) -> BackendCmd {
@@ -1537,42 +1063,28 @@ pub(crate) mod tests {
         }
     }
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, event::KeyModifiers::NONE)
-    }
-
-    pub(crate) fn ready_app(kind: BackendKind) -> (App, Receiver<BackendCommand>) {
-        let (mut app, cmd_rx) = test_app(kind);
-        app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
-        (app, cmd_rx)
-    }
-
-    #[test]
-    fn focus_panel_navigation_wraps() {
-        assert_eq!(FocusPanel::BasicSettings.next(), FocusPanel::CacheSettings);
-        assert_eq!(FocusPanel::Exclusions.next(), FocusPanel::BasicSettings);
-        assert_eq!(FocusPanel::BasicSettings.prev(), FocusPanel::Exclusions);
-    }
-
-    #[test]
-    fn selection_helpers_clamp_and_wrap() {
-        let mut sel = Some(5);
-        clamp(&mut sel, 3);
-        assert_eq!(sel, Some(2));
-        let mut sel = None;
-        clamp(&mut sel, 3);
-        assert_eq!(sel, Some(0));
-        let mut sel = Some(0);
-        clamp(&mut sel, 0);
-        assert_eq!(sel, None);
-        let mut sel = Some(0);
-        move_selection(&mut sel, 3, -1);
-        assert_eq!(sel, Some(2));
-        move_selection(&mut sel, 3, 1);
-        assert_eq!(sel, Some(0));
-        let mut sel = Some(0);
-        move_selection(&mut sel, 0, 1);
-        assert_eq!(sel, None);
+    fn build_gui_harness<'a>(
+        kind: BackendKind,
+        dialog: StubFileDialog,
+        snapshot: Option<FullSnapshot>,
+    ) -> (
+        Harness<'a, UwfApp>,
+        Sender<BackendEvent>,
+        Receiver<BackendCommand>,
+    ) {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        if let Some(snap) = snapshot {
+            let _ = event_tx.send(BackendEvent::Snapshot(snap));
+        }
+        let harness = Harness::builder()
+            .with_size([1060.0, 740.0])
+            .allow_missing_glyphs()
+            .build_eframe(move |cc| {
+                theme::apply_theme(&cc.egui_ctx);
+                UwfApp::new_with_file_dialog(cmd_tx, event_rx, kind, Box::new(dialog))
+            });
+        (harness, event_tx, cmd_rx)
     }
 
     #[test]
@@ -1582,11 +1094,7 @@ pub(crate) mod tests {
         app.apply_event(BackendEvent::NotInstalled(None));
         assert_eq!(app.phase, Phase::NotInstalled);
         assert!(!app.is_busy());
-        assert!(
-            app.last_log
-                .as_ref()
-                .is_some_and(|e| e.level == LogLevel::Err)
-        );
+        assert!(app.last_log().is_some_and(|e| e.level == LogLevel::Err));
         app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
         assert_eq!(app.phase, Phase::Ready);
     }
@@ -1642,14 +1150,14 @@ pub(crate) mod tests {
     #[test]
     fn mutation_gated_while_pending() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.on_key(key(KeyCode::Char('e')));
+        app.toggle_write_filter();
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate 命令");
         };
-        assert!(matches!(cmd, BackendCmd::EnableFilter));
+        assert!(matches!(cmd, BackendCmd::DisableFilter));
         assert_eq!(app.mutation, Some(id));
 
-        app.on_key(key(KeyCode::Char('d')));
+        app.protect_selected(false);
         assert!(cmd_rx.try_recv().is_err());
 
         app.apply_event(BackendEvent::Finished {
@@ -1657,8 +1165,8 @@ pub(crate) mod tests {
             outcome: Outcome::Ok("ok".into()),
         });
         assert!(!app.is_pending());
-        app.on_key(key(KeyCode::Char('d')));
-        assert!(matches!(recv_cmd(&cmd_rx), BackendCmd::DisableFilter));
+        app.protect_selected(false);
+        assert!(matches!(recv_cmd(&cmd_rx), BackendCmd::Unprotect(_)));
     }
 
     #[test]
@@ -1676,34 +1184,6 @@ pub(crate) mod tests {
             outcome: Outcome::Ok("UWF 将在下次系统重启后启用".into()),
         });
         assert!(!app.should_quit);
-    }
-
-    #[test]
-    fn quit_requires_confirm_when_mutation_pending() {
-        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
-        let _ = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
-        app.on_key(key(KeyCode::Esc));
-        assert!(!app.should_quit);
-        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
-        app.on_key(key(KeyCode::Enter));
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn not_installed_blocks_management_keys() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.apply_event(BackendEvent::NotInstalled(None));
-        for code in [
-            KeyCode::F(10),
-            KeyCode::Char('c'),
-            KeyCode::Char('e'),
-            KeyCode::Char('a'),
-            KeyCode::Char('p'),
-        ] {
-            app.on_key(key(code));
-            assert!(app.modal.is_none(), "未安装页不应打开管理弹窗: {code:?}");
-        }
-        assert!(cmd_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1729,27 +1209,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn global_keys_focus_help_refresh_quit() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.on_key(key(KeyCode::Tab));
-        assert_eq!(app.focus, FocusPanel::CacheSettings);
-        app.on_key(key(KeyCode::BackTab));
-        assert_eq!(app.focus, FocusPanel::BasicSettings);
-        app.on_key(key(KeyCode::Char('?')));
-        assert!(matches!(app.modal, Some(Modal::Help(_))));
-        app.on_key(key(KeyCode::Esc));
-        assert!(app.modal.is_none());
-        app.on_key(key(KeyCode::F(5)));
-        assert!(matches!(cmd_rx.try_recv(), Ok(BackendCommand::RefreshAll)));
-        app.on_key(key(KeyCode::Char('q')));
-        assert!(app.should_quit);
-    }
-
-    #[test]
     fn basic_settings_toggles_write_filter_and_respects_r1_lock() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        // 写入过滤默认启用 -> Enter 发送 DisableFilter
-        app.on_key(key(KeyCode::Enter));
+        app.toggle_write_filter();
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate");
         };
@@ -1759,20 +1221,18 @@ pub(crate) mod tests {
             outcome: Outcome::Ok("ok".into()),
         });
 
-        // 切到覆盖类型：current_enabled = true 时 R1 锁定
-        app.on_key(key(KeyCode::Down));
-        assert_eq!(app.basic_field, BasicField::OverlayType);
-        app.on_key(key(KeyCode::Enter));
+        // current_enabled == true 时 R1 锁定切换缓存模式
+        app.set_overlay_type(OverlayType::Disk);
         assert!(cmd_rx.try_recv().is_err());
 
-        // 解锁后（current_enabled = false）允许切换覆盖类型
+        // 解锁后允许切换缓存模式
         let mut snap = demo_snapshot();
         snap.filter_state = Some(FilterState {
             current_enabled: false,
             next_enabled: false,
         });
         app.apply_event(BackendEvent::Snapshot(snap));
-        app.on_key(key(KeyCode::Enter));
+        app.set_overlay_type(OverlayType::Disk);
         assert!(matches!(
             recv_cmd(&cmd_rx),
             BackendCmd::SetOverlayType(OverlayType::Disk)
@@ -1780,17 +1240,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cache_form_validation_dirty_flag_and_esc_discard() {
+    fn cache_form_validation_dirty_flag_and_reset() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.focus = FocusPanel::CacheSettings;
-        app.on_focus_entered();
-        // current_enabled == true 时聚焦落在警告阈值
-        assert_eq!(app.cache.field, CacheField::WarningThreshold);
-
-        // 输入非法阈值（警告 >= 严重）
-        app.cache.warning.set("2000");
-        app.cache.dirty = true;
-        app.on_key(key(KeyCode::Enter));
+        app.cache.warning_text = "2000".into();
+        app.cache.on_edited();
+        app.submit_cache_settings();
         assert!(cmd_rx.try_recv().is_err());
         assert!(
             app.cache
@@ -1799,21 +1253,19 @@ pub(crate) mod tests {
                 .is_some_and(|e| e.contains("必须小于"))
         );
 
-        // 正在编辑时收到后台刷新，不冲掉输入内容
+        // dirty = true 时后台刷新不冲掉正在编辑的文本
         app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
-        assert_eq!(app.cache.warning.text, "2000");
+        assert_eq!(app.cache.warning_text, "2000");
 
-        // Esc 放弃未保存修改，而不是直接退出
-        app.on_key(key(KeyCode::Esc));
-        assert!(!app.should_quit);
+        // 还原恢复到快照值
+        app.reset_cache_form();
         assert!(!app.cache.dirty);
-        assert_eq!(app.cache.warning.text, "1536");
+        assert_eq!(app.cache.warning_text, "1536");
 
-        // 再次合法编辑并 Enter 提交
-        app.on_key(key(KeyCode::Backspace));
-        app.on_key(key(KeyCode::Char('0'))); // 1530
-        assert!(app.cache.dirty);
-        app.on_key(key(KeyCode::Enter));
+        // 合法修改后提交
+        app.cache.warning_text = "1530".into();
+        app.cache.on_edited();
+        app.submit_cache_settings();
         match recv_cmd(&cmd_rx) {
             BackendCmd::SetOverlayCache {
                 max_mb,
@@ -1827,102 +1279,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn volumes_protect_selected_drive() {
+    fn selection_identity_and_session_toggle_preserve_key() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.focus = FocusPanel::Volumes;
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Char('p')));
+        let mut snap = demo_snapshot();
+        snap.file_exclusions_next = vec![
+            FileExclusion::new("C:".into(), "\\A".into()),
+            FileExclusion::new("C:".into(), "\\B".into()),
+        ];
+        app.apply_event(BackendEvent::Snapshot(snap));
+
+        let b_item = ExclusionItem::File(FileExclusion::new("C:".into(), "\\B".into()));
+        app.select_exclusion(b_item.clone());
+        assert_eq!(app.selected_exclusion(), Some(b_item.clone()));
+
+        // 切到只读当前视图（空），不允许新增/删除；切回后必须保持选中 \B
+        app.set_exclusion_session(true);
+        assert!(app.selected_exclusion().is_none());
+        app.delete_selected_exclusion();
+        assert!(cmd_rx.try_recv().is_err());
+
+        app.set_exclusion_session(false);
+        assert_eq!(app.selected_exclusion(), Some(b_item));
+        app.delete_selected_exclusion();
         match recv_cmd(&cmd_rx) {
-            BackendCmd::Protect(drive) => assert_eq!(drive, "D:"),
-            other => panic!("期望 Protect，实际 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn exclusions_toggle_session_and_delete_selected() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.focus = FocusPanel::Exclusions;
-        assert!(!app.exclusion_session_current);
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(app.exclusion_session_current);
-        app.on_key(key(KeyCode::Char('s')));
-
-        // 统一列表中第 0 项为文件排除，第 1 项为注册表排除
-        app.on_key(key(KeyCode::Char('d')));
-        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
-            panic!("期望 Mutate 命令");
-        };
-        match cmd {
-            BackendCmd::RemoveFileExclusion(path) => assert_eq!(path, "C:\\Windows\\Temp"),
+            BackendCmd::RemoveFileExclusion(path) => assert_eq!(path, "C:\\B"),
             other => panic!("期望 RemoveFileExclusion，实际 {other:?}"),
-        }
-        app.apply_event(BackendEvent::Finished {
-            id,
-            outcome: Outcome::Ok("ok".into()),
-        });
-
-        // 下移选中注册表项并删除
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Char('d')));
-        match recv_cmd(&cmd_rx) {
-            BackendCmd::RemoveRegistryExclusion(key) => {
-                assert_eq!(key, "HKLM\\SOFTWARE\\UwfManagerDemo")
-            }
-            other => panic!("期望 RemoveRegistryExclusion，实际 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn current_session_view_is_read_only() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.focus = FocusPanel::Exclusions;
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(app.exclusion_session_current);
-
-        for code in [
-            KeyCode::Char('a'),
-            KeyCode::Char('r'),
-            KeyCode::Char('d'),
-            KeyCode::Char('i'),
-        ] {
-            app.on_key(key(code));
-            assert!(app.modal.is_none());
-            assert!(cmd_rx.try_recv().is_err());
-        }
-
-        app.on_key(key(KeyCode::Char('s')));
-        app.on_key(key(KeyCode::Char('d')));
-        assert!(matches!(
-            recv_cmd(&cmd_rx),
-            BackendCmd::RemoveFileExclusion(_)
-        ));
-    }
-
-    #[test]
-    fn commit_menu_registry_input_flow() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.on_key(key(KeyCode::Char('c')));
-        assert!(matches!(app.modal, Some(Modal::CommitMenu(_))));
-        app.on_key(key(KeyCode::Char('3')));
-        assert!(matches!(app.modal, Some(Modal::Input(_))));
-        for c in "HKLM\\SOFTWARE\\X\\Val".chars() {
-            app.on_key(key(KeyCode::Char(c)));
-        }
-        app.on_key(key(KeyCode::Enter));
-        assert!(app.modal.is_none());
-        match recv_cmd(&cmd_rx) {
-            BackendCmd::CommitRegistry(path) => assert_eq!(path, "HKLM\\SOFTWARE\\X\\Val"),
-            other => panic!("期望 CommitRegistry，实际 {other:?}"),
         }
     }
 
     #[test]
     fn restart_flow_mock_stays_windows_quits() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.on_key(key(KeyCode::F(10)));
-        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
-        app.on_key(key(KeyCode::Enter));
-        assert!(app.modal.is_none());
+        app.execute_confirm(ConfirmAction::Restart);
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate 命令");
         };
@@ -1933,14 +1321,12 @@ pub(crate) mod tests {
         });
         assert!(!app.should_quit);
         assert!(
-            app.last_log
-                .as_ref()
+            app.last_log()
                 .is_some_and(|e| e.text.contains("（模拟）已重启"))
         );
 
         let (mut app, cmd_rx) = ready_app(BackendKind::Windows);
-        app.on_key(key(KeyCode::F(10)));
-        app.on_key(key(KeyCode::Enter));
+        app.execute_confirm(ConfirmAction::Restart);
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate 命令");
         };
@@ -1953,14 +1339,120 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn commit_file_deletion_requires_confirm() {
-        let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        app.execute_pick(
-            PickerAction::CommitFileDeletion,
-            PathBuf::from("C:\\data\\a.txt"),
+    fn gui_dashboard_renders_and_dispatches_filter_volume_and_cache_actions() {
+        let (mut harness, event_tx, cmd_rx) = build_gui_harness(
+            BackendKind::Mock,
+            StubFileDialog::default(),
+            Some(demo_snapshot()),
         );
-        assert!(matches!(app.modal, Some(Modal::Confirm(_))));
-        app.on_key(key(KeyCode::Enter));
+
+        // 切换筛选器（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
+        harness.get_by_label("停用筛选器").click();
+        harness.run_steps(2);
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::DisableFilter));
+        let _ = event_tx.send(BackendEvent::Finished {
+            id,
+            outcome: Outcome::Ok("ok".into()),
+        });
+        harness.run();
+
+        // 选中 D: 行并点击保护
+        harness.get_by_label_contains("D:").click();
+        harness.run();
+        harness.get_by_label("保护选中分区").click();
+        harness.run_steps(2);
+        match recv_cmd(&cmd_rx) {
+            BackendCmd::Protect(drive) => assert_eq!(drive, "D:"),
+            other => panic!("期望 Protect(D:)，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gui_cache_form_validation_and_save() {
+        let (mut harness, _event_tx, cmd_rx) = build_gui_harness(
+            BackendKind::Mock,
+            StubFileDialog::default(),
+            Some(demo_snapshot()),
+        );
+
+        {
+            let warn_input = harness.get_by_label("警告阈值");
+            warn_input.click();
+        }
+        harness.state_mut().cache.warning_text = "2000".into();
+        harness.state_mut().cache.on_edited();
+        harness.run();
+
+        harness.get_by_label("应用缓存设置").click();
+        harness.run();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(
+            harness
+                .query_all_by_label_contains("警告阈值必须小于严重阈值")
+                .next()
+                .is_some()
+        );
+
+        harness.get_by_label("还原").click();
+        harness.run();
+        assert_eq!(harness.state().cache.warning_text, "1536");
+
+        harness.state_mut().cache.warning_text = "1530".into();
+        harness.state_mut().cache.on_edited();
+        harness.run();
+        harness.get_by_label("应用缓存设置").click();
+        harness.run_steps(2);
+        match recv_cmd(&cmd_rx) {
+            BackendCmd::SetOverlayCache {
+                max_mb,
+                warning_mb,
+                critical_mb,
+            } => assert_eq!((max_mb, warning_mb, critical_mb), (2048, 1530, 1843)),
+            other => panic!("期望 SetOverlayCache，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gui_folder_exclusion_with_stub_file_dialog() {
+        let stub = StubFileDialog::with_replies([Some(PathBuf::from("D:\\TempWork"))]);
+        let (mut harness, _event_tx, cmd_rx) =
+            build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
+
+        harness.get_by_label("+ 文件夹").click();
+        harness.run();
+        harness.get_by_label("选择目录…").click();
+        harness.run();
+        harness.get_by_label("确认").click();
+        harness.run_steps(2);
+
+        match recv_cmd(&cmd_rx) {
+            BackendCmd::AddFileExclusion(path) => assert_eq!(path, "D:\\TempWork"),
+            other => panic!("期望 AddFileExclusion，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gui_commit_file_deletion_enforces_two_step_confirm() {
+        let stub = StubFileDialog::with_replies([Some(PathBuf::from("C:\\data\\a.txt"))]);
+        let (mut harness, _event_tx, cmd_rx) =
+            build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
+
+        harness.get_by_label("提交操作…").click();
+        harness.run();
+        harness.get_by_label("选择待删文件…").click();
+        harness.run();
+        harness.get_by_label("浏览文件…").click();
+        harness.run();
+        harness.get_by_label("下一步").click();
+        harness.run();
+        // 第一步仅切到二次确认，尚未发命令
+        assert!(cmd_rx.try_recv().is_err());
+
+        harness.get_by_label("确认删除并固化").click();
+        harness.run_steps(2);
         match recv_cmd(&cmd_rx) {
             BackendCmd::CommitFileDeletion(path) => assert_eq!(path, "C:\\data\\a.txt"),
             other => panic!("期望 CommitFileDeletion，实际 {other:?}"),
@@ -1968,74 +1460,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn selection_identity_survives_reorder_and_session_toggle() {
-        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
-        assert_eq!(
-            app.selected_exclusion_key,
-            Some(ExclusionItem::File(FileExclusion::new(
-                "C:".into(),
-                "\\Windows\\Temp".into()
-            )))
-        );
-        app.focus = FocusPanel::Exclusions;
-        let mut snap = demo_snapshot();
-        snap.file_exclusions_next = vec![
-            FileExclusion::new("C:".into(), "\\A".into()),
-            FileExclusion::new("C:".into(), "\\B".into()),
-        ];
-        app.apply_event(BackendEvent::Snapshot(snap));
-        app.on_key(key(KeyCode::Down));
-        assert_eq!(app.exclusion_state.selected(), Some(1));
+    fn gui_not_installed_and_log_drawer() {
+        let (mut harness, event_tx, cmd_rx) =
+            build_gui_harness(BackendKind::Mock, StubFileDialog::default(), None);
 
-        // 切到空当前视图再切回，必须保持选中 \B
-        app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.exclusion_state.selected(), None);
-        app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.exclusion_state.selected(), Some(1));
-        assert_eq!(
-            app.selected_exclusion_key,
-            Some(ExclusionItem::File(FileExclusion::new(
-                "C:".into(),
-                "\\B".into()
-            )))
-        );
-    }
+        let _ = event_tx.send(BackendEvent::NotInstalled(None));
+        harness.run();
+        harness.get_by_label("重新检测").click();
+        harness.run_steps(2);
+        assert!(matches!(cmd_rx.try_recv(), Ok(BackendCommand::RefreshAll)));
 
-    #[test]
-    fn backend_disconnect_marks_lost_closes_modal_and_blocks_mutations() {
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (_ui_tx, ui_rx) = std::sync::mpsc::channel();
-        let mut app = App::new(cmd_tx, ui_rx, BackendKind::Mock);
-        app.modal = Some(Modal::Help(HelpState::default()));
-        assert!(app.is_busy());
-
-        app.apply_event(BackendEvent::Disconnected);
-        assert_eq!(app.phase, Phase::BackendLost);
-        assert!(app.modal.is_none());
-        assert!(!app.is_busy());
-
-        app.on_key(key(KeyCode::Char('e')));
-        assert!(cmd_rx.try_recv().is_err());
-        app.on_key(key(KeyCode::Esc));
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn repeat_events_advance_selection_and_release_is_ignored() {
-        let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
-        app.focus = FocusPanel::Volumes;
-        app.handle_ui_event(UiEvent::Terminal(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Down,
-            event::KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        ))));
-        assert_eq!(app.volumes_state.selected(), Some(1));
-
-        app.handle_ui_event(UiEvent::Terminal(Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Down,
-            event::KeyModifiers::NONE,
-            KeyEventKind::Release,
-        ))));
-        assert_eq!(app.volumes_state.selected(), Some(1));
+        let _ = event_tx.send(BackendEvent::Snapshot(demo_snapshot()));
+        harness.run();
+        harness.get_by_label_contains("操作日志").click();
+        harness.run();
+        assert!(harness.state().show_log_drawer);
+        assert!(harness.query_by_label("复制全部").is_some());
     }
 }

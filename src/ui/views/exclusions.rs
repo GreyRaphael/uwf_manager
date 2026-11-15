@@ -1,164 +1,235 @@
-//! 右栏：4. 排除列表（文件与注册表统一展示、行内操作栏）与底部快捷按钮。
+//! 右侧下方卡片：排除项规则列表（文件/目录 + 注册表、双会话视图与导入导出）。
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use eframe::egui::{
+    self, Align, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
+};
 
-use crate::app::{App, FocusPanel};
+use crate::app::{ExclusionFilter, ExclusionItem, UwfApp};
 use crate::ui::{text, theme};
 
-pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [box_area, btn_area] =
-        Layout::vertical([Constraint::Min(5), Constraint::Length(2)]).areas(area);
+pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
+    theme::card_frame().show(ui, |ui| {
+        let avail_h = ui.available_height();
+        ui.set_width(ui.available_width());
+        ui.set_min_height(avail_h.max(200.0));
 
-    let focused = app.focus == FocusPanel::Exclusions;
-    app.regions.panel_exclusions = box_area;
+        // 第一行：标题 + 会话视角切换（重启后生效可编辑 / 当前生效只读）
+        ui.horizontal(|ui| {
+            let count = app.visible_exclusions().len();
+            theme::card_header(ui, "排除项规则", Some(&format!("共 {count} 条")));
 
-    let read_only = app.exclusion_session_current;
-    let title_spans = if read_only {
-        vec![
-            Span::styled(" 4.排除列表 ", theme::focus_title(focused)),
-            Span::styled("[当前生效·只读] ", theme::warn()),
-        ]
-    } else {
-        vec![
-            Span::styled(" 4.排除列表 ", theme::focus_title(focused)),
-            Span::styled("[重启后·可编辑] ", theme::ok()),
-        ]
-    };
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut session_current = app.exclusion_session_current;
+                if theme::segmented_toggle(
+                    ui,
+                    &mut session_current,
+                    &[(false, "重启后生效 (可编辑)"), (true, "当前生效 (只读)")],
+                ) {
+                    app.set_exclusion_session(session_current);
+                }
+            });
+        });
 
-    let block = Block::bordered()
-        .title(Line::from(title_spans))
-        .border_style(theme::focus_border(focused))
-        .style(theme::surface());
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+        ui.add_space(8.0);
 
-    if !super::render_load_placeholder(frame, app, inner) {
-        let [list_area, toolbar_area] =
-            Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).areas(inner);
-        app.regions.exclusion_rows = list_area;
+        // 第二行：类型过滤胶囊 + 分组操作工具栏
+        ui.horizontal_wrapped(|ui| {
+            let mut filter = app.exclusion_filter;
+            if theme::segmented_toggle(
+                ui,
+                &mut filter,
+                &[
+                    (ExclusionFilter::All, "全部"),
+                    (ExclusionFilter::Files, "文件与目录"),
+                    (ExclusionFilter::Registry, "注册表"),
+                ],
+            ) {
+                app.set_exclusion_filter(filter);
+            }
 
-        let visible = app.visible_exclusions();
-        let items: Vec<ListItem> = if visible.is_empty() {
-            vec![ListItem::new(text::READY_EMPTY).style(theme::dim())]
-        } else {
-            visible
-                .iter()
-                .map(|item| {
-                    let style = if item.is_registry() {
-                        theme::registry()
-                    } else {
-                        theme::text()
-                    };
-                    ListItem::new(item.display()).style(style)
-                })
-                .collect()
-        };
+            ui.add_space(6.0);
+            let busy = app.is_busy();
+            let editable = !busy && !app.exclusion_session_current;
+            let has_selected = app.selected_exclusion().is_some();
 
-        let list = List::new(items)
-            .style(theme::surface())
-            .highlight_style(theme::selected())
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, list_area, &mut app.exclusion_state);
+            ui.add_enabled_ui(editable, |ui| {
+                if theme::secondary_button(ui, "+ 文件").clicked() {
+                    app.open_add_file_exclusion(false);
+                }
+                if theme::secondary_button(ui, "+ 文件夹").clicked() {
+                    app.open_add_file_exclusion(true);
+                }
+                if theme::secondary_button(ui, "+ 注册表").clicked() {
+                    app.open_add_registry_exclusion();
+                }
+                ui.add_enabled_ui(has_selected, |ui| {
+                    if theme::danger_button(ui, "移除选中").clicked() {
+                        app.delete_selected_exclusion();
+                    }
+                });
+                if theme::secondary_button(ui, "导入列表").clicked() {
+                    app.open_import_dialog(ui.ctx());
+                }
+            });
 
-        render_toolbar(frame, app, toolbar_area, read_only);
-    }
+            ui.add_enabled_ui(!busy, |ui| {
+                if theme::secondary_button(ui, "导出列表").clicked() {
+                    app.open_export_dialog(ui.ctx());
+                }
+            });
+        });
 
-    render_bottom_buttons(
-        frame,
-        app,
-        Rect::new(btn_area.x, btn_area.y + 1, btn_area.width, 1),
-    );
-}
+        if app.exclusion_session_current {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "当前视图仅反映已生效只读规则；需增删改请切换到「重启后生效 (可编辑)」",
+                )
+                .font(FontId::proportional(11.5))
+                .color(theme::WARN_FG),
+            );
+        }
 
-fn render_toolbar(frame: &mut Frame, app: &mut App, area: Rect, read_only: bool) {
-    let compact = area.width < 36;
-    let view_lbl = if compact {
-        " 视图 "
-    } else {
-        " 切换视图 "
-    };
-    let btns: [(&str, bool); 4] = if compact {
-        [
-            (" +文件 ", read_only),
-            (" +注册 ", read_only),
-            (" 删 ", read_only),
-            (view_lbl, false),
-        ]
-    } else {
-        [
-            (" +文件 ", read_only),
-            (" +注册表 ", read_only),
-            (" 删除 ", read_only),
-            (view_lbl, false),
-        ]
-    };
+        ui.add_space(8.0);
 
-    let mut x = area.x;
-    let mut spans = Vec::new();
-    let rects = [
-        &mut app.regions.excl_add_file_btn,
-        &mut app.regions.excl_add_reg_btn,
-        &mut app.regions.excl_delete_btn,
-        &mut app.regions.excl_view_btn,
-    ];
-    for (i, (lbl, disabled)) in btns.iter().enumerate() {
-        let w = (Line::raw(*lbl).width() as u16).min(area.right().saturating_sub(x));
-        *rects[i] = Rect::new(x, area.y, w, 1);
-        x += w + 1;
-        spans.push(Span::styled(*lbl, theme::button(false, false, *disabled)));
-        spans.push(Span::styled(" ", theme::surface()));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme::surface()),
-        area,
-    );
-}
+        // 主体列表区（撑满卡片剩余空间）
+        let rows = app.filtered_exclusions();
+        let selected_key = app.selected_exclusion_key.clone();
+        let filter_current_enabled = app
+            .snapshot
+            .filter_state
+            .is_some_and(|fs| fs.current_enabled);
+        let view_is_current = app.exclusion_session_current;
 
-fn render_bottom_buttons(frame: &mut Frame, app: &mut App, area: Rect) {
-    let ready = app.phase == crate::app::Phase::Ready;
-    let import_disabled = !ready || app.exclusion_session_current;
-    let compact = area.width < 38;
-    let btns: [(&str, bool, bool); 4] = if compact {
-        [
-            (" 导入 ", false, import_disabled),
-            (" 导出 ", false, !ready),
-            (" 重启 ", true, !ready),
-            (" 关机 ", true, !ready),
-        ]
-    } else {
-        [
-            (" 导入列表 ", false, import_disabled),
-            (" 导出列表 ", false, !ready),
-            (" 重启 ", true, !ready),
-            (" 关机 ", true, !ready),
-        ]
-    };
+        let list_h = (ui.available_height() - 18.0).max(120.0);
+        let mut clicked_item: Option<ExclusionItem> = None;
 
-    let total_w: u16 = btns
-        .iter()
-        .map(|(lbl, _, _)| Line::raw(*lbl).width() as u16 + 1)
-        .sum::<u16>()
-        .saturating_sub(1);
-    let mut x = area.x + area.width.saturating_sub(total_w) / 2;
-    let mut spans = Vec::new();
-    let rects = [
-        &mut app.regions.import_btn,
-        &mut app.regions.export_btn,
-        &mut app.regions.restart_btn,
-        &mut app.regions.shutdown_btn,
-    ];
-    for (i, (lbl, danger, disabled)) in btns.iter().enumerate() {
-        let w = (Line::raw(*lbl).width() as u16).min(area.right().saturating_sub(x));
-        *rects[i] = Rect::new(x, area.y, w, 1);
-        x += w + 1;
-        spans.push(Span::styled(*lbl, theme::button(false, *danger, *disabled)));
-        spans.push(Span::styled(" ", theme::canvas()));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme::canvas()),
-        area,
-    );
+        egui::Frame::NONE
+            .fill(theme::BG_SUBTLE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(list_h);
+
+                if rows.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(text::READY_EMPTY)
+                                .font(FontId::proportional(13.0))
+                                .color(theme::TEXT_MUTED),
+                        );
+                    });
+                    return;
+                }
+
+                ScrollArea::vertical()
+                    .id_salt("exclusions_scroll")
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // 允许点击行内文本区域直接选中整行（完整路径仍可通过悬停提示或导出查看）
+                        ui.style_mut().interaction.selectable_labels = false;
+                        for (idx, (item, in_current)) in rows.into_iter().enumerate() {
+                            let is_selected = selected_key.as_ref() == Some(&item);
+                            let full_text = item.display();
+                            let (kind_lbl, kind_fg, kind_bg) = if item.is_registry() {
+                                ("注册表", theme::WARN_FG, theme::WARN_BG)
+                            } else {
+                                ("文件/目录", theme::INFO_FG, theme::INFO_BG)
+                            };
+
+                            let row_fill = if is_selected {
+                                theme::BG_SELECTED
+                            } else if idx % 2 == 0 {
+                                theme::BG_CARD
+                            } else {
+                                theme::BG_SUBTLE
+                            };
+                            let row_stroke = if is_selected {
+                                Stroke::new(1.0, theme::ACCENT)
+                            } else {
+                                Stroke::NONE
+                            };
+
+                            let row_resp = egui::Frame::NONE
+                                .fill(row_fill)
+                                .stroke(row_stroke)
+                                .corner_radius(CornerRadius::same(6))
+                                .inner_margin(Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        theme::status_pill(ui, kind_lbl, kind_fg, kind_bg);
+
+                                        let right_badge_w = 104.0;
+                                        let text_w =
+                                            (ui.available_width() - right_badge_w).max(80.0);
+                                        ui.add_sized(
+                                            [text_w, 20.0],
+                                            egui::Label::new(
+                                                RichText::new(&full_text)
+                                                    .font(FontId::monospace(12.5))
+                                                    .color(if is_selected {
+                                                        theme::ACCENT
+                                                    } else {
+                                                        theme::TEXT_PRIMARY
+                                                    }),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&full_text);
+
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if view_is_current {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "生效中",
+                                                        theme::OK_FG,
+                                                        theme::OK_BG,
+                                                    );
+                                                } else if !filter_current_enabled {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "已配置",
+                                                        theme::TEXT_SECONDARY,
+                                                        theme::BG_SUBTLE,
+                                                    );
+                                                } else if in_current {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "已生效",
+                                                        theme::OK_FG,
+                                                        theme::OK_BG,
+                                                    );
+                                                } else {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "待重启生效",
+                                                        theme::WARN_FG,
+                                                        theme::WARN_BG,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(Sense::click());
+
+                            if row_resp.clicked() {
+                                clicked_item = Some(item);
+                            }
+                            ui.add_space(3.0);
+                        }
+                    });
+            });
+
+        if let Some(item) = clicked_item {
+            app.select_exclusion(item);
+        }
+    });
 }
