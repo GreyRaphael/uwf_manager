@@ -59,6 +59,15 @@ pub struct Win32_Volume {
     pub DriveLetter: Option<String>,
 }
 
+/// `ROOT\CIMV2` 操作系统版本信息（用于左下角系统版本与兼容性提示）。
+#[derive(Deserialize)]
+#[allow(non_snake_case, non_camel_case_types)]
+pub struct Win32_OperatingSystem {
+    pub Caption: Option<String>,
+    pub BuildNumber: Option<String>,
+    pub OSArchitecture: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[allow(non_snake_case, non_camel_case_types)]
 pub struct UWF_RegistryFilter {

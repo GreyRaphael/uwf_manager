@@ -292,6 +292,10 @@ impl UwfBackend for MockUwfBackend {
     fn commit_registry(&mut self, _key: &str, _value_name: &str) -> Result<()> {
         Ok(())
     }
+
+    fn get_os_version(&mut self) -> Option<String> {
+        Some("Windows 10 Enterprise LTSC 2021 (Mock 模拟)".to_string())
+    }
 }
 
 #[cfg(test)]

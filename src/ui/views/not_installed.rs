@@ -32,6 +32,20 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                         .color(theme::TEXT_SECONDARY),
                 );
 
+                if let Some(os_ver) = &app.os_version {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "当前系统：{os_ver}（提示：需要 Windows 企业版和教育版才能使用 UWF 功能）"
+                            ))
+                            .font(FontId::proportional(12.0))
+                            .color(theme::TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                }
+
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(text::NI_REASON_TITLE)

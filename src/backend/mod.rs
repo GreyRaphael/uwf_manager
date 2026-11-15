@@ -76,6 +76,11 @@ pub trait UwfBackend: 'static {
     fn take_warnings(&mut self) -> Vec<String> {
         Vec::new()
     }
+
+    /// 读取当前操作系统版本名称（如 `Windows 10 Enterprise LTSC 2021`）。
+    fn get_os_version(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// 全量状态快照（`RefreshAll` 回包）
@@ -90,6 +95,8 @@ pub struct FullSnapshot {
     pub file_exclusions_next: Vec<FileExclusion>,
     pub registry_exclusions_current: Vec<String>,
     pub registry_exclusions_next: Vec<String>,
+    /// 当前 Windows 系统版本文本
+    pub os_version: Option<String>,
     /// 部分卷读取失败等非致命警告
     pub warnings: Vec<String>,
 }
@@ -144,6 +151,8 @@ pub enum BackendCmd {
         path: PathBuf,
         current_session: bool,
     },
+    /// 撤销下次会话排除项修改，使其恢复到与当前生效会话一致
+    RevertExclusionsToCurrent,
     RestartSystem,
     ShutdownSystem,
 }
@@ -168,6 +177,8 @@ pub enum BackendEvent {
     Snapshot(FullSnapshot),
     /// 2 秒增量回包
     OverlayRuntime(OverlayRuntime),
+    /// 启动或快照采集到的系统版本信息（UWF 未安装时也可独立展示）
+    OsVersion(String),
     /// `RefreshAll` 失败（与变更请求解耦，不会误解锁 in-flight mutation）
     RefreshFailed(String),
     /// 变更请求的最终结果（只由 [`BackendCommand::Mutate`] 产出）
@@ -269,6 +280,9 @@ where
             (wake)();
         };
         let mut backend = factory();
+        if let Some(ver) = backend.get_os_version() {
+            emit(BackendEvent::OsVersion(ver));
+        }
         while let Ok(command) = rx.recv() {
             match command {
                 BackendCommand::Quit => {
@@ -388,15 +402,18 @@ fn handle_mutation(
         ),
         BackendCmd::CommitFile(path) => mutate_with(id, backend, emit, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
+            ensure_volume_commit_ready(b, &drive, "文件提交")?;
             b.commit_file(&drive, &rel)?;
             Ok(format!("{path} 提交成功"))
         }),
         BackendCmd::CommitFileDeletion(path) => mutate_with(id, backend, emit, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
+            ensure_volume_commit_ready(b, &drive, "文件删除固化")?;
             b.commit_file_deletion(&drive, &rel)?;
             Ok(format!("{path} 删除提交成功"))
         }),
         BackendCmd::CommitRegistry(full_path) => mutate_with(id, backend, emit, |b| {
+            ensure_filter_commit_ready(b, "注册表提交")?;
             let (key, value) = split_registry_path(&full_path)?;
             b.commit_registry(&key, &value)?;
             Ok(format!("注册表 {full_path} 提交成功"))
@@ -406,6 +423,9 @@ fn handle_mutation(
             path,
             current_session,
         } => export_exclusions(id, backend, emit, &path, current_session),
+        BackendCmd::RevertExclusionsToCurrent => {
+            revert_exclusions_to_current(id, backend, emit);
+        }
         BackendCmd::RestartSystem => {
             mutate_without_refresh(id, backend, emit, |b| b.restart_system(), "系统即将重启")
         }
@@ -432,6 +452,7 @@ fn collect_snapshot(b: &mut dyn UwfBackend) -> Result<FullSnapshot> {
         file_exclusions_next: b.get_file_exclusions(false)?,
         registry_exclusions_current: b.get_registry_exclusions(true)?,
         registry_exclusions_next: b.get_registry_exclusions(false)?,
+        os_version: b.get_os_version(),
         warnings: b.take_warnings(),
     })
 }
@@ -624,6 +645,91 @@ fn import_exclusions(
     }
 }
 
+/// 将“重启后生效”排除项恢复为与“当前生效”一致（先移除多余项，再补回被删项）。
+fn revert_exclusions_to_current(
+    id: RequestId,
+    backend: &mut dyn UwfBackend,
+    emit: &dyn Fn(BackendEvent),
+) {
+    let plan = (|| -> Result<ExclusionRevertPlan> {
+        let files_current = backend.get_file_exclusions(true)?;
+        let files_next = backend.get_file_exclusions(false)?;
+        let regs_current = backend.get_registry_exclusions(true)?;
+        let regs_next = backend.get_registry_exclusions(false)?;
+        Ok(plan_exclusion_revert(
+            &files_current,
+            &files_next,
+            &regs_current,
+            &regs_next,
+        ))
+    })();
+
+    let plan = match plan {
+        Ok(p) => p,
+        Err(e) => {
+            send_mutation_err(emit, id, e);
+            return;
+        }
+    };
+
+    if plan.is_empty() {
+        finish_with_refresh(
+            id,
+            backend,
+            emit,
+            Outcome::Ok("重启后排除项已与当前生效一致，无需撤销".to_string()),
+        );
+        return;
+    }
+
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut first_err: Option<String> = None;
+
+    let mut track = |res: Result<()>| match res {
+        Ok(()) => ok += 1,
+        Err(e) => {
+            failed += 1;
+            if first_err.is_none() {
+                first_err = Some(e.to_string());
+            }
+        }
+    };
+
+    for file in &plan.files_to_remove {
+        track(backend.remove_file_exclusion(&file.drive_letter, &file.file_rel_path));
+    }
+    for key in &plan.regs_to_remove {
+        track(backend.remove_registry_exclusion(key));
+    }
+    for file in &plan.files_to_add {
+        track(backend.add_file_exclusion(&file.drive_letter, &file.file_rel_path));
+    }
+    for key in &plan.regs_to_add {
+        track(backend.add_registry_exclusion(key));
+    }
+
+    let err_detail = first_err
+        .map(|e| format!("（首个错误：{e}）"))
+        .unwrap_or_default();
+    let outcome = if failed == 0 {
+        Outcome::Ok(format!(
+            "已撤销排除项修改（移除 {} 项，恢复 {} 项），重启后列表已与当前生效一致",
+            plan.remove_count(),
+            plan.add_count()
+        ))
+    } else if ok == 0 {
+        Outcome::Err(format!(
+            "撤销排除项修改失败：{failed} 项均未成功{err_detail}"
+        ))
+    } else {
+        Outcome::Warning(format!(
+            "已部分撤销排除项修改：成功 {ok} 项，失败 {failed} 项{err_detail}"
+        ))
+    };
+    finish_with_refresh(id, backend, emit, outcome);
+}
+
 /// 原子创建不覆盖既有文件的导出路径：同秒重复导出自动追加 `_1`、`_2`。
 fn create_unique_export_file(path: &Path) -> io::Result<(PathBuf, std::fs::File)> {
     let mut candidate = path.to_path_buf();
@@ -772,6 +878,16 @@ pub(crate) fn normalize_drive_letter(raw: &str) -> Option<String> {
     }
 }
 
+/// 判断是否应对该卷实例调用 `UWF_Volume.GetExclusions`。
+///
+/// 当前会话中未受保护的卷未挂载 UWF 过滤驱动，直接调用 `GetExclusions` 会返回
+/// `WBEM_E_NOT_FOUND (0x80041002)`；而下次会话即使尚未启用保护也可能已预配置排除项，
+/// 因此仅跳过 `current_session && !protected`。
+#[cfg(any(windows, test))]
+pub(crate) fn should_query_volume_exclusions(current_session: bool, protected: bool) -> bool {
+    !current_session || protected
+}
+
 /// 在已消歧的卷集合中按 `(current_session, drive_letter)` 查找实例。
 #[cfg(any(windows, test))]
 pub(crate) fn find_session_volume<'a>(
@@ -880,6 +996,186 @@ where
         .zip(selected)
         .filter_map(|(v, keep)| keep.then_some(v))
         .collect())
+}
+
+/// 校验当前会话全局筛选器是否已启用，方可执行 Overlay 提交或固化操作。
+pub fn validate_filter_commit_ready(filter_enabled: bool, what: &'static str) -> Result<()> {
+    if filter_enabled {
+        Ok(())
+    } else {
+        Err(UwfError::FilterNotCurrentlyEnabled { what })
+    }
+}
+
+/// 校验目标盘符是否已在当前会话受 UWF 保护，防止对未保护分区误执行文件提交或物理删除。
+pub fn validate_volume_commit_ready(
+    volumes: &[VolumeInfo],
+    filter_enabled: bool,
+    drive_letter: &str,
+    what: &'static str,
+) -> Result<()> {
+    validate_filter_commit_ready(filter_enabled, what)?;
+    match volumes
+        .iter()
+        .find(|v| v.drive_letter.eq_ignore_ascii_case(drive_letter))
+    {
+        None => Err(UwfError::VolumeNotFound(drive_letter.to_string())),
+        Some(v) if !v.current_protected => {
+            Err(UwfError::VolumeNotProtected(v.drive_letter.clone()))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn ensure_filter_commit_ready(b: &mut dyn UwfBackend, what: &'static str) -> Result<()> {
+    let filter = b.get_filter_state()?;
+    validate_filter_commit_ready(filter.current_enabled, what)
+}
+
+fn ensure_volume_commit_ready(
+    b: &mut dyn UwfBackend,
+    drive_letter: &str,
+    what: &'static str,
+) -> Result<()> {
+    let filter = b.get_filter_state()?;
+    let volumes = b.list_volumes()?;
+    validate_volume_commit_ready(&volumes, filter.current_enabled, drive_letter, what)
+}
+
+/// Windows 版本对 UWF 的支持级别（仅基于版本名称作友好提示，不阻止用户操作）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditionSupport {
+    /// 企业版 / 教育版 / IoT Enterprise
+    Supported,
+    /// 非企业版/教育版（如家庭版 / 专业版等）
+    Unsupported,
+    /// 未检测到或无法识别
+    Unknown,
+}
+
+/// 规范化 `Win32_OperatingSystem` 返回的系统版本文本。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn format_os_version(caption: &str, build: Option<&str>, arch: Option<&str>) -> String {
+    let mut base = caption
+        .trim()
+        .strip_prefix("Microsoft ")
+        .unwrap_or(caption.trim())
+        .to_string();
+    let build = build.map(str::trim).filter(|s| !s.is_empty());
+    let arch = arch.map(str::trim).filter(|s| !s.is_empty());
+
+    // Windows LTSC 的 Caption 常省略年份，结合 Build 号补齐以便一目了然辨识
+    if base.contains("LTSC") {
+        let ltsc_year = match build {
+            Some("14393") if !base.contains("2016") => Some("2016"),
+            Some("17763") if !base.contains("2019") => Some("2019"),
+            Some("19044") if !base.contains("2021") => Some("2021"),
+            Some("26100") if !base.contains("2024") => Some("2024"),
+            _ => None,
+        };
+        if let Some(year) = ltsc_year {
+            base.push(' ');
+            base.push_str(year);
+        }
+    }
+
+    let mut meta = Vec::new();
+    if let Some(b) = build {
+        meta.push(format!("Build {b}"));
+    }
+    if let Some(a) = arch {
+        meta.push(a.to_string());
+    }
+    if meta.is_empty() {
+        base
+    } else {
+        format!("{base} ({})", meta.join(", "))
+    }
+}
+
+/// 检查系统版本文本是否为官方支持 UWF 的 Windows 企业版 / 教育版。
+pub fn check_windows_edition_support(os_version: &str) -> EditionSupport {
+    let trimmed = os_version.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.is_empty() || lower.contains("未知") {
+        return EditionSupport::Unknown;
+    }
+    if !lower.contains("server")
+        && (lower.contains("enterprise")
+            || trimmed.contains("企业版")
+            || lower.contains("education")
+            || trimmed.contains("教育版"))
+    {
+        EditionSupport::Supported
+    } else {
+        EditionSupport::Unsupported
+    }
+}
+
+/// 将“重启后生效”排除项恢复为与“当前生效”一致的差异计划。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExclusionRevertPlan {
+    pub files_to_remove: Vec<FileExclusion>,
+    pub files_to_add: Vec<FileExclusion>,
+    pub regs_to_remove: Vec<String>,
+    pub regs_to_add: Vec<String>,
+}
+
+impl ExclusionRevertPlan {
+    pub fn remove_count(&self) -> usize {
+        self.files_to_remove.len() + self.regs_to_remove.len()
+    }
+
+    pub fn add_count(&self) -> usize {
+        self.files_to_add.len() + self.regs_to_add.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.remove_count() == 0 && self.add_count() == 0
+    }
+}
+
+/// 计算把 `next` 对齐回 `current` 需要移除与补回的排除项列表（忽略大小写去重比较）。
+pub fn plan_exclusion_revert(
+    files_current: &[FileExclusion],
+    files_next: &[FileExclusion],
+    regs_current: &[String],
+    regs_next: &[String],
+) -> ExclusionRevertPlan {
+    let files_to_remove = files_next
+        .iter()
+        .filter(|next| {
+            !files_current
+                .iter()
+                .any(|cur| cur.matches_ignore_case(next))
+        })
+        .cloned()
+        .collect();
+    let files_to_add = files_current
+        .iter()
+        .filter(|cur| !files_next.iter().any(|next| next.matches_ignore_case(cur)))
+        .cloned()
+        .collect();
+    let regs_to_remove = regs_next
+        .iter()
+        .filter(|next| {
+            !regs_current
+                .iter()
+                .any(|cur| cur.eq_ignore_ascii_case(next))
+        })
+        .cloned()
+        .collect();
+    let regs_to_add = regs_current
+        .iter()
+        .filter(|cur| !regs_next.iter().any(|next| next.eq_ignore_ascii_case(cur)))
+        .cloned()
+        .collect();
+    ExclusionRevertPlan {
+        files_to_remove,
+        files_to_add,
+        regs_to_remove,
+        regs_to_add,
+    }
 }
 
 /// R6：绝对路径 → (盘符, 相对路径)。
@@ -1570,5 +1866,177 @@ mod tests {
             resolve_volumes(dup_identity, |_| Ok(None)),
             Err(UwfError::VolumeAmbiguous(ref d)) if d == "E:"
         ));
+    }
+
+    #[test]
+    fn skips_current_unprotected_volumes_when_querying_file_exclusions() {
+        assert!(should_query_volume_exclusions(true, true));
+        assert!(!should_query_volume_exclusions(true, false));
+        assert!(should_query_volume_exclusions(false, true));
+        assert!(should_query_volume_exclusions(false, false));
+    }
+
+    #[test]
+    fn commit_actions_require_enabled_filter_and_current_protected_volume() {
+        // 1. 仅保护 C: 时，对未保护的 D: 执行 CommitFile / CommitFileDeletion 必须直接被拒绝
+        let mut backend = MockUwfBackend::demo();
+        let (tx, rx) = test_sink();
+        let emit = |e| {
+            let _ = tx.send(e);
+        };
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 1,
+                cmd: BackendCmd::CommitFile("D:\\test.txt".into()),
+            },
+            &emit,
+        );
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 2,
+                cmd: BackendCmd::CommitFileDeletion("D:\\test.txt".into()),
+            },
+            &emit,
+        );
+        // C: 受保护且筛选器已启用，应允许提交
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 3,
+                cmd: BackendCmd::CommitFileDeletion("C:\\data\\ok.txt".into()),
+            },
+            &emit,
+        );
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [
+                Outcome::Err(e1),
+                Outcome::Err(e2),
+                Outcome::Ok(ok3),
+            ] if e1.contains("卷 D: 当前会话未受 UWF 保护")
+                && e2.contains("卷 D: 当前会话未受 UWF 保护")
+                && ok3.contains("删除提交成功")
+        ));
+
+        // 2. 停用筛选器并重启后，即使之前保护过 C:，现在也必须拦截所有提交/固化操作
+        backend.disable_filter().unwrap();
+        backend.restart_system().unwrap();
+        let (tx, rx) = test_sink();
+        let emit = |e| {
+            let _ = tx.send(e);
+        };
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 4,
+                cmd: BackendCmd::CommitFile("C:\\data\\ok.txt".into()),
+            },
+            &emit,
+        );
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 5,
+                cmd: BackendCmd::CommitFileDeletion("C:\\data\\ok.txt".into()),
+            },
+            &emit,
+        );
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 6,
+                cmd: BackendCmd::CommitRegistry("HKLM\\SOFTWARE\\Demo\\Val".into()),
+            },
+            &emit,
+        );
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Err(e1), Outcome::Err(e2), Outcome::Err(e3)]
+                if e1.contains("筛选器当前会话未启用")
+                    && e2.contains("筛选器当前会话未启用")
+                    && e3.contains("筛选器当前会话未启用")
+        ));
+    }
+
+    #[test]
+    fn os_version_formatting_and_edition_detection() {
+        let formatted = format_os_version(
+            "Microsoft Windows 10 Enterprise LTSC",
+            Some("19044"),
+            Some("64-bit"),
+        );
+        assert_eq!(
+            formatted,
+            "Windows 10 Enterprise LTSC 2021 (Build 19044, 64-bit)"
+        );
+        assert_eq!(
+            check_windows_edition_support(&formatted),
+            EditionSupport::Supported
+        );
+        assert_eq!(
+            check_windows_edition_support("Windows 11 教育版 (Build 22631)"),
+            EditionSupport::Supported
+        );
+        assert_eq!(
+            check_windows_edition_support("Windows 11 Pro (Build 22631)"),
+            EditionSupport::Unsupported
+        );
+        assert_eq!(check_windows_edition_support(""), EditionSupport::Unknown);
+    }
+
+    #[test]
+    fn revert_exclusions_to_current_restores_exact_current_set() {
+        let mut backend = MockUwfBackend::demo();
+        // 先“重启”让演示规则生效为当前基线：current == next == [Windows\Temp, UwfManagerDemo]
+        backend.restart_system().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emit = |evt: BackendEvent| {
+            let _ = tx.send(evt);
+        };
+
+        // 触发不对称差异：新增 1 项文件与 1 项注册表，同时移除基线中的 1 项文件与 1 项注册表
+        backend.add_file_exclusion("C:", "\\Extra\\Temp").unwrap();
+        backend
+            .remove_file_exclusion("C:", "\\Windows\\Temp")
+            .unwrap();
+        backend
+            .add_registry_exclusion("HKLM\\SOFTWARE\\Extra")
+            .unwrap();
+        backend
+            .remove_registry_exclusion("HKLM\\SOFTWARE\\UwfManagerDemo")
+            .unwrap();
+
+        let plan = plan_exclusion_revert(
+            &backend.get_file_exclusions(true).unwrap(),
+            &backend.get_file_exclusions(false).unwrap(),
+            &backend.get_registry_exclusions(true).unwrap(),
+            &backend.get_registry_exclusions(false).unwrap(),
+        );
+        assert_eq!(plan.remove_count(), 2);
+        assert_eq!(plan.add_count(), 2);
+
+        handle_command(
+            &mut backend,
+            BackendCommand::Mutate {
+                id: 99,
+                cmd: BackendCmd::RevertExclusionsToCurrent,
+            },
+            &emit,
+        );
+
+        assert!(matches!(
+            finished_outcomes(&rx).as_slice(),
+            [Outcome::Ok(msg)] if msg.contains("移除 2 项") && msg.contains("恢复 2 项")
+        ));
+        assert_eq!(
+            backend.get_file_exclusions(false).unwrap(),
+            backend.get_file_exclusions(true).unwrap()
+        );
+        assert_eq!(
+            backend.get_registry_exclusions(false).unwrap(),
+            backend.get_registry_exclusions(true).unwrap()
+        );
     }
 }

@@ -4,7 +4,7 @@ use crate::backend::BackendKind;
 pub use crate::error::UWF_ENABLE_CMD as NI_ENABLE_CMD;
 
 pub const LOADING: &str = "正在读取 UWF 系统状态…";
-pub const LOAD_FAILED: &str = "读取状态失败，请点击右上角「刷新」或按 [F5] 重试";
+pub const LOAD_FAILED: &str = "读取状态失败，请点击下方「重新加载」或按 [F5] 重试";
 pub const BACKEND_LOST: &str = "后台服务线程已意外断开，请重启本程序";
 pub const READY_EMPTY: &str = "（暂无条目）";
 
@@ -25,10 +25,6 @@ pub fn backend_badge(kind: BackendKind) -> &'static str {
 
 pub fn protected_zh(value: bool) -> &'static str {
     if value { "已保护" } else { "未保护" }
-}
-
-pub fn enabled_zh(value: bool) -> &'static str {
-    if value { "已启用" } else { "已禁用" }
 }
 
 // ── UWF 未安装引导页 ──

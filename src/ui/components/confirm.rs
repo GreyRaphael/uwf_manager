@@ -17,6 +17,8 @@ pub enum ConfirmAction {
     Quit,
     /// 携带待删除文件的绝对路径（R4 两步确认）
     CommitFileDeletion(PathBuf),
+    /// 撤销下次会话排除项修改，恢复为与当前生效会话一致
+    RevertExclusions,
 }
 
 pub struct ConfirmState {
@@ -44,6 +46,7 @@ impl ConfirmState {
             ConfirmAction::Shutdown => "确认关机",
             ConfirmAction::Quit => "强行退出",
             ConfirmAction::CommitFileDeletion(_) => "确认删除并固化",
+            ConfirmAction::RevertExclusions => "确认撤销",
         };
         Self {
             title: title.into(),

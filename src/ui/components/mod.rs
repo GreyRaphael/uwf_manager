@@ -4,6 +4,7 @@ pub mod commit_menu;
 pub mod confirm;
 pub mod help;
 pub mod input_dialog;
+pub mod logs;
 
 use eframe::egui::{self, Color32, FontId, Id, Modal, RichText, Ui};
 

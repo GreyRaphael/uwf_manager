@@ -19,4 +19,12 @@ impl FileExclusion {
     pub fn display(&self) -> String {
         format!("{}{}", self.drive_letter, self.file_rel_path)
     }
+
+    /// 忽略大小写比较两个文件排除项是否等价（Windows 路径大小写不敏感）。
+    pub fn matches_ignore_case(&self, other: &Self) -> bool {
+        self.drive_letter.eq_ignore_ascii_case(&other.drive_letter)
+            && self
+                .file_rel_path
+                .eq_ignore_ascii_case(&other.file_rel_path)
+    }
 }

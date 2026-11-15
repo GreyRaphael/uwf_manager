@@ -60,8 +60,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(ui::text::app_title())
-        .with_inner_size([1060.0, 740.0])
-        .with_min_inner_size([900.0, 600.0]);
+        .with_inner_size([1240.0, 780.0])
+        .with_min_inner_size([1080.0, 640.0]);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }

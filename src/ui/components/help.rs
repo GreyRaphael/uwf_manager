@@ -6,13 +6,15 @@ use crate::ui::theme;
 
 use super::show_modal;
 
+pub const GITHUB_URL: &str = "https://github.com/GreyRaphael/uwf_manager";
+
 const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
     (
         "全局快捷键",
         &[
             ("F5", "刷新全部 UWF 状态（含筛选器 / 缓存 / 卷 / 排除列表）"),
             ("F1", "打开或关闭本帮助窗口"),
-            ("Esc", "关闭当前弹窗或收起底部日志面板"),
+            ("Esc", "关闭当前弹窗"),
             ("Delete", "在无文本输入焦点时移除当前选中的排除项规则"),
         ],
     ),
@@ -87,6 +89,24 @@ pub fn render(ctx: &egui::Context) -> bool {
                     });
                 ui.add_space(4.0);
             }
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("开源项目与反馈")
+                    .font(FontId::proportional(13.5))
+                    .strong()
+                    .color(theme::ACCENT),
+            );
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("GitHub 地址")
+                        .font(FontId::proportional(12.5))
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.hyperlink_to(GITHUB_URL, GITHUB_URL);
+            });
 
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

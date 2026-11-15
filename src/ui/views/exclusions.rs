@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Align, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
 };
 
-use crate::app::{ExclusionFilter, ExclusionItem, UwfApp};
+use crate::app::{ExclusionItem, UwfApp};
 use crate::ui::{text, theme};
 
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
@@ -32,25 +32,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         ui.add_space(8.0);
 
-        // 第二行：类型过滤胶囊 + 分组操作工具栏
-        ui.horizontal_wrapped(|ui| {
-            let mut filter = app.exclusion_filter;
-            if theme::segmented_toggle(
-                ui,
-                &mut filter,
-                &[
-                    (ExclusionFilter::All, "全部"),
-                    (ExclusionFilter::Files, "文件与目录"),
-                    (ExclusionFilter::Registry, "注册表"),
-                ],
-            ) {
-                app.set_exclusion_filter(filter);
-            }
-
-            ui.add_space(6.0);
+        // 第二行：单行分组操作工具栏（不换行，不提供类型过滤）
+        let revert_plan = app.exclusion_revert_plan();
+        ui.horizontal(|ui| {
             let busy = app.is_busy();
             let editable = !busy && !app.exclusion_session_current;
             let has_selected = app.selected_exclusion().is_some();
+            let can_revert = editable && !revert_plan.is_empty();
 
             ui.add_enabled_ui(editable, |ui| {
                 if theme::secondary_button(ui, "+ 文件").clicked() {
@@ -67,15 +55,38 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                         app.delete_selected_exclusion();
                     }
                 });
-                if theme::secondary_button(ui, "导入列表").clicked() {
-                    app.open_import_dialog(ui.ctx());
-                }
+                ui.add_enabled_ui(can_revert, |ui| {
+                    let revert_btn = theme::secondary_button(ui, "撤销修改");
+                    let tip = if revert_plan.is_empty() {
+                        "重启后生效列表已与当前生效一致，无需撤销".to_string()
+                    } else {
+                        format!(
+                            "撤销修改并恢复为与「当前生效 (只读)」一致（将移除 {} 项、恢复 {} 项）",
+                            revert_plan.remove_count(),
+                            revert_plan.add_count(),
+                        )
+                    };
+                    if revert_btn
+                        .on_hover_text(&tip)
+                        .on_disabled_hover_text(&tip)
+                        .clicked()
+                    {
+                        app.open_revert_exclusions_confirm();
+                    }
+                });
             });
 
-            ui.add_enabled_ui(!busy, |ui| {
-                if theme::secondary_button(ui, "导出列表").clicked() {
-                    app.open_export_dialog(ui.ctx());
-                }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    if theme::secondary_button(ui, "导出列表").clicked() {
+                        app.open_export_dialog(ui.ctx());
+                    }
+                });
+                ui.add_enabled_ui(editable, |ui| {
+                    if theme::secondary_button(ui, "导入列表").clicked() {
+                        app.open_import_dialog(ui.ctx());
+                    }
+                });
             });
         });
 
@@ -83,7 +94,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "当前视图仅反映已生效只读规则；需增删改请切换到「重启后生效 (可编辑)」",
+                    "当前视图仅反映已生效只读规则；需增删改或撤销修改请切换到「重启后生效 (可编辑)」",
                 )
                 .font(FontId::proportional(11.5))
                 .color(theme::WARN_FG),
@@ -93,7 +104,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.add_space(8.0);
 
         // 主体列表区（撑满卡片剩余空间）
-        let rows = app.filtered_exclusions();
+        let rows = app.exclusion_rows();
         let selected_key = app.selected_exclusion_key.clone();
         let filter_current_enabled = app
             .snapshot

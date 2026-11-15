@@ -30,7 +30,7 @@ use classes::*;
 
 use super::{
     RawVolumeInstance, ResolvedVolume, UwfBackend, find_session_volume, normalize_drive_letter,
-    resolve_volumes,
+    resolve_volumes, should_query_volume_exclusions,
 };
 
 /// UWF WMI 命名空间
@@ -45,6 +45,8 @@ pub struct WindowsWmiBackend {
     con: Option<WMIConnection>,
     /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot / export_exclusions 取走
     warnings: Vec<String>,
+    /// 缓存的操作系统版本文本（`None` 表示尚未查询）
+    cached_os_version: Option<Option<String>>,
 }
 
 impl WindowsWmiBackend {
@@ -54,13 +56,20 @@ impl WindowsWmiBackend {
         Self {
             con: None,
             warnings: Vec::new(),
+            cached_os_version: None,
         }
     }
 
     fn con(&mut self) -> Result<&WMIConnection> {
         if self.con.is_none() {
-            // 命名空间不存在（UWF 功能未安装）时经 From<WMIError> 转为 NotInstalled
-            self.con = Some(WMIConnection::with_namespace_path(NAMESPACE)?);
+            // 连接嵌入式命名空间失败（包括部分系统返回的 WBEM_E_NOT_FOUND）统一视为 UWF 未安装
+            let conn = WMIConnection::with_namespace_path(NAMESPACE).map_err(|e| match &e {
+                wmi::WMIError::HResultError { hres } if *hres == crate::error::WBEM_E_NOT_FOUND => {
+                    UwfError::NotInstalled
+                }
+                _ => e.into(),
+            })?;
+            self.con = Some(conn);
         }
         Ok(self.con.as_ref().expect("connected above"))
     }
@@ -89,7 +98,7 @@ impl WindowsWmiBackend {
     fn exec<Class, Out>(
         &mut self,
         object_path: &str,
-        method: &str,
+        method: &'static str,
         in_params: impl Serialize,
     ) -> Result<Out>
     where
@@ -101,6 +110,13 @@ impl WindowsWmiBackend {
             .exec_instance_method::<Class, Out>(object_path, method, in_params)
         {
             Ok(out) => Ok(out),
+            Err(wmi::WMIError::HResultError { hres }) if hres == crate::error::WBEM_E_NOT_FOUND => {
+                // 目标对象或叠加层记录不存在，并非 UWF 未安装，也无需重置健康连接
+                Err(UwfError::WmiMethod {
+                    method,
+                    code: crate::error::WBEM_E_NOT_FOUND_CODE,
+                })
+            }
             Err(e) => {
                 self.con = None;
                 Err(e.into())
@@ -184,6 +200,24 @@ impl WindowsWmiBackend {
             }
         }
         Ok(map)
+    }
+
+    /// 查询 `ROOT\CIMV2` 中的 `Win32_OperatingSystem` 以展示系统版本与 UWF 兼容性提示。
+    fn query_os_version() -> Option<String> {
+        let cimv2 = WMIConnection::new().ok()?;
+        let rows: Vec<Win32_OperatingSystem> = cimv2
+            .raw_query("SELECT Caption, BuildNumber, OSArchitecture FROM Win32_OperatingSystem")
+            .ok()?;
+        let os = rows.into_iter().next()?;
+        let caption = os.Caption.as_deref().unwrap_or("").trim();
+        if caption.is_empty() {
+            return None;
+        }
+        Some(super::format_os_version(
+            caption,
+            os.BuildNumber.as_deref(),
+            os.OSArchitecture.as_deref(),
+        ))
     }
 
     /// 按会话过滤已消歧的卷实例。
@@ -408,8 +442,14 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_file(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R3：当前会话实例
-        let path = self.find_volume_path(true, drive_letter)?;
+        // R3 前置保护校验 + 获取当前会话实例路径
+        let volumes = self.read_volumes()?;
+        let current = find_session_volume(&volumes, true, drive_letter)
+            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
+        if !current.protected {
+            return Err(UwfError::VolumeNotProtected(current.drive_letter.clone()));
+        }
+        let path = current.path.clone();
         let out: ReturnOnly = self.exec::<UWF_Volume, _>(
             &path,
             "CommitFile",
@@ -421,9 +461,21 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_file_deletion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R3 第一步：先做所有可能失败的校验，再执行不可逆删除。
-        // 卷实例不存在 / WMI 查询失败时完全不碰文件。
-        let path = self.find_volume_path(false, drive_letter)?;
+        // R3 第一步：必须在触碰物理文件前校验当前会话受保护状态与下次会话实例存在性
+        let volumes = self.read_volumes()?;
+        match find_session_volume(&volumes, true, drive_letter) {
+            Some(current) if current.protected => {}
+            Some(current) => {
+                return Err(UwfError::VolumeNotProtected(current.drive_letter.clone()));
+            }
+            None if find_session_volume(&volumes, false, drive_letter).is_some() => {
+                return Err(UwfError::VolumeNotProtected(drive_letter.into()));
+            }
+            None => return Err(UwfError::VolumeNotFound(drive_letter.into())),
+        }
+        let path = find_session_volume(&volumes, false, drive_letter)
+            .map(|v| v.path.clone())
+            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
 
         // R3 第二步：真实删除文件（写入 Overlay；已不存在则容忍）
         let abs_path = format!("{drive_letter}{file_rel_path}");
@@ -460,6 +512,10 @@ impl UwfBackend for WindowsWmiBackend {
     fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
         let mut items = Vec::new();
         for volume in self.volumes_for(current_session)? {
+            // 当前会话未受保护的卷未加载过滤驱动，调用 GetExclusions 会报 0x80041002
+            if !should_query_volume_exclusions(current_session, volume.protected) {
+                continue;
+            }
             // P1-6：单卷失败继续读其他卷，但必须留下警告，不能静默显示为空。
             let out =
                 match self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
@@ -574,5 +630,14 @@ impl UwfBackend for WindowsWmiBackend {
             },
         )?;
         Self::ensure_ok("CommitRegistry", out)
+    }
+
+    fn get_os_version(&mut self) -> Option<String> {
+        if let Some(cached) = &self.cached_os_version {
+            return cached.clone();
+        }
+        let queried = Self::query_os_version();
+        self.cached_os_version = Some(queried.clone());
+        queried
     }
 }

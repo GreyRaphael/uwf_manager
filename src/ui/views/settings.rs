@@ -5,6 +5,7 @@ use eframe::egui::{
 };
 
 use crate::app::{UwfApp, is_overlay_locked};
+use crate::backend::{EditionSupport, check_windows_edition_support};
 use crate::model::OverlayType;
 use crate::ui::{text, theme};
 
@@ -270,4 +271,75 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
             }
         });
     });
+}
+
+/// 左下角系统版本与 UWF 版本兼容性提示面板。
+pub fn render_os_card(ui: &mut egui::Ui, app: &UwfApp) -> egui::Response {
+    theme::card_frame()
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            let os_text = app
+                .os_version
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("正在检测 Windows 版本…");
+            let support = app
+                .os_version
+                .as_deref()
+                .map(check_windows_edition_support)
+                .unwrap_or(EditionSupport::Unknown);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("系统环境")
+                        .font(FontId::proportional(13.5))
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match support {
+                    EditionSupport::Supported => {
+                        theme::status_pill(ui, "支持 UWF", theme::OK_FG, theme::OK_BG);
+                    }
+                    EditionSupport::Unsupported => {
+                        theme::status_pill(ui, "需企业/教育版", theme::WARN_FG, theme::WARN_BG);
+                    }
+                    EditionSupport::Unknown => {
+                        theme::status_pill(ui, "版本未知", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(os_text)
+                        .font(FontId::proportional(12.5))
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                )
+                .wrap(),
+            );
+
+            ui.add_space(4.0);
+            let (hint_text, hint_color) = match support {
+                EditionSupport::Unsupported => (
+                    "提示：当前非企业版或教育版，需要 Windows 企业版或教育版才能使用 UWF 功能。",
+                    theme::WARN_FG,
+                ),
+                EditionSupport::Supported | EditionSupport::Unknown => (
+                    "提示：需要 Windows 企业版和教育版才能使用 UWF 功能。",
+                    theme::TEXT_MUTED,
+                ),
+            };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(hint_text)
+                        .font(FontId::proportional(11.5))
+                        .color(hint_color),
+                )
+                .wrap(),
+            );
+        })
+        .response
 }

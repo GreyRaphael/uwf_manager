@@ -1,4 +1,4 @@
-//! 现代桌面 GUI 顶层调度：顶部全局命令栏、双区工作台、底部反馈与可展开日志抽屉、模态遮罩层。
+//! 现代桌面 GUI 顶层调度：顶部全局命令栏（含日志弹窗与帮助入口）、双区工作台、底部状态栏、模态遮罩层。
 
 pub mod components;
 pub mod file_dialog;
@@ -16,14 +16,12 @@ use crate::ui::components::commit_menu::{self, CommitMenuOutcome};
 use crate::ui::components::confirm::{self, ConfirmOutcome};
 use crate::ui::components::help;
 use crate::ui::components::input_dialog::{self, InputOutcome};
+use crate::ui::components::logs;
 
 /// 绘制整个应用窗口（供 [`eframe::App::ui`] 调用）。
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
     render_top_bar(ui, app);
     render_footer_bar(ui, app);
-    if app.show_log_drawer {
-        render_log_drawer(ui, app);
-    }
     render_central_workspace(ui, app);
     render_modals(ui.ctx(), app);
     handle_shortcuts(ui.ctx(), app);
@@ -39,35 +37,11 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(text::app_title())
-                        .font(FontId::proportional(16.0))
-                        .strong()
-                        .color(theme::TEXT_PRIMARY),
-                );
-
                 let (b_fg, b_bg) = match app.backend_kind {
                     BackendKind::Windows => (theme::OK_FG, theme::OK_BG),
                     BackendKind::Mock => (theme::WARN_FG, theme::WARN_BG),
                 };
                 theme::status_pill(ui, text::backend_badge(app.backend_kind), b_fg, b_bg);
-
-                if app.phase == Phase::Ready
-                    && let Some(fs) = app.snapshot.filter_state
-                {
-                    ui.add_space(6.0);
-                    let cur_txt = format!("当前: {}", text::enabled_zh(fs.current_enabled));
-                    if fs.current_enabled {
-                        theme::status_pill(ui, &cur_txt, theme::OK_FG, theme::OK_BG);
-                    } else {
-                        theme::status_pill(ui, &cur_txt, theme::TEXT_SECONDARY, theme::BG_SUBTLE);
-                    }
-
-                    if fs.current_enabled != fs.next_enabled {
-                        let next_txt = format!("重启后: {}", text::enabled_zh(fs.next_enabled));
-                        theme::status_pill(ui, &next_txt, theme::WARN_FG, theme::WARN_BG);
-                    }
-                }
 
                 if app.is_busy() {
                     ui.add_space(6.0);
@@ -77,6 +51,10 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if theme::secondary_button(ui, "帮助 (F1)").clicked() {
                         app.open_help();
+                    }
+                    let log_lbl = format!("日志 ({})", app.logs.len());
+                    if theme::secondary_button(ui, &log_lbl).clicked() {
+                        app.open_logs();
                     }
 
                     let ready = app.phase == Phase::Ready && !app.is_busy();
@@ -94,13 +72,6 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                         if theme::secondary_button(ui, "提交操作…").clicked() {
                             app.open_commit_menu();
-                        }
-                    });
-
-                    let can_refresh = !app.is_pending();
-                    ui.add_enabled_ui(can_refresh, |ui| {
-                        if theme::secondary_button(ui, "刷新 (F5)").clicked() {
-                            app.refresh_all();
                         }
                     });
                 });
@@ -139,15 +110,6 @@ fn render_footer_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let log_lbl = if app.show_log_drawer {
-                        format!("收起日志 ({}) ▼", app.logs.len())
-                    } else {
-                        format!("操作日志 ({}) ▲", app.logs.len())
-                    };
-                    if theme::secondary_button(ui, &log_lbl).clicked() {
-                        app.show_log_drawer = !app.show_log_drawer;
-                    }
-
                     ui.label(
                         RichText::new(text::NOTICE_SHORT)
                             .font(FontId::proportional(11.5))
@@ -155,65 +117,6 @@ fn render_footer_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                     );
                 });
             });
-        });
-}
-
-fn render_log_drawer(ui: &mut egui::Ui, app: &mut UwfApp) {
-    Panel::bottom("uwf_log_drawer")
-        .frame(
-            egui::Frame::NONE
-                .fill(theme::BG_SUBTLE)
-                .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
-                .inner_margin(Margin::symmetric(16, 8)),
-        )
-        .resizable(false)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("操作记录（最新在前）")
-                        .font(FontId::proportional(12.5))
-                        .strong()
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::secondary_button(ui, "复制全部").clicked() {
-                        let dumped = app
-                            .logs
-                            .iter()
-                            .map(|e| format!("[{}] {}", e.time, e.text))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ui.ctx().copy_text(dumped);
-                        app.push_ok("已复制操作日志到剪贴板");
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            ScrollArea::vertical()
-                .id_salt("log_drawer_scroll")
-                .max_height(115.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if app.logs.is_empty() {
-                        ui.label(
-                            RichText::new("暂无操作记录")
-                                .font(FontId::proportional(12.0))
-                                .color(theme::TEXT_MUTED),
-                        );
-                        return;
-                    }
-                    for entry in app.logs.iter().rev() {
-                        let (icon, fg, bg) = theme::log_badge(entry.level);
-                        ui.horizontal(|ui| {
-                            theme::status_pill(ui, icon, fg, bg);
-                            ui.label(
-                                RichText::new(format!("[{}] {}", entry.time, entry.text))
-                                    .font(FontId::monospace(11.5))
-                                    .color(theme::TEXT_PRIMARY),
-                            );
-                        });
-                    }
-                });
         });
 }
 
@@ -282,23 +185,38 @@ fn render_status_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 fn render_ready_dashboard(ui: &mut egui::Ui, app: &mut UwfApp) {
     let total_w = ui.available_width();
     let total_h = ui.available_height();
-    let left_w = (total_w * 0.31).clamp(275.0, 325.0);
+    let left_w = (total_w * 0.30).clamp(285.0, 330.0);
     let right_w = (total_w - left_w - 14.0).max(320.0);
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 14.0;
 
-        // 左侧控制与缓存监控边栏（可滚动防极小窗口裁剪）
+        // 左侧控制、缓存监控与左下角系统环境面板（纯 top-down 计算高度，将系统面板贴底展示）
         ui.allocate_ui_with_layout(
             egui::vec2(left_w, total_h),
             Layout::top_down(Align::Min),
             |ui| {
-                ScrollArea::vertical()
-                    .id_salt("left_rail_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        views::settings::render(ui, app);
-                    });
+                let os_h_id = ui.make_persistent_id("left_rail_os_card_h");
+                let prev_os_h: f32 = ui.data(|d| d.get_temp::<f32>(os_h_id)).unwrap_or(122.0);
+                let scroll_h = (total_h - prev_os_h - 10.0).max(120.0);
+
+                ui.allocate_ui(egui::vec2(left_w, scroll_h), |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("left_rail_scroll")
+                        .max_height(scroll_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            views::settings::render(ui, app);
+                        });
+                });
+
+                ui.add_space(10.0);
+                let os_resp = views::settings::render_os_card(ui, app);
+                let measured_h = os_resp.rect.height();
+                if measured_h > 20.0 && (measured_h - prev_os_h).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(os_h_id, measured_h));
+                    ui.ctx().request_repaint();
+                }
             },
         );
 
@@ -326,6 +244,11 @@ fn render_modals(ctx: &egui::Context, app: &mut UwfApp) {
                 app.modal = Some(crate::app::Modal::Help);
             }
         }
+        crate::app::Modal::Logs => {
+            if !logs::render(ctx, app) {
+                app.modal = Some(crate::app::Modal::Logs);
+            }
+        }
         crate::app::Modal::CommitMenu => match commit_menu::render(ctx) {
             CommitMenuOutcome::Stay => app.modal = Some(crate::app::Modal::CommitMenu),
             CommitMenuOutcome::Cancel => {}
@@ -345,7 +268,14 @@ fn render_modals(ctx: &egui::Context, app: &mut UwfApp) {
                     app.modal = Some(crate::app::Modal::Input(state));
                     app.open_input_browse(kind, ctx);
                 }
-                InputOutcome::Submit(action, text) => app.execute_input(action, text),
+                InputOutcome::Submit(action, text) => {
+                    if let Err(err) = app.validate_input_preflight(action, &text) {
+                        state.error = Some(err);
+                        app.modal = Some(crate::app::Modal::Input(state));
+                    } else {
+                        app.execute_input(action, text);
+                    }
+                }
             }
         }
     }
@@ -367,11 +297,6 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut UwfApp) {
 
     if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5)) && !app.is_pending() {
         app.refresh_all();
-        return;
-    }
-
-    if app.show_log_drawer && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-        app.show_log_drawer = false;
         return;
     }
 
