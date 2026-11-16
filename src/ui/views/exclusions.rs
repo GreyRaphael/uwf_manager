@@ -13,7 +13,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_width(ui.available_width());
         ui.set_min_height(avail_h.max(200.0));
 
-        // 第一行：标题与导入导出按钮（低频维护操作收在右上角）
+        // 第一行：标题与导入导出按钮，第二行：说明副标题（防止较窄窗口下拥挤）
         let count = app.visible_exclusions().len();
         let busy = app.is_busy();
         ui.horizontal(|ui| {
@@ -22,11 +22,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     .font(FontId::proportional(15.0))
                     .strong()
                     .color(theme::TEXT_PRIMARY),
-            );
-            ui.label(
-                RichText::new(format!("共 {count} 条 · 例外清单内的改动重启后仍会保留"))
-                    .font(FontId::proportional(12.0))
-                    .color(theme::TEXT_MUTED),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
@@ -39,6 +34,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                 });
             });
         });
+        ui.label(
+            RichText::new(format!("共 {count} 条 · 例外清单内的改动重启后仍会保留"))
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
 
         ui.add_space(8.0);
 

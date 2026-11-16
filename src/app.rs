@@ -1743,7 +1743,9 @@ pub(crate) mod tests {
         assert!(harness.query_by_label("⚠ 待重启生效").is_some());
         assert!(harness.query_by_label("立即重启生效…").is_some());
 
-        // 4. 保护缓存阈值旁展示百分比提示，且每行支持直觉移除排除项、点击「撤销修改 (2)」可预览明细并确认
+        // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，分区常态显示「保持不变」，每行支持直觉移除排除项
+        assert!(harness.query_by_label("512 / 2048 MB").is_some());
+        assert_eq!(harness.query_all_by_label("保持不变").count(), 2);
         assert!(harness.query_by_label_contains("(75%)").is_some());
         assert!(harness.query_by_label_contains("(90%)").is_some());
         assert!(harness.query_by_label("移除选中").is_none());

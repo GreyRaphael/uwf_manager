@@ -87,25 +87,31 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                         }
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if theme::secondary_button(ui, "帮助 (F1)").clicked() {
+                            if theme::ghost_button(ui, "帮助 (F1)").clicked() {
                                 app.open_help();
                             }
                             let log_lbl = format!("日志 ({})", app.logs.len());
-                            if theme::secondary_button(ui, &log_lbl).clicked() {
+                            if theme::ghost_button(ui, &log_lbl).clicked() {
                                 app.open_logs();
                             }
 
                             let ready = app.phase == Phase::Ready && !app.is_busy();
                             ui.add_enabled_ui(ready, |ui| {
-                                ui.menu_button("电源 ▾", |ui| {
-                                    if ui.button("重启计算机…").clicked() {
-                                        ui.close();
-                                        app.open_restart_confirm();
-                                    }
-                                    if ui.button("关闭计算机…").clicked() {
-                                        ui.close();
-                                        app.open_shutdown_confirm();
-                                    }
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().button_padding = egui::vec2(11.0, 6.0);
+                                    let w = &mut ui.visuals_mut().widgets;
+                                    w.inactive.weak_bg_fill = theme::BG_SUBTLE;
+                                    w.inactive.bg_stroke = Stroke::new(1.0, theme::BORDER_STRONG);
+                                    ui.menu_button("电源 ▾", |ui| {
+                                        if ui.button("重启计算机…").clicked() {
+                                            ui.close();
+                                            app.open_restart_confirm();
+                                        }
+                                        if ui.button("关闭计算机…").clicked() {
+                                            ui.close();
+                                            app.open_shutdown_confirm();
+                                        }
+                                    });
                                 });
 
                                 if theme::secondary_button(ui, "永久保存…").clicked() {

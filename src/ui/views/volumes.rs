@@ -44,7 +44,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 .column(Column::remainder().at_least(150.0))
                 .column(Column::initial(95.0).at_least(85.0))
                 .column(Column::initial(172.0).at_least(160.0))
-                .header(26.0, |mut header| {
+                .header(28.0, |mut header| {
                     for title in ["分区", "保护效果说明", "当前生效", "重启后生效"]
                     {
                         header.col(|ui| {
@@ -59,7 +59,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 })
                 .body(|body| {
                     let row_count = app.snapshot.volumes.len();
-                    body.rows(30.0, row_count, |mut row| {
+                    body.rows(36.0, row_count, |mut row| {
                         let vol = &app.snapshot.volumes[row.index()];
 
                         row.col(|ui| {
@@ -134,14 +134,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                                     "将取消 (待重启)"
                                 };
                                 theme::status_pill(ui, label, theme::WARN_FG, theme::WARN_BG);
-                            } else if vol.next_protected {
-                                theme::status_pill(ui, "已保护", theme::OK_FG, theme::OK_BG);
                             } else {
-                                theme::status_pill(
-                                    ui,
-                                    "未保护",
-                                    theme::TEXT_SECONDARY,
-                                    theme::BG_SUBTLE,
+                                ui.label(
+                                    RichText::new("保持不变")
+                                        .font(FontId::proportional(12.0))
+                                        .color(theme::TEXT_MUTED),
                                 );
                             }
                         });

@@ -1,8 +1,6 @@
 //! 左侧控制与监控栏：筛选器总开关 + 写入缓存 (Overlay) 监控与配置。
 
-use eframe::egui::{
-    self, Align, CornerRadius, FontId, Layout, Margin, ProgressBar, RichText, Stroke,
-};
+use eframe::egui::{self, Align, CornerRadius, FontId, Layout, Margin, RichText, Stroke};
 
 use crate::app::{UwfApp, is_overlay_locked};
 use crate::backend::{EditionSupport, check_windows_edition_support};
@@ -120,12 +118,24 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 fn render_overlay_card(ui: &mut egui::Ui, app: &mut UwfApp) {
     theme::card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let subtitle = if app.cache.dirty {
-            Some("* 有未保存改动")
-        } else {
-            Some("临时缓存占用与配额")
-        };
-        theme::card_header(ui, "保护缓存", subtitle);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("保护缓存")
+                    .font(FontId::proportional(15.0))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            if app.cache.dirty {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    theme::status_pill(ui, "* 未保存", theme::WARN_FG, theme::WARN_BG);
+                });
+            }
+        });
+        ui.label(
+            RichText::new("临时缓存占用与配额上限")
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
         ui.add_space(8.0);
 
         render_usage_section(ui, app);
@@ -154,25 +164,23 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("当前缓存用量")
+                RichText::new("当前用量")
                     .font(FontId::proportional(12.5))
                     .strong()
                     .color(theme::TEXT_PRIMARY),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 theme::status_pill(ui, &format!("● {status_text} {percent}%"), fg, bg);
+                ui.label(
+                    RichText::new(format!("{} / {} MB", runtime.consumption_mb, max_size))
+                        .font(FontId::proportional(12.0))
+                        .color(theme::TEXT_SECONDARY),
+                );
             });
         });
 
-        ui.add_space(4.0);
-        ui.add(
-            ProgressBar::new(ratio)
-                .desired_width(ui.available_width())
-                .desired_height(18.0)
-                .fill(bar_color)
-                .corner_radius(CornerRadius::same(6))
-                .text(format!("已用 {} / {} MB", runtime.consumption_mb, max_size)),
-        );
+        ui.add_space(6.0);
+        theme::slim_progress_bar(ui, ratio, bar_color);
     } else {
         egui::Frame::NONE
             .fill(theme::BG_SUBTLE)

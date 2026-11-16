@@ -110,32 +110,41 @@ pub fn modal_frame() -> Frame {
         .inner_margin(Margin::same(20))
 }
 
-/// 卡片头部标题 + 可选辅助副标题。
+/// 卡片头部标题 + 下方可选说明文字（避免在窄边栏与右侧控件争抢宽度）。
 pub fn card_header(ui: &mut Ui, title: &str, subtitle: Option<&str>) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(title)
-                .font(FontId::proportional(15.0))
-                .strong()
-                .color(TEXT_PRIMARY),
-        );
-        if let Some(sub) = subtitle {
-            ui.label(
+    ui.label(
+        RichText::new(title)
+            .font(FontId::proportional(15.0))
+            .strong()
+            .color(TEXT_PRIMARY),
+    );
+    if let Some(sub) = subtitle {
+        ui.add_space(1.0);
+        ui.add(
+            egui::Label::new(
                 RichText::new(sub)
-                    .font(FontId::proportional(12.0))
+                    .font(FontId::proportional(11.5))
                     .color(TEXT_MUTED),
-            );
-        }
-    });
+            )
+            .wrap(),
+        );
+    }
 }
 
-/// 高优先级实心强调按钮（每组仅用于最核心动作）。
+/// 高优先级实心强调按钮（禁用态转为低对比灰底以免误导点击）。
 pub fn primary_button(ui: &mut Ui, label: &str) -> Response {
+    let enabled = ui.is_enabled();
+    let (fill, border, fg) = if enabled {
+        (ACCENT, ACCENT, Color32::WHITE)
+    } else {
+        (BG_SUBTLE, BORDER, TEXT_MUTED)
+    };
     ui.add(
-        Button::new(RichText::new(label).color(Color32::WHITE).strong())
-            .fill(ACCENT)
-            .stroke(Stroke::new(1.0, ACCENT))
-            .corner_radius(CornerRadius::same(6)),
+        Button::new(RichText::new(label).color(fg).strong())
+            .fill(fill)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 28.0)),
     )
 }
 
@@ -145,7 +154,19 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
         Button::new(RichText::new(label).color(TEXT_PRIMARY))
             .fill(BG_SUBTLE)
             .stroke(Stroke::new(1.0, BORDER_STRONG))
-            .corner_radius(CornerRadius::same(6)),
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 28.0)),
+    )
+}
+
+/// 无边框轻量幽灵按钮（用于日志、帮助等辅助信息入口）。
+pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add(
+        Button::new(RichText::new(label).color(TEXT_SECONDARY))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 28.0)),
     )
 }
 
@@ -155,7 +176,8 @@ pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
         Button::new(RichText::new(label).color(ERR_FG))
             .fill(ERR_BG)
             .stroke(Stroke::new(1.0, Color32::from_rgb(252, 165, 165)))
-            .corner_radius(CornerRadius::same(6)),
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(0.0, 28.0)),
     )
 }
 
@@ -282,6 +304,35 @@ pub fn log_badge(level: LogLevel) -> (&'static str, Color32, Color32) {
     }
 }
 
+/// Fluent 风格细进度条（避免文字压在填充交界处影响对比度）。
+pub fn slim_progress_bar(ui: &mut Ui, ratio: f32, fill_color: Color32) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 10.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let radius = rect.height() * 0.5;
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, BG_SUBTLE);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let clamped = ratio.clamp(0.0, 1.0);
+    if clamped > 0.0 {
+        let min_visible_w = if clamped > 0.01 { rect.height() } else { 0.0 };
+        let fill_w = (rect.width() * clamped)
+            .max(min_visible_w)
+            .min(rect.width());
+        let fill_rect = egui::Rect::from_min_size(rect.min, Vec2::new(fill_w, rect.height()));
+        painter.rect_filled(fill_rect, radius, fill_color);
+    }
+}
+
 /// Fluent 风格布尔开关（用于分区保护等行内直接切换），状态以 `on` 为唯一真相源。
 pub fn toggle_switch(ui: &mut Ui, on: bool, a11y_label: &str) -> Response {
     let desired_size = Vec2::new(36.0, 20.0);
@@ -297,7 +348,11 @@ pub fn toggle_switch(ui: &mut Ui, on: bool, a11y_label: &str) -> Response {
 
         let off_bg = if enabled { BORDER_STRONG } else { BORDER };
         let on_bg = if enabled {
-            ACCENT
+            if hovered {
+                Color32::from_rgb(0, 86, 179)
+            } else {
+                ACCENT
+            }
         } else {
             Color32::from_rgb(147, 197, 253)
         };
@@ -305,20 +360,27 @@ pub fn toggle_switch(ui: &mut Ui, on: bool, a11y_label: &str) -> Response {
 
         let painter = ui.painter();
         let radius = 0.5 * rect.height();
-        painter.rect_filled(rect, radius, bg);
         if hovered {
+            let halo = Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 80);
             painter.rect_stroke(
                 rect,
                 radius,
-                Stroke::new(1.5, ACCENT),
+                Stroke::new(2.0, halo),
                 egui::StrokeKind::Outside,
             );
         }
+        painter.rect_filled(rect, radius, bg);
 
         let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
         let center = egui::pos2(circle_x, rect.center().y);
         let knob_color = if enabled { Color32::WHITE } else { BG_SUBTLE };
-        painter.circle_filled(center, 0.72 * radius, knob_color);
+        let knob_r = 0.72 * radius;
+        painter.circle_filled(center, knob_r, knob_color);
+        painter.circle_stroke(
+            center,
+            knob_r,
+            Stroke::new(0.6, Color32::from_rgba_unmultiplied(15, 23, 42, 36)),
+        );
     }
 
     response
