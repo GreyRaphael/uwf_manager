@@ -249,6 +249,25 @@ pub fn status_pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
         });
 }
 
+/// 双态（当前 / 重启后）布尔状态胶囊：待重启变更时琥珀高亮，否则按激活与否展示绿/灰胶囊。
+pub fn state_status_pill(
+    ui: &mut Ui,
+    active: bool,
+    pending: bool,
+    on_label: &str,
+    off_label: &str,
+) {
+    let (fg, bg) = if pending {
+        (WARN_FG, WARN_BG)
+    } else if active {
+        (OK_FG, OK_BG)
+    } else {
+        (TEXT_SECONDARY, BG_SUBTLE)
+    };
+    let label = if active { on_label } else { off_label };
+    status_pill(ui, label, fg, bg);
+}
+
 /// 现代分段胶囊切换控件，返回是否切换了选中项。
 pub fn segmented_toggle<T: Copy + PartialEq>(
     ui: &mut Ui,

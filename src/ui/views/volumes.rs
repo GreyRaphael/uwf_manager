@@ -4,7 +4,7 @@ use eframe::egui::{self, Align, FontId, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::UwfApp;
-use crate::ui::{text, theme};
+use crate::ui::theme;
 
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
     theme::card_frame().show(ui, |ui| {
@@ -92,7 +92,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                         });
 
                         row.col(|ui| {
-                            render_protection_pill(ui, vol.current_protected, false);
+                            theme::state_status_pill(
+                                ui,
+                                vol.current_protected,
+                                false,
+                                "保护",
+                                "不保护",
+                            );
                         });
 
                         row.col(|ui| {
@@ -125,7 +131,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
 
                         row.col(|ui| {
                             let pending = vol.current_protected != vol.next_protected;
-                            render_protection_pill(ui, vol.next_protected, pending);
+                            theme::state_status_pill(
+                                ui,
+                                vol.next_protected,
+                                pending,
+                                "保护",
+                                "不保护",
+                            );
                         });
                     });
                 });
@@ -135,15 +147,4 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
             app.set_volume_protected(&drive, protect);
         }
     });
-}
-
-fn render_protection_pill(ui: &mut egui::Ui, protected: bool, pending: bool) {
-    let (fg, bg) = if pending {
-        (theme::WARN_FG, theme::WARN_BG)
-    } else if protected {
-        (theme::OK_FG, theme::OK_BG)
-    } else {
-        (theme::TEXT_SECONDARY, theme::BG_SUBTLE)
-    };
-    theme::status_pill(ui, text::protected_zh(protected), fg, bg);
 }

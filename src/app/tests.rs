@@ -764,11 +764,13 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     assert!(harness.query_by_label("⚠ 待重启生效").is_some());
     assert!(harness.query_by_label("立即重启生效…").is_some());
 
-    // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，分区表改为 5 列，每行支持直觉移除排除项
+    // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，总开关与分区表均显示 3 列状态，每行支持直觉移除排除项
     assert!(harness.query_by_label("512 / 2048 MB").is_some());
-    assert!(harness.query_by_label("当前状态").is_some());
-    assert!(harness.query_by_label("开关").is_some());
-    assert!(harness.query_by_label("重启后状态").is_some());
+    assert_eq!(harness.query_all_by_label("当前状态").count(), 2);
+    assert_eq!(harness.query_all_by_label("开关").count(), 2);
+    assert_eq!(harness.query_all_by_label("重启后状态").count(), 2);
+    assert_eq!(harness.query_all_by_label("开启").count(), 2);
+    assert_eq!(harness.query_all_by_label("关闭").count(), 0);
     assert!(harness.query_by_label("保持不变").is_none());
     assert_eq!(harness.query_all_by_label("保护").count(), 2);
     assert_eq!(harness.query_all_by_label("不保护").count(), 2);
@@ -810,8 +812,9 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     harness.run();
     assert!(harness.query_by_label("⚠ 待重启生效").is_none());
     assert!(harness.query_by_label("✔ 当前设置已全部生效").is_some());
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 0);
 
-    // 5. 也测试点击「立即重启生效…」会弹出重启确认对话框
+    // 5. 测试总开关其余三种状态组合及点击「立即重启生效…」弹出重启确认对话框
     harness.get_by_label("切换写保护总开关").click();
     harness.run_steps(2);
     let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
@@ -825,7 +828,7 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
         current_enabled: true,
         next_enabled: false,
     });
-    let _ = event_tx.send(BackendEvent::Snapshot(pending_snap));
+    let _ = event_tx.send(BackendEvent::Snapshot(pending_snap.clone()));
     let _ = event_tx.send(BackendEvent::Finished {
         id,
         outcome: Outcome::Ok("将在重启后停用保护".into()),
@@ -836,11 +839,37 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
             .query_by_label_contains("将在重启后停用保护")
             .is_some()
     );
+    // 状态 2：当前 开启 -> 开关 off(待重启生效) -> 重启后 关闭
+    assert_eq!(harness.query_all_by_label("开启").count(), 1);
+    assert_eq!(harness.query_all_by_label("关闭").count(), 1);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 1);
     harness.get_by_label("立即重启生效…").click();
     harness.run();
     assert!(harness.query_by_label("重启系统确认").is_some());
     harness.get_by_label("取消").click();
     harness.run();
+
+    // 状态 3：当前 关闭 -> 开关 off -> 重启后 关闭
+    pending_snap.filter_state = Some(FilterState {
+        current_enabled: false,
+        next_enabled: false,
+    });
+    let _ = event_tx.send(BackendEvent::Snapshot(pending_snap.clone()));
+    harness.run();
+    assert_eq!(harness.query_all_by_label("开启").count(), 0);
+    assert_eq!(harness.query_all_by_label("关闭").count(), 2);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 0);
+
+    // 状态 4：当前 关闭 -> 开关 on(待重启生效) -> 重启后 开启
+    pending_snap.filter_state = Some(FilterState {
+        current_enabled: false,
+        next_enabled: true,
+    });
+    let _ = event_tx.send(BackendEvent::Snapshot(pending_snap));
+    harness.run();
+    assert_eq!(harness.query_all_by_label("开启").count(), 1);
+    assert_eq!(harness.query_all_by_label("关闭").count(), 1);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 1);
 
     // 恢复一个非空排除项并通过行内「移除」按钮直接移除第一行
     let _ = event_tx.send(BackendEvent::Snapshot(demo_snapshot()));

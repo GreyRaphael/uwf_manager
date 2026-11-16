@@ -13,10 +13,6 @@ pub fn app_title() -> String {
     format!("UWF 管理器 v{}", env!("CARGO_PKG_VERSION"))
 }
 
-pub fn protected_zh(value: bool) -> &'static str {
-    if value { "保护" } else { "不保护" }
-}
-
 // ── UWF 未安装引导页 ──
 pub const NI_TITLE: &str = "未检测到 UWF 功能";
 pub const NI_LEAD: &str = "当前系统尚未安装或启用 Windows 统一写入筛选器（Unified Write Filter）。";

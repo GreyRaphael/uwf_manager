@@ -53,19 +53,13 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
             return;
         };
 
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("当前保护")
-                    .font(FontId::proportional(12.5))
-                    .color(theme::TEXT_SECONDARY),
-            );
-            if fs.current_enabled {
-                theme::status_pill(ui, "● 已开启", theme::OK_FG, theme::OK_BG);
-            } else {
-                theme::status_pill(ui, "○ 已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
-            }
+        let pending = fs.current_enabled != fs.next_enabled;
+        ui.columns(3, |cols| {
+            filter_slot(&mut cols[0], "当前状态", |ui| {
+                theme::state_status_pill(ui, fs.current_enabled, false, "开启", "关闭");
+            });
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            filter_slot(&mut cols[1], "开关", |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     let switch_tip = if fs.next_enabled {
                         "点击切换：将在下次重启后停用写保护"
@@ -81,29 +75,35 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
                     }
                 });
             });
+
+            filter_slot(&mut cols[2], "重启后状态", |ui| {
+                theme::state_status_pill(ui, fs.next_enabled, pending, "开启", "关闭");
+            });
         });
 
-        if fs.current_enabled != fs.next_enabled {
-            ui.add_space(8.0);
-            let pending_msg = if fs.next_enabled {
-                "⏳ 已设为开启保护，将在下次重启后生效"
-            } else {
-                "⏳ 已设为关闭保护，将在下次重启后生效"
-            };
-            egui::Frame::NONE
-                .fill(theme::WARN_BG)
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new(pending_msg)
-                            .font(FontId::proportional(12.0))
-                            .strong()
-                            .color(theme::WARN_FG),
-                    );
-                });
-        }
+        // 固定预留开关下方提示槽位高度，避免切换时导致下方「保护缓存」卡片上下跳动
+        ui.add_space(6.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 22.0),
+            Layout::top_down(Align::Center),
+            |ui| {
+                if pending {
+                    theme::status_pill(ui, "待重启生效", theme::WARN_FG, theme::WARN_BG);
+                }
+            },
+        );
+    });
+}
+
+fn filter_slot(ui: &mut egui::Ui, heading: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new(heading)
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
+        ui.add_space(6.0);
+        body(ui);
     });
 }
 
