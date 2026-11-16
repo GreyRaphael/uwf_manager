@@ -144,7 +144,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                 .inner_margin(Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    ui.with_layout(
+                                    // 显式限定单行高度为 interact_size.y，防止在 auto_shrink([false, false]) 的
+                                    // ScrollArea 中直接调用 with_layout 吃满剩余可视高度并把状态胶囊纵向拉长。
+                                    let row_h = ui.spacing().interact_size.y;
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), row_h),
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
                                             ui.add_enabled_ui(!busy, |ui| {
@@ -191,7 +195,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                                             let left_w = ui.available_width().max(80.0);
                                             ui.allocate_ui_with_layout(
-                                                egui::vec2(left_w, 20.0),
+                                                egui::vec2(left_w, row_h),
                                                 Layout::left_to_right(Align::Center),
                                                 |ui| {
                                                     theme::status_pill(

@@ -786,7 +786,22 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     assert!(harness.query_by_label_contains("(75%)").is_some());
     assert!(harness.query_by_label_contains("(90%)").is_some());
     assert!(harness.query_by_label("移除选中").is_none());
-    assert_eq!(harness.query_all_by_label("移除").count(), 2);
+    let rm_rects: Vec<_> = harness
+        .query_all_by_label("移除")
+        .map(|n| n.rect())
+        .collect();
+    assert_eq!(rm_rects.len(), 2);
+    let row_gap = rm_rects[1].center().y - rm_rects[0].center().y;
+    assert!(
+        row_gap > 20.0 && row_gap < 48.0,
+        "排除项单行高度应紧凑（约 30-40px），不应被 ScrollArea 拉高: gap={row_gap}, rects={rm_rects:?}"
+    );
+    let kind_rect = harness.get_by_label("文件/目录").rect();
+    assert!(
+        (kind_rect.center().y - rm_rects[0].center().y).abs() < 6.0,
+        "类型徽章应与移除按钮处于同一紧凑水平行: kind={kind_rect:?}, rm={:?}",
+        rm_rects[0]
+    );
 
     harness.get_by_label("撤销修改 (2)").click();
     harness.run();
