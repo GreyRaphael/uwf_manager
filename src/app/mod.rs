@@ -840,7 +840,7 @@ impl eframe::App for UwfApp {
         crate::ui::render(ui, self);
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.send_quit();
     }
 }

@@ -615,13 +615,22 @@ fn gui_not_installed_and_logs_modal() {
     harness.run();
     assert!(harness.state().modal.is_none());
 
-    // 打开帮助弹窗并验证包含 GitHub 地址
+    // 打开帮助弹窗并验证包含 GitHub 地址与复制按钮
     harness.get_by_label("帮助 (F1)").click();
     harness.run();
     assert!(
         harness
             .query_by_label("https://github.com/GreyRaphael/uwf_manager")
             .is_some()
+    );
+    harness.get_by_label("复制地址").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .logs
+            .back()
+            .is_some_and(|e| e.text.contains("GitHub 项目地址"))
     );
     harness.get_by_label("知道了").click();
     harness.run();

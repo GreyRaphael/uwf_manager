@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align, FontId, Layout, RichText};
 
+use crate::app::UwfApp;
 use crate::ui::theme;
 
 use super::show_modal;
@@ -49,7 +50,7 @@ const SECTIONS: [(&str, &[(&str, &str)]); 3] = [
     ),
 ];
 
-pub fn render(ctx: &egui::Context) -> bool {
+pub fn render(ctx: &egui::Context, app: &mut UwfApp) -> bool {
     let mut close_clicked = false;
     let (_, should_close) = show_modal(
         ctx,
@@ -104,7 +105,17 @@ pub fn render(ctx: &egui::Context) -> bool {
                         .strong()
                         .color(theme::TEXT_PRIMARY),
                 );
-                ui.hyperlink_to(GITHUB_URL, GITHUB_URL);
+                ui.label(
+                    RichText::new(GITHUB_URL)
+                        .font(FontId::proportional(12.5))
+                        .color(theme::ACCENT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::secondary_button(ui, "复制地址").clicked() {
+                        ui.ctx().copy_text(GITHUB_URL.to_string());
+                        app.push_ok("已将 GitHub 项目地址复制到剪贴板");
+                    }
+                });
             });
 
             ui.add_space(10.0);

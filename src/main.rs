@@ -123,3 +123,14 @@ fn show_fatal_dialog(title: &str, message: &str) {
             .show();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_window_icon_decodes_cleanly() {
+        let icon = super::load_window_icon().expect("内嵌 icon.ico 必须可正常解码");
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+}

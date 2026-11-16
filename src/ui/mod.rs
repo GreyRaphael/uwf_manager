@@ -290,7 +290,7 @@ fn render_modals(ctx: &egui::Context, app: &mut UwfApp) {
     };
     match modal {
         crate::app::Modal::Help => {
-            if !help::render(ctx) {
+            if !help::render(ctx, app) {
                 app.modal = Some(crate::app::Modal::Help);
             }
         }

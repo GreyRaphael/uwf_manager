@@ -5,8 +5,15 @@ edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
-eframe = "0.37.0"
-egui_extras = "0.37.0"
+eframe = { version = "0.37.0", default-features = false, features = [
+    "glow",
+    "clipboard",
+    "default_fonts",
+    "system_fonts",
+    "x11",
+    "wayland",
+] }
+egui_extras = { version = "0.37.0", default-features = false }
 image = { version = "0.25", default-features = false, features = ["ico"] }
 rfd = "0.18.0"
 thiserror = "2"
@@ -27,3 +34,9 @@ windows = { version = "0.62", features = [
 
 [build-dependencies]
 embed-resource = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
