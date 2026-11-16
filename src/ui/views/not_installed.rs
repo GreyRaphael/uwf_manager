@@ -3,6 +3,8 @@
 use eframe::egui::{self, Align, CornerRadius, FontId, Layout, Margin, RichText, Stroke};
 
 use crate::app::UwfApp;
+use crate::backend::{EditionSupport, check_windows_edition_support};
+use crate::error::UWF_ENABLE_CMD;
 use crate::ui::{text, theme};
 
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
@@ -34,13 +36,29 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                 if let Some(os_ver) = &app.os_version {
                     ui.add_space(6.0);
+                    let (msg, color) = match check_windows_edition_support(os_ver) {
+                        EditionSupport::Unsupported => (
+                            format!(
+                                "当前系统：{os_ver}（当前非企业版或教育版，需要 Windows 企业版和教育版才能使用 UWF 功能）"
+                            ),
+                            theme::WARN_FG,
+                        ),
+                        EditionSupport::Supported => (
+                            format!("当前系统：{os_ver}（版本符合要求：已支持启用 UWF 功能）"),
+                            theme::OK_FG,
+                        ),
+                        EditionSupport::Unknown => (
+                            format!(
+                                "当前系统：{os_ver}（提示：需要 Windows 企业版和教育版才能使用 UWF 功能）"
+                            ),
+                            theme::TEXT_MUTED,
+                        ),
+                    };
                     ui.add(
                         egui::Label::new(
-                            RichText::new(format!(
-                                "当前系统：{os_ver}（提示：需要 Windows 企业版和教育版才能使用 UWF 功能）"
-                            ))
-                            .font(FontId::proportional(12.0))
-                            .color(theme::TEXT_MUTED),
+                            RichText::new(msg)
+                                .font(FontId::proportional(12.0))
+                                .color(color),
                         )
                         .wrap(),
                     );
@@ -80,7 +98,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                         let copy_w = theme::measure_button_width(ui, "复制命令");
                         let spacing = ui.spacing().item_spacing.x;
                         ui.horizontal(|ui| {
-                            let mut cmd_ref: &str = text::NI_ENABLE_CMD;
+                            let mut cmd_ref: &str = UWF_ENABLE_CMD;
                             ui.add(
                                 egui::TextEdit::singleline(&mut cmd_ref)
                                     .desired_width((ui.available_width() - copy_w - spacing).max(180.0))
@@ -90,7 +108,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if theme::secondary_button(ui, "复制命令").clicked() {
-                                    ui.ctx().copy_text(text::NI_ENABLE_CMD.to_string());
+                                    ui.ctx().copy_text(UWF_ENABLE_CMD.to_string());
                                     app.push_ok("已将 PowerShell 启用命令复制到剪贴板");
                                 }
                             });

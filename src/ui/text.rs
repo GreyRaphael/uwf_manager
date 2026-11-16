@@ -1,7 +1,5 @@
 //! 界面中文文案与共享标签常量。
 
-pub use crate::error::UWF_ENABLE_CMD as NI_ENABLE_CMD;
-
 pub const LOADING: &str = "正在读取 UWF 系统状态…";
 pub const LOAD_FAILED: &str = "读取状态失败，请点击下方「重新加载」或按 [F5] 重试";
 pub const BACKEND_LOST: &str = "后台服务线程已意外断开，请重启本程序";

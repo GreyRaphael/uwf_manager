@@ -350,10 +350,7 @@ impl UwfApp {
                     let _ = self.begin_mutation(BackendCmd::ImportExclusions { path });
                 }
                 FileDialogTarget::ExportExclusions => {
-                    let _ = self.begin_mutation(BackendCmd::ExportExclusions {
-                        path,
-                        current_session: false,
-                    });
+                    let _ = self.begin_mutation(BackendCmd::ExportExclusions { path });
                 }
             },
             Ok(None) => {}
@@ -1610,7 +1607,21 @@ pub(crate) mod tests {
         assert!(harness.query_by_label_contains("Windows 10 Pro").is_some());
         assert!(
             harness
+                .query_by_label_contains("当前非企业版或教育版")
+                .is_some()
+        );
+        assert!(
+            harness
                 .query_by_label_contains("需要 Windows 企业版和教育版才能使用 UWF 功能")
+                .is_some()
+        );
+        let _ = event_tx.send(BackendEvent::OsVersion(
+            "Windows 10 Enterprise LTSC 2021 16G".into(),
+        ));
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("版本符合要求：已支持启用 UWF 功能")
                 .is_some()
         );
         harness.get_by_label("重新检测").click();

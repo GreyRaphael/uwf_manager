@@ -166,10 +166,9 @@ pub enum BackendCmd {
     ImportExclusions {
         path: PathBuf,
     },
-    /// 导出 UI 当前视图（current_session 由 UI 传入）
+    /// 导出下次会话（重启后生效）排除列表
     ExportExclusions {
         path: PathBuf,
-        current_session: bool,
     },
     /// 撤销下次会话排除项修改，使其恢复到与当前生效会话一致
     RevertExclusionsToCurrent,
@@ -436,10 +435,7 @@ fn handle_mutation(
             Ok(format!("注册表 {full_path} 提交成功"))
         }),
         BackendCmd::ImportExclusions { path } => import_exclusions(id, backend, emit, &path),
-        BackendCmd::ExportExclusions {
-            path,
-            current_session,
-        } => export_exclusions(id, backend, emit, &path, current_session),
+        BackendCmd::ExportExclusions { path } => export_exclusions(id, backend, emit, &path),
         BackendCmd::RevertExclusionsToCurrent => {
             revert_exclusions_to_current(id, backend, emit);
         }
@@ -767,11 +763,11 @@ fn export_exclusions(
     backend: &mut dyn UwfBackend,
     emit: &dyn Fn(BackendEvent),
     path: &Path,
-    current_session: bool,
 ) {
     let result = (|| -> Result<(usize, PathBuf, Vec<String>)> {
-        let files = backend.get_file_exclusions(current_session)?;
-        let registry = backend.get_registry_exclusions(current_session)?;
+        // 排除列表与配置保持一致，统一导出下次会话（重启后生效）的持久规则
+        let files = backend.get_file_exclusions(false)?;
+        let registry = backend.get_registry_exclusions(false)?;
         let warnings = backend.take_warnings();
         let mut lines: Vec<String> = files.iter().map(|e| e.display()).collect();
         lines.extend(registry);
@@ -1430,7 +1426,6 @@ mod tests {
                 let _ = tx.send(e);
             },
             &export,
-            false,
         );
         assert_eq!(std::fs::metadata(&export).unwrap().len(), 0);
 
@@ -1645,7 +1640,6 @@ mod tests {
                 let _ = tx.send(e);
             },
             &export,
-            false,
         );
         assert!(stub.warnings.is_empty(), "export 必须消费 warnings");
         assert!(matches!(
