@@ -56,6 +56,36 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                             ui.spinner();
                         }
 
+                        if app.phase == Phase::Ready {
+                            let reasons = app.pending_reboot_reasons();
+                            if reasons.is_empty() {
+                                ui.label(
+                                    RichText::new("✔ 当前设置已全部生效")
+                                        .font(FontId::proportional(12.0))
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            } else {
+                                let detail = format!(
+                                    "以下更改将在下次重启计算机后生效：{}",
+                                    reasons.join("、")
+                                );
+                                theme::status_pill(
+                                    ui,
+                                    "⚠ 待重启生效",
+                                    theme::WARN_FG,
+                                    theme::WARN_BG,
+                                );
+                                ui.add_enabled_ui(!app.is_busy(), |ui| {
+                                    if theme::secondary_button(ui, "立即重启生效…")
+                                        .on_hover_text(&detail)
+                                        .clicked()
+                                    {
+                                        app.open_restart_confirm();
+                                    }
+                                });
+                            }
+                        }
+
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::secondary_button(ui, "帮助 (F1)").clicked() {
                                 app.open_help();

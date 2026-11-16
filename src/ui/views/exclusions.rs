@@ -13,23 +13,41 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_width(ui.available_width());
         ui.set_min_height(avail_h.max(200.0));
 
-        // 第一行：标题与生效机制说明（仅展示重启后配置视图，行内通过标签区分是否已生效）
+        // 第一行：标题与导入导出按钮（低频维护操作收在右上角）
         let count = app.visible_exclusions().len();
-        theme::card_header(
-            ui,
-            "排除项规则",
-            Some(&format!("共 {count} 条 · 例外清单内的改动重启后仍会保留")),
-        );
+        let busy = app.is_busy();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("排除项规则")
+                    .font(FontId::proportional(15.0))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(format!("共 {count} 条 · 例外清单内的改动重启后仍会保留"))
+                    .font(FontId::proportional(12.0))
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    if theme::secondary_button(ui, "导出列表").clicked() {
+                        app.open_export_dialog(ui.ctx());
+                    }
+                    if theme::secondary_button(ui, "导入列表").clicked() {
+                        app.open_import_dialog(ui.ctx());
+                    }
+                });
+            });
+        });
 
         ui.add_space(8.0);
 
-        // 第二行：单行分组操作工具栏（不换行，不提供类型过滤）
+        // 第二行：高频添加与撤销操作工具栏（不换行）
         let revert_plan = app.exclusion_revert_plan();
+        let revert_count = revert_plan.remove_count() + revert_plan.add_count();
         ui.horizontal(|ui| {
-            let busy = app.is_busy();
             let editable = !busy;
-            let has_selected = app.selected_exclusion().is_some();
-            let can_revert = editable && !revert_plan.is_empty();
+            let can_revert = editable && revert_count > 0;
 
             ui.add_enabled_ui(editable, |ui| {
                 if theme::secondary_button(ui, "+ 文件").clicked() {
@@ -41,13 +59,16 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                 if theme::secondary_button(ui, "+ 注册表").clicked() {
                     app.open_add_registry_exclusion();
                 }
-                ui.add_enabled_ui(has_selected, |ui| {
-                    if theme::danger_button(ui, "移除选中").clicked() {
-                        app.delete_selected_exclusion();
-                    }
-                });
+            });
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_enabled_ui(can_revert, |ui| {
-                    let revert_btn = theme::secondary_button(ui, "撤销修改");
+                    let revert_label = if revert_count > 0 {
+                        format!("撤销修改 ({revert_count})")
+                    } else {
+                        "撤销修改".to_string()
+                    };
+                    let revert_btn = theme::secondary_button(ui, &revert_label);
                     let tip = if revert_plan.is_empty() {
                         "重启后排除列表已与当前生效一致，无需撤销".to_string()
                     } else {
@@ -66,17 +87,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     }
                 });
             });
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if theme::secondary_button(ui, "导出列表").clicked() {
-                        app.open_export_dialog(ui.ctx());
-                    }
-                    if theme::secondary_button(ui, "导入列表").clicked() {
-                        app.open_import_dialog(ui.ctx());
-                    }
-                });
-            });
         });
 
         ui.add_space(8.0);
@@ -91,6 +101,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         let list_h = (ui.available_height() - 18.0).max(120.0);
         let mut clicked_item: Option<ExclusionItem> = None;
+        let mut removed_item: Option<ExclusionItem> = None;
 
         egui::Frame::NONE
             .fill(theme::BG_SUBTLE)
@@ -151,7 +162,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                 Stroke::NONE
                             };
 
-                            let row_resp = egui::Frame::NONE
+                            let inner_resp = egui::Frame::NONE
                                 .fill(row_fill)
                                 .stroke(row_stroke)
                                 .corner_radius(CornerRadius::same(6))
@@ -161,7 +172,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                     ui.horizontal(|ui| {
                                         theme::status_pill(ui, kind_lbl, kind_fg, kind_bg);
 
-                                        let right_badge_w = 104.0;
+                                        let right_badge_w = 132.0;
                                         let text_w =
                                             (ui.available_width() - right_badge_w).max(80.0);
                                         ui.add_sized(
@@ -182,6 +193,32 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
+                                                let rm_rect = ui
+                                                    .add_enabled_ui(!busy, |ui| {
+                                                        let rm_resp = ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new("移除")
+                                                                        .font(FontId::proportional(
+                                                                            11.5,
+                                                                        ))
+                                                                        .color(theme::ERR_FG),
+                                                                )
+                                                                .fill(theme::ERR_BG)
+                                                                .stroke(Stroke::NONE)
+                                                                .corner_radius(CornerRadius::same(
+                                                                    5,
+                                                                )),
+                                                            )
+                                                            .on_hover_text(format!(
+                                                                "删除规则：{full_text}"
+                                                            ));
+                                                        if rm_resp.clicked() {
+                                                            removed_item = Some(item.clone());
+                                                        }
+                                                        rm_resp.rect
+                                                    })
+                                                    .inner;
                                                 if !filter_current_enabled {
                                                     theme::status_pill(
                                                         ui,
@@ -204,14 +241,28 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                                         theme::WARN_BG,
                                                     );
                                                 }
+                                                rm_rect
                                             },
-                                        );
-                                    });
-                                })
-                                .response
-                                .interact(Sense::click());
+                                        )
+                                        .inner
+                                    })
+                                    .inner
+                                });
 
-                            if row_resp.clicked() {
+                            let row_rect = inner_resp.response.rect;
+                            let rm_rect = inner_resp.inner;
+                            let select_rect = egui::Rect::from_min_max(
+                                row_rect.min,
+                                egui::pos2(
+                                    (rm_rect.min.x - 4.0).max(row_rect.min.x + 1.0),
+                                    row_rect.max.y,
+                                ),
+                            );
+                            if ui
+                                .interact(select_rect, ui.scope_id().with(("excl_row", idx)), Sense::click())
+                                .clicked()
+                                && removed_item.is_none()
+                            {
                                 clicked_item = Some(item);
                             }
                             ui.add_space(3.0);
@@ -219,7 +270,9 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     });
             });
 
-        if let Some(item) = clicked_item {
+        if let Some(item) = removed_item {
+            app.remove_exclusion(&item);
+        } else if let Some(item) = clicked_item {
             app.select_exclusion(item);
         }
     });

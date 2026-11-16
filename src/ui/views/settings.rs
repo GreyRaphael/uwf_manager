@@ -18,7 +18,40 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
     theme::card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::card_header(ui, "写入保护总开关", Some("开启后改动重启自动还原"));
+        let busy = app.is_busy();
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("写入保护总开关")
+                    .font(FontId::proportional(15.0))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    let reset_btn = ui.add(
+                        egui::Button::new(
+                            RichText::new("重置…")
+                                .font(FontId::proportional(11.5))
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE),
+                    );
+                    if reset_btn
+                        .on_hover_text("将全部 UWF 配置恢复为默认初始值（需确认并重启）")
+                        .clicked()
+                    {
+                        app.open_reset_confirm();
+                    }
+                });
+            });
+        });
+        ui.label(
+            RichText::new("开启后受保护分区的改动重启后自动还原")
+                .font(FontId::proportional(11.5))
+                .color(theme::TEXT_MUTED),
+        );
         ui.add_space(8.0);
 
         let Some(fs) = app.snapshot.filter_state else {
@@ -32,63 +65,55 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("当前生效")
+                RichText::new("当前保护")
                     .font(FontId::proportional(12.5))
                     .color(theme::TEXT_SECONDARY),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if fs.current_enabled {
-                    theme::status_pill(ui, "● 已开启", theme::OK_FG, theme::OK_BG);
-                } else {
-                    theme::status_pill(ui, "○ 已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
-                }
-            });
-        });
+            if fs.current_enabled {
+                theme::status_pill(ui, "● 已开启", theme::OK_FG, theme::OK_BG);
+            } else {
+                theme::status_pill(ui, "○ 已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+            }
 
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("重启后")
-                    .font(FontId::proportional(12.5))
-                    .color(theme::TEXT_SECONDARY),
-            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let pending_change = fs.current_enabled != fs.next_enabled;
-                if pending_change {
-                    let label = if fs.next_enabled {
-                        "将开启 (待重启)"
+                ui.add_enabled_ui(!busy, |ui| {
+                    let switch_tip = if fs.next_enabled {
+                        "点击切换：将在下次重启后停用写入保护"
                     } else {
-                        "将关闭 (待重启)"
+                        "点击切换：将在下次重启后启用写入保护"
                     };
-                    theme::status_pill(ui, label, theme::WARN_FG, theme::WARN_BG);
-                } else if fs.next_enabled {
-                    theme::status_pill(ui, "已开启", theme::OK_FG, theme::OK_BG);
-                } else {
-                    theme::status_pill(ui, "已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
-                }
-            });
-        });
-
-        ui.add_space(10.0);
-        let busy = app.is_busy();
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                let clicked = if fs.next_enabled {
-                    theme::secondary_button(ui, "停用保护").clicked()
-                } else {
-                    theme::primary_button(ui, "启用保护").clicked()
-                };
-                if clicked {
-                    app.toggle_write_filter();
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::danger_button(ui, "重置配置").clicked() {
-                        app.open_reset_confirm();
+                    if theme::toggle_switch(ui, fs.next_enabled, "切换写入保护总开关")
+                        .on_hover_text(switch_tip)
+                        .on_disabled_hover_text("有操作正在执行，请稍候")
+                        .clicked()
+                    {
+                        app.toggle_write_filter();
                     }
                 });
             });
         });
+
+        if fs.current_enabled != fs.next_enabled {
+            ui.add_space(8.0);
+            let pending_msg = if fs.next_enabled {
+                "⏳ 已设为开启保护，将在下次重启后生效"
+            } else {
+                "⏳ 已设为关闭保护，将在下次重启后生效"
+            };
+            egui::Frame::NONE
+                .fill(theme::WARN_BG)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(pending_msg)
+                            .font(FontId::proportional(12.0))
+                            .strong()
+                            .color(theme::WARN_FG),
+                    );
+                });
+        }
     });
 }
 
@@ -168,59 +193,85 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
 fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
     let busy = app.is_busy();
     let locked = is_overlay_locked(&app.snapshot);
-
-    // 缓存模式：内存(RAM) / 磁盘(Disk)（R1：当前启用时锁定）
-    if let Some(cfg_next) = app.snapshot.overlay_config_next {
-        let mut selected_type = cfg_next.overlay_type;
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [78.0, 24.0],
-                egui::Label::new(
-                    RichText::new("缓存模式")
-                        .font(FontId::proportional(12.5))
-                        .color(if !locked {
-                            theme::TEXT_PRIMARY
-                        } else {
-                            theme::TEXT_MUTED
-                        }),
-                ),
-            );
-            ui.add_enabled_ui(!busy && !locked, |ui| {
-                if theme::segmented_toggle(
-                    ui,
-                    &mut selected_type,
-                    &[
-                        (OverlayType::Ram, "内存 RAM"),
-                        (OverlayType::Disk, "磁盘 Disk"),
-                    ],
-                ) {
-                    app.set_overlay_type(selected_type);
-                }
-            });
-        });
-        ui.add_space(4.0);
-    }
-
-    let input_w = (ui.available_width() - 118.0).max(80.0);
     let mut edited = false;
 
-    edited |= theme::labeled_input_row(
-        ui,
-        "最大容量",
-        &mut app.cache.max_size_text,
-        Some("MB"),
-        !busy && !locked,
-        input_w,
-    )
-    .changed();
+    let render_locked_pair = |ui: &mut egui::Ui, app: &mut UwfApp, edited: &mut bool| {
+        let input_w = (ui.available_width() - 148.0).max(76.0);
+        if let Some(cfg_next) = app.snapshot.overlay_config_next {
+            let mut selected_type = cfg_next.overlay_type;
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [74.0, 24.0],
+                    egui::Label::new(
+                        RichText::new("缓存位置")
+                            .font(FontId::proportional(12.5))
+                            .color(if !locked {
+                                theme::TEXT_PRIMARY
+                            } else {
+                                theme::TEXT_MUTED
+                            }),
+                    ),
+                );
+                ui.add_enabled_ui(!busy && !locked, |ui| {
+                    if theme::segmented_toggle(
+                        ui,
+                        &mut selected_type,
+                        &[
+                            (OverlayType::Ram, "内存 RAM"),
+                            (OverlayType::Disk, "磁盘 Disk"),
+                        ],
+                    ) {
+                        app.set_overlay_type(selected_type);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
+
+        *edited |= theme::labeled_input_row(
+            ui,
+            "最大容量",
+            &mut app.cache.max_size_text,
+            Some("MB"),
+            !busy && !locked,
+            input_w,
+        )
+        .changed();
+    };
+
+    if locked {
+        egui::Frame::NONE
+            .fill(theme::BG_SUBTLE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(8, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(text::OVERLAY_LOCK_HINT)
+                        .font(FontId::proportional(11.5))
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(6.0);
+                render_locked_pair(ui, app, &mut edited);
+            });
+        ui.add_space(6.0);
+    } else {
+        render_locked_pair(ui, app, &mut edited);
+        ui.add_space(2.0);
+    }
+
+    let warn_unit = format_threshold_unit(&app.cache.warning_text, app);
+    let crit_unit = format_threshold_unit(&app.cache.critical_text, app);
+    let thresh_w = (ui.available_width() - 150.0).max(76.0);
 
     edited |= theme::labeled_input_row(
         ui,
         "警告阈值",
         &mut app.cache.warning_text,
-        Some("MB"),
+        Some(&warn_unit),
         !busy,
-        input_w,
+        thresh_w,
     )
     .changed();
 
@@ -228,9 +279,9 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui,
         "严重阈值",
         &mut app.cache.critical_text,
-        Some("MB"),
+        Some(&crit_unit),
         !busy,
-        input_w,
+        thresh_w,
     )
     .changed();
 
@@ -238,32 +289,55 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
         app.cache.on_edited();
     }
 
-    ui.add_space(4.0);
     if let Some(err) = &app.cache.error {
+        ui.add_space(4.0);
         ui.label(
             RichText::new(err)
                 .font(FontId::proportional(12.0))
                 .color(theme::ERR_FG),
         );
-    } else if locked {
-        ui.label(
-            RichText::new(text::OVERLAY_LOCK_HINT)
-                .font(FontId::proportional(11.5))
-                .color(theme::TEXT_MUTED),
-        );
     }
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(!busy, |ui| {
-            if theme::primary_button(ui, "应用缓存设置").clicked() {
+        ui.add_enabled_ui(!busy && app.cache.dirty, |ui| {
+            if theme::primary_button(ui, "应用缓存设置")
+                .on_disabled_hover_text("当前无未保存改动")
+                .clicked()
+            {
                 app.submit_cache_settings();
             }
+        });
+        ui.add_enabled_ui(!busy, |ui| {
             if app.cache.dirty && theme::secondary_button(ui, "还原").clicked() {
                 app.reset_cache_form();
             }
         });
     });
+}
+
+fn format_threshold_unit(val_text: &str, app: &UwfApp) -> String {
+    let max_mb = if is_overlay_locked(&app.snapshot) {
+        app.snapshot
+            .overlay_config_next
+            .map(|c| c.max_size_mb)
+            .filter(|&m| m > 0)
+    } else {
+        app.cache
+            .max_size_text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&m| m > 0)
+    };
+    let val = val_text.trim().parse::<u32>().ok();
+    match (val, max_mb) {
+        (Some(v), Some(m)) => {
+            let pct = (u64::from(v) * 100 + u64::from(m) / 2) / u64::from(m);
+            format!("MB ({pct}%)")
+        }
+        _ => "MB".to_string(),
+    }
 }
 
 /// 左下角系统版本与 UWF 版本兼容性提示面板。
@@ -320,7 +394,11 @@ pub fn render_os_card(ui: &mut egui::Ui, app: &UwfApp) -> egui::Response {
                     "提示：当前非企业版或教育版，需要 Windows 企业版或教育版才能使用 UWF 功能。",
                     theme::WARN_FG,
                 ),
-                EditionSupport::Supported | EditionSupport::Unknown => (
+                EditionSupport::Supported => (
+                    "当前版本符合要求（需要 Windows 企业版和教育版才能使用 UWF 功能）。",
+                    theme::TEXT_MUTED,
+                ),
+                EditionSupport::Unknown => (
                     "提示：需要 Windows 企业版和教育版才能使用 UWF 功能。",
                     theme::TEXT_MUTED,
                 ),

@@ -562,6 +562,37 @@ impl UwfApp {
 
     // ── 业务操作派发 ──
 
+    /// 汇总当前已配置但尚未生效（需重启计算机）的变更分类，供顶栏引导条展示。
+    pub fn pending_reboot_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if self
+            .snapshot
+            .filter_state
+            .is_some_and(|fs| fs.current_enabled != fs.next_enabled)
+        {
+            reasons.push("保护总开关");
+        }
+        if let (Some(cur), Some(next)) = (
+            self.snapshot.overlay_config_current,
+            self.snapshot.overlay_config_next,
+        ) && (cur.overlay_type != next.overlay_type || cur.max_size_mb != next.max_size_mb)
+        {
+            reasons.push("保护缓存设置");
+        }
+        if self
+            .snapshot
+            .volumes
+            .iter()
+            .any(|v| v.current_protected != v.next_protected)
+        {
+            reasons.push("磁盘分区保护");
+        }
+        if !self.exclusion_revert_plan().is_empty() {
+            reasons.push("排除项规则");
+        }
+        reasons
+    }
+
     pub fn toggle_write_filter(&mut self) {
         let Some(state) = self.snapshot.filter_state else {
             return;
@@ -654,15 +685,20 @@ impl UwfApp {
         )));
     }
 
-    pub fn delete_selected_exclusion(&mut self) {
-        match self.selected_exclusion() {
-            Some(ExclusionItem::File(f)) => {
+    pub fn remove_exclusion(&mut self, item: &ExclusionItem) {
+        match item {
+            ExclusionItem::File(f) => {
                 let _ = self.begin_mutation(BackendCmd::RemoveFileExclusion(f.display()));
             }
-            Some(ExclusionItem::Registry(k)) => {
-                let _ = self.begin_mutation(BackendCmd::RemoveRegistryExclusion(k));
+            ExclusionItem::Registry(k) => {
+                let _ = self.begin_mutation(BackendCmd::RemoveRegistryExclusion(k.clone()));
             }
-            None => {}
+        }
+    }
+
+    pub fn delete_selected_exclusion(&mut self) {
+        if let Some(item) = self.selected_exclusion() {
+            self.remove_exclusion(&item);
         }
     }
 
@@ -1394,7 +1430,7 @@ pub(crate) mod tests {
         assert!(harness.query_by_label_contains("当前: ").is_none());
 
         // 切换写入保护总开关（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
-        harness.get_by_label("停用保护").click();
+        harness.get_by_label("切换写入保护总开关").click();
         harness.run_steps(2);
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate 命令");
@@ -1691,14 +1727,29 @@ pub(crate) mod tests {
         assert!(harness.query_by_label("文件/目录").is_some());
         assert!(harness.query_by_label("注册表").is_some());
         let add_file_rect = harness.get_by_label("+ 文件").rect();
+        let revert_rect = harness.get_by_label("撤销修改 (2)").rect();
+        assert!(
+            (add_file_rect.center().y - revert_rect.center().y).abs() < 4.0,
+            "排除项工具栏按钮不应换行: add={add_file_rect:?}, revert={revert_rect:?}"
+        );
+        let import_rect = harness.get_by_label("导入列表").rect();
         let export_rect = harness.get_by_label("导出列表").rect();
         assert!(
-            (add_file_rect.center().y - export_rect.center().y).abs() < 4.0,
-            "排除项工具栏按钮不应换行: add={add_file_rect:?}, export={export_rect:?}"
+            (import_rect.center().y - export_rect.center().y).abs() < 4.0,
+            "导入导出按钮应在标题栏同一水平行: import={import_rect:?}, export={export_rect:?}"
         );
 
-        // 4. 点击「撤销修改」可预览明细并确认，验证下发 RevertExclusionsToCurrent，回包后差异清零
-        harness.get_by_label("撤销修改").click();
+        assert!(harness.query_by_label("当前设置已全部生效").is_none());
+        assert!(harness.query_by_label("⚠ 待重启生效").is_some());
+        assert!(harness.query_by_label("立即重启生效…").is_some());
+
+        // 4. 保护缓存阈值旁展示百分比提示，且每行支持直觉移除排除项、点击「撤销修改 (2)」可预览明细并确认
+        assert!(harness.query_by_label_contains("(75%)").is_some());
+        assert!(harness.query_by_label_contains("(90%)").is_some());
+        assert!(harness.query_by_label("移除选中").is_none());
+        assert_eq!(harness.query_all_by_label("移除").count(), 2);
+
+        harness.get_by_label("撤销修改 (2)").click();
         harness.run();
         assert!(harness.query_by_label_contains("预计移除 2 项").is_some());
         assert!(
@@ -1719,7 +1770,7 @@ pub(crate) mod tests {
         };
         assert!(matches!(cmd, BackendCmd::RevertExclusionsToCurrent));
 
-        // 撤销完成刷新为与当前一致后，差异为空
+        // 撤销完成刷新为与当前一致后，差异清零，顶栏显示「当前设置已全部生效」
         let mut aligned = demo_snapshot();
         aligned.file_exclusions_next = aligned.file_exclusions_current.clone();
         aligned.registry_exclusions_next = aligned.registry_exclusions_current.clone();
@@ -1729,6 +1780,54 @@ pub(crate) mod tests {
             outcome: Outcome::Ok("已撤销排除项修改".into()),
         });
         harness.run();
-        assert!(harness.state().exclusion_revert_plan().is_empty());
+        assert!(harness.query_by_label("⚠ 待重启生效").is_none());
+        assert!(harness.query_by_label("✔ 当前设置已全部生效").is_some());
+
+        // 5. 也测试点击「立即重启生效…」会弹出重启确认对话框
+        harness.get_by_label("切换写入保护总开关").click();
+        harness.run_steps(2);
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::DisableFilter));
+        let mut pending_snap = demo_snapshot();
+        pending_snap.file_exclusions_next.clear();
+        pending_snap.registry_exclusions_next.clear();
+        pending_snap.filter_state = Some(FilterState {
+            current_enabled: true,
+            next_enabled: false,
+        });
+        let _ = event_tx.send(BackendEvent::Snapshot(pending_snap));
+        let _ = event_tx.send(BackendEvent::Finished {
+            id,
+            outcome: Outcome::Ok("将在重启后停用保护".into()),
+        });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("将在重启后停用保护")
+                .is_some()
+        );
+        harness.get_by_label("立即重启生效…").click();
+        harness.run();
+        assert!(harness.query_by_label("重启系统确认").is_some());
+        harness.get_by_label("取消").click();
+        harness.run();
+
+        // 恢复一个非空排除项并通过行内「移除」按钮直接移除第一行
+        let _ = event_tx.send(BackendEvent::Snapshot(demo_snapshot()));
+        harness.run();
+        harness.query_all_by_label("移除").next().unwrap().click();
+        harness.run_steps(2);
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Remove 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::RemoveFileExclusion(_)));
+        let _ = event_tx.send(BackendEvent::Finished {
+            id,
+            outcome: Outcome::Ok("已移除排除项".into()),
+        });
+        harness.run();
+        assert!(harness.state().modal.is_none());
     }
 }
