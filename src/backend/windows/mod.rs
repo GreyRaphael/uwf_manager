@@ -29,8 +29,8 @@ use crate::model::*;
 use classes::*;
 
 use super::{
-    RawVolumeInstance, ResolvedVolume, UwfBackend, find_session_volume, normalize_drive_letter,
-    resolve_volumes, should_query_volume_exclusions,
+    FullSnapshot, RawVolumeInstance, ResolvedVolume, UwfBackend, find_session_volume,
+    normalize_drive_letter, resolve_volumes, should_query_volume_exclusions,
 };
 
 /// UWF WMI 命名空间
@@ -45,8 +45,8 @@ pub struct WindowsWmiBackend {
     con: Option<WMIConnection>,
     /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot / export_exclusions 取走
     warnings: Vec<String>,
-    /// 缓存的操作系统版本文本（`None` 表示尚未查询）
-    cached_os_version: Option<Option<String>>,
+    /// 缓存已成功识别的操作系统版本文本（查询失败时不负缓存，允许 F5 重试）
+    cached_os_version: Option<String>,
 }
 
 impl WindowsWmiBackend {
@@ -158,6 +158,28 @@ impl WindowsWmiBackend {
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
+    /// 单次全量读取 `UWF_OverlayConfig` 并拆分为 `(current, next)`，避免快照刷新双倍往返。
+    fn overlay_configs_pair(&mut self) -> Result<(OverlayConfig, OverlayConfig)> {
+        let rows: Vec<UWF_OverlayConfig> = self.raw_query("SELECT * FROM UWF_OverlayConfig")?;
+        let mut current = None;
+        let mut next = None;
+        for row in rows {
+            let cfg = OverlayConfig {
+                overlay_type: OverlayType::from_u32(row.Type),
+                max_size_mb: row.MaximumSize,
+            };
+            if row.CurrentSession {
+                current = Some(cfg);
+            } else {
+                next = Some(cfg);
+            }
+        }
+        Ok((
+            current.ok_or(UwfError::NotInstalled)?,
+            next.ok_or(UwfError::NotInstalled)?,
+        ))
+    }
+
     /// 单次全量读取 `UWF_Volume`，跳过无效盘符实例并消歧同会话同盘符冲突。
     fn read_volumes(&mut self) -> Result<Vec<ResolvedVolume>> {
         let rows: Vec<UWF_Volume> = self.raw_query("SELECT * FROM UWF_Volume")?;
@@ -251,13 +273,16 @@ impl WindowsWmiBackend {
             .map(|kb| kb.saturating_mul(1024))
     }
 
-    /// 按会话过滤已消歧的卷实例。
-    fn volumes_for(&mut self, current_session: bool) -> Result<Vec<ResolvedVolume>> {
-        Ok(self
-            .read_volumes()?
-            .into_iter()
-            .filter(|v| v.current_session == current_session)
-            .collect())
+    fn merge_resolved_volumes(volumes: &[ResolvedVolume]) -> Vec<VolumeInfo> {
+        let current = volumes
+            .iter()
+            .filter(|v| v.current_session)
+            .map(|v| (v.drive_letter.clone(), v.protected));
+        let next = volumes
+            .iter()
+            .filter(|v| !v.current_session)
+            .map(|v| (v.drive_letter.clone(), v.protected));
+        super::merge_volume_infos(current, next)
     }
 
     /// 按盘符定位指定会话的卷实例路径。
@@ -329,6 +354,24 @@ impl WindowsWmiBackend {
             .ok_or(UwfError::NotInstalled)
     }
 
+    /// 单次全量读取 `UWF_RegistryFilter` 并拆分 `(current_path, next_path)`。
+    fn registry_filter_paths(&mut self) -> Result<(String, String)> {
+        let rows: Vec<UWF_RegistryFilter> = self.raw_query("SELECT * FROM UWF_RegistryFilter")?;
+        let mut current = None;
+        let mut next = None;
+        for row in rows {
+            if row.CurrentSession {
+                current = Some(row.path);
+            } else {
+                next = Some(row.path);
+            }
+        }
+        Ok((
+            current.ok_or(UwfError::NotInstalled)?,
+            next.ok_or(UwfError::NotInstalled)?,
+        ))
+    }
+
     fn filter_method_no_params(&mut self, method: &'static str) -> Result<()> {
         let path = self.filter_instance()?.path;
         let out: ReturnOnly = self.exec::<UWF_Filter, _>(&path, method, ())?;
@@ -341,6 +384,76 @@ impl WindowsWmiBackend {
             return Err(UwfError::FilterCurrentlyEnabled { what });
         }
         Ok(())
+    }
+
+    /// R3 / R5：筛选器当前会话必须处于启用状态才允许提交固化
+    fn ensure_commit_filter_enabled(&mut self, what: &'static str) -> Result<()> {
+        if !self.filter_instance()?.CurrentEnabled {
+            return Err(UwfError::FilterNotCurrentlyEnabled { what });
+        }
+        Ok(())
+    }
+
+    fn file_exclusions_from_volumes(
+        &mut self,
+        volumes: &[ResolvedVolume],
+        current_session: bool,
+    ) -> Vec<FileExclusion> {
+        let mut items = Vec::new();
+        for volume in volumes
+            .iter()
+            .filter(|v| v.current_session == current_session)
+        {
+            // 当前会话未受保护的卷未加载过滤驱动，调用 GetExclusions 会报 0x80041002
+            if !should_query_volume_exclusions(current_session, volume.protected) {
+                continue;
+            }
+            // P1-6：单卷失败继续读其他卷，但必须留下警告，不能静默显示为空。
+            let out =
+                match self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
+                {
+                    Ok(out) if out.ReturnValue == 0 => out,
+                    Ok(out) => {
+                        self.warnings.push(format!(
+                            "卷 {} 读取排除项失败: ReturnValue=0x{:08X}",
+                            volume.drive_letter, out.ReturnValue
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        self.warnings
+                            .push(format!("卷 {} 读取排除项失败: {e}", volume.drive_letter));
+                        continue;
+                    }
+                };
+            for file in out.ExcludedFiles.unwrap_or_default() {
+                items.push(FileExclusion::new(
+                    volume.drive_letter.clone(),
+                    file.FileName,
+                ));
+            }
+        }
+        items.sort();
+        items
+    }
+
+    fn registry_exclusions_at_path(&mut self, path: &str) -> Result<Vec<String>> {
+        let out: RegistryExclusionsOut =
+            self.exec::<UWF_RegistryFilter, _>(path, "GetExclusions", ())?;
+        if out.ReturnValue != 0 {
+            return Err(UwfError::WmiMethod {
+                method: "GetExclusions",
+                code: out.ReturnValue,
+            });
+        }
+        let mut keys: Vec<String> = out
+            .ExcludedKeys
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| k.RegistryKey)
+            .collect();
+        keys.sort();
+        Ok(keys)
     }
 }
 
@@ -447,15 +560,7 @@ impl UwfBackend for WindowsWmiBackend {
     fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
         // R2 / PLAN：单次全量消歧查询后按会话合并，next-only 卷与未注册的 current-only 卷均可见。
         let volumes = self.read_volumes()?;
-        let current = volumes
-            .iter()
-            .filter(|v| v.current_session)
-            .map(|v| (v.drive_letter.clone(), v.protected));
-        let next = volumes
-            .iter()
-            .filter(|v| !v.current_session)
-            .map(|v| (v.drive_letter.clone(), v.protected));
-        Ok(super::merge_volume_infos(current, next))
+        Ok(Self::merge_resolved_volumes(&volumes))
     }
 
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {
@@ -472,7 +577,8 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_file(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R3 前置保护校验 + 获取当前会话实例路径
+        // R3 前置过滤与保护校验 + 获取当前会话实例路径（单次 read_volumes）
+        self.ensure_commit_filter_enabled("文件提交")?;
         let volumes = self.read_volumes()?;
         let current = find_session_volume(&volumes, true, drive_letter)
             .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
@@ -491,7 +597,8 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_file_deletion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        // R3 第一步：必须在触碰物理文件前校验当前会话受保护状态与下次会话实例存在性
+        // R3 第一步：必须在触碰物理文件前校验筛选器启用、当前会话受保护状态与下次会话实例存在性
+        self.ensure_commit_filter_enabled("文件删除固化")?;
         let volumes = self.read_volumes()?;
         match find_session_volume(&volumes, true, drive_letter) {
             Some(current) if current.protected => {}
@@ -503,9 +610,10 @@ impl UwfBackend for WindowsWmiBackend {
             }
             None => return Err(UwfError::VolumeNotFound(drive_letter.into())),
         }
-        let path = find_session_volume(&volumes, false, drive_letter)
-            .map(|v| v.path.clone())
-            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
+        let path = match find_session_volume(&volumes, false, drive_letter) {
+            Some(next) => next.path.clone(),
+            None => self.ensure_next_volume_path(drive_letter)?,
+        };
 
         // R3 第二步：真实删除文件（写入 Overlay；已不存在则容忍）
         let abs_path = format!("{drive_letter}{file_rel_path}");
@@ -540,39 +648,8 @@ impl UwfBackend for WindowsWmiBackend {
     // ── Exclusion ──
 
     fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
-        let mut items = Vec::new();
-        for volume in self.volumes_for(current_session)? {
-            // 当前会话未受保护的卷未加载过滤驱动，调用 GetExclusions 会报 0x80041002
-            if !should_query_volume_exclusions(current_session, volume.protected) {
-                continue;
-            }
-            // P1-6：单卷失败继续读其他卷，但必须留下警告，不能静默显示为空。
-            let out =
-                match self.exec::<UWF_Volume, FileExclusionsOut>(&volume.path, "GetExclusions", ())
-                {
-                    Ok(out) if out.ReturnValue == 0 => out,
-                    Ok(out) => {
-                        self.warnings.push(format!(
-                            "卷 {} 读取排除项失败: ReturnValue=0x{:08X}",
-                            volume.drive_letter, out.ReturnValue
-                        ));
-                        continue;
-                    }
-                    Err(e) => {
-                        self.warnings
-                            .push(format!("卷 {} 读取排除项失败: {e}", volume.drive_letter));
-                        continue;
-                    }
-                };
-            for file in out.ExcludedFiles.unwrap_or_default() {
-                items.push(FileExclusion::new(
-                    volume.drive_letter.clone(),
-                    file.FileName,
-                ));
-            }
-        }
-        items.sort();
-        Ok(items)
+        let volumes = self.read_volumes()?;
+        Ok(self.file_exclusions_from_volumes(&volumes, current_session))
     }
 
     fn take_warnings(&mut self) -> Vec<String> {
@@ -606,22 +683,7 @@ impl UwfBackend for WindowsWmiBackend {
 
     fn get_registry_exclusions(&mut self, current_session: bool) -> Result<Vec<String>> {
         let path = self.registry_filter_path(current_session)?;
-        let out: RegistryExclusionsOut =
-            self.exec::<UWF_RegistryFilter, _>(&path, "GetExclusions", ())?;
-        if out.ReturnValue != 0 {
-            return Err(UwfError::WmiMethod {
-                method: "GetExclusions",
-                code: out.ReturnValue,
-            });
-        }
-        let mut keys: Vec<String> = out
-            .ExcludedKeys
-            .unwrap_or_default()
-            .into_iter()
-            .map(|k| k.RegistryKey)
-            .collect();
-        keys.sort();
-        Ok(keys)
+        self.registry_exclusions_at_path(&path)
     }
 
     fn add_registry_exclusion(&mut self, key: &str) -> Result<()> {
@@ -649,7 +711,8 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn commit_registry(&mut self, key: &str, value_name: &str) -> Result<()> {
-        // R5：当前会话实例
+        // R5：前筛校验 + 当前会话实例
+        self.ensure_commit_filter_enabled("注册表提交")?;
         let path = self.registry_filter_path(true)?;
         let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
             &path,
@@ -664,10 +727,42 @@ impl UwfBackend for WindowsWmiBackend {
 
     fn get_os_version(&mut self) -> Option<String> {
         if let Some(cached) = &self.cached_os_version {
-            return cached.clone();
+            return Some(cached.clone());
         }
         let queried = Self::query_os_version();
-        self.cached_os_version = Some(queried.clone());
+        if let Some(ver) = &queried {
+            self.cached_os_version = Some(ver.clone());
+        }
         queried
+    }
+
+    fn collect_snapshot(&mut self) -> Result<FullSnapshot> {
+        let filter_state = Some(self.get_filter_state()?);
+        let (cfg_current, cfg_next) = self.overlay_configs_pair()?;
+        let overlay_runtime = Some(self.get_overlay_runtime()?);
+
+        // UWF_Volume 单次全量查询后供卷列表与当前/下次文件排除项共同消费
+        let resolved_volumes = self.read_volumes()?;
+        let volumes = Self::merge_resolved_volumes(&resolved_volumes);
+        let file_exclusions_current = self.file_exclusions_from_volumes(&resolved_volumes, true);
+        let file_exclusions_next = self.file_exclusions_from_volumes(&resolved_volumes, false);
+
+        let (reg_current_path, reg_next_path) = self.registry_filter_paths()?;
+        let registry_exclusions_current = self.registry_exclusions_at_path(&reg_current_path)?;
+        let registry_exclusions_next = self.registry_exclusions_at_path(&reg_next_path)?;
+
+        Ok(FullSnapshot {
+            filter_state,
+            overlay_config_current: Some(cfg_current),
+            overlay_config_next: Some(cfg_next),
+            overlay_runtime,
+            volumes,
+            file_exclusions_current,
+            file_exclusions_next,
+            registry_exclusions_current,
+            registry_exclusions_next,
+            os_version: self.get_os_version(),
+            warnings: self.take_warnings(),
+        })
     }
 }

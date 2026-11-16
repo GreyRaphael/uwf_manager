@@ -77,9 +77,29 @@ pub trait UwfBackend: 'static {
         Vec::new()
     }
 
-    /// 读取当前操作系统版本名称（如 `Windows 10 Enterprise LTSC 2021`）。
+    /// 读取当前操作系统版本名称（如 `Windows 10 Enterprise LTSC 2021 16G`）。
     fn get_os_version(&mut self) -> Option<String> {
         None
+    }
+
+    /// 采集完整状态快照。
+    ///
+    /// 默认按接口逐项查询；`WindowsWmiBackend` 会覆盖此方法，在单次快照周期内合并
+    /// `UWF_Volume` / `UWF_OverlayConfig` / `UWF_RegistryFilter` 查询，减少 WMI 往返。
+    fn collect_snapshot(&mut self) -> Result<FullSnapshot> {
+        Ok(FullSnapshot {
+            filter_state: Some(self.get_filter_state()?),
+            overlay_config_current: Some(self.get_overlay_config(true)?),
+            overlay_config_next: Some(self.get_overlay_config(false)?),
+            overlay_runtime: Some(self.get_overlay_runtime()?),
+            volumes: self.list_volumes()?,
+            file_exclusions_current: self.get_file_exclusions(true)?,
+            file_exclusions_next: self.get_file_exclusions(false)?,
+            registry_exclusions_current: self.get_registry_exclusions(true)?,
+            registry_exclusions_next: self.get_registry_exclusions(false)?,
+            os_version: self.get_os_version(),
+            warnings: self.take_warnings(),
+        })
     }
 }
 
@@ -402,18 +422,15 @@ fn handle_mutation(
         ),
         BackendCmd::CommitFile(path) => mutate_with(id, backend, emit, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
-            ensure_volume_commit_ready(b, &drive, "文件提交")?;
             b.commit_file(&drive, &rel)?;
             Ok(format!("{path} 提交成功"))
         }),
         BackendCmd::CommitFileDeletion(path) => mutate_with(id, backend, emit, |b| {
             let (drive, rel) = split_absolute_path(&path)?;
-            ensure_volume_commit_ready(b, &drive, "文件删除固化")?;
             b.commit_file_deletion(&drive, &rel)?;
             Ok(format!("{path} 删除提交成功"))
         }),
         BackendCmd::CommitRegistry(full_path) => mutate_with(id, backend, emit, |b| {
-            ensure_filter_commit_ready(b, "注册表提交")?;
             let (key, value) = split_registry_path(&full_path)?;
             b.commit_registry(&key, &value)?;
             Ok(format!("注册表 {full_path} 提交成功"))
@@ -436,25 +453,9 @@ fn handle_mutation(
 }
 
 fn try_refresh(backend: &mut dyn UwfBackend, emit: &dyn Fn(BackendEvent)) -> Result<()> {
-    let snapshot = collect_snapshot(backend)?;
+    let snapshot = backend.collect_snapshot()?;
     emit(BackendEvent::Snapshot(snapshot));
     Ok(())
-}
-
-fn collect_snapshot(b: &mut dyn UwfBackend) -> Result<FullSnapshot> {
-    Ok(FullSnapshot {
-        filter_state: Some(b.get_filter_state()?),
-        overlay_config_current: Some(b.get_overlay_config(true)?),
-        overlay_config_next: Some(b.get_overlay_config(false)?),
-        overlay_runtime: Some(b.get_overlay_runtime()?),
-        volumes: b.list_volumes()?,
-        file_exclusions_current: b.get_file_exclusions(true)?,
-        file_exclusions_next: b.get_file_exclusions(false)?,
-        registry_exclusions_current: b.get_registry_exclusions(true)?,
-        registry_exclusions_next: b.get_registry_exclusions(false)?,
-        os_version: b.get_os_version(),
-        warnings: b.take_warnings(),
-    })
 }
 
 /// 变更类命令统一出口：失败回 `Finished(Err)` 或 `NotInstalled(Some(id))`；
@@ -1025,21 +1026,6 @@ pub fn validate_volume_commit_ready(
         }
         Some(_) => Ok(()),
     }
-}
-
-fn ensure_filter_commit_ready(b: &mut dyn UwfBackend, what: &'static str) -> Result<()> {
-    let filter = b.get_filter_state()?;
-    validate_filter_commit_ready(filter.current_enabled, what)
-}
-
-fn ensure_volume_commit_ready(
-    b: &mut dyn UwfBackend,
-    drive_letter: &str,
-    what: &'static str,
-) -> Result<()> {
-    let filter = b.get_filter_state()?;
-    let volumes = b.list_volumes()?;
-    validate_volume_commit_ready(&volumes, filter.current_enabled, drive_letter, what)
 }
 
 /// Windows 版本对 UWF 的支持级别（仅基于版本名称作友好提示，不阻止用户操作）。

@@ -34,6 +34,7 @@ pub struct UWF_Overlay {
 pub struct UWF_OverlayConfig {
     #[serde(rename = "__Path")]
     pub path: String,
+    pub CurrentSession: bool,
     pub Type: u32,
     pub MaximumSize: u32,
 }
@@ -171,6 +172,7 @@ pub struct Win32_ComputerSystem {
 pub struct UWF_RegistryFilter {
     #[serde(rename = "__Path")]
     pub path: String,
+    pub CurrentSession: bool,
 }
 
 // ── 方法出参 ──

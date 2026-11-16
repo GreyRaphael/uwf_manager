@@ -101,6 +101,22 @@ impl MockUwfBackend {
             Err(UwfError::VolumeNotFound(drive_letter.into()))
         }
     }
+
+    fn ensure_volume_commit_ready(&self, drive_letter: &str, what: &'static str) -> Result<()> {
+        if !self.filter_current {
+            return Err(UwfError::FilterNotCurrentlyEnabled { what });
+        }
+        let upper = drive_letter.to_ascii_uppercase();
+        let vol = self
+            .volumes
+            .iter()
+            .find(|v| v.letter == upper)
+            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
+        if !vol.current {
+            return Err(UwfError::VolumeNotProtected(vol.letter.clone()));
+        }
+        Ok(())
+    }
 }
 
 impl UwfBackend for MockUwfBackend {
@@ -231,12 +247,12 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn commit_file(&mut self, drive_letter: &str, _file_rel_path: &str) -> Result<()> {
-        self.known_volume(drive_letter)
+        self.ensure_volume_commit_ready(drive_letter, "文件提交")
     }
 
     fn commit_file_deletion(&mut self, drive_letter: &str, _file_rel_path: &str) -> Result<()> {
-        // R3 第一步（删除真实文件）在 Mock 下无意义，直接模拟成功
-        self.known_volume(drive_letter)
+        // R3 第一步（删除真实文件）在 Mock 下无意义，但仍严格执行 R3 前置保护校验
+        self.ensure_volume_commit_ready(drive_letter, "文件删除固化")
     }
 
     fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
@@ -289,6 +305,11 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn commit_registry(&mut self, _key: &str, _value_name: &str) -> Result<()> {
+        if !self.filter_current {
+            return Err(UwfError::FilterNotCurrentlyEnabled {
+                what: "注册表提交"
+            });
+        }
         Ok(())
     }
 
@@ -383,6 +404,32 @@ mod tests {
         assert!(matches!(
             b.remove_file_exclusion("Z:", "\\x"),
             Err(UwfError::VolumeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn r3_and_r5_commit_enforce_filter_and_volume_protection_in_mock() {
+        let mut b = MockUwfBackend::demo();
+        assert!(b.commit_file("C:", "\\a.txt").is_ok());
+        assert!(b.commit_registry("HKLM\\SOFTWARE\\Demo", "Val").is_ok());
+        assert!(matches!(
+            b.commit_file("D:", "\\a.txt"),
+            Err(UwfError::VolumeNotProtected(_))
+        ));
+        assert!(matches!(
+            b.commit_file_deletion("Z:", "\\a.txt"),
+            Err(UwfError::VolumeNotFound(_))
+        ));
+
+        b.disable_filter().unwrap();
+        b.restart_system().unwrap();
+        assert!(matches!(
+            b.commit_file("C:", "\\a.txt"),
+            Err(UwfError::FilterNotCurrentlyEnabled { .. })
+        ));
+        assert!(matches!(
+            b.commit_registry("HKLM\\SOFTWARE\\Demo", "Val"),
+            Err(UwfError::FilterNotCurrentlyEnabled { .. })
         ));
     }
 }
