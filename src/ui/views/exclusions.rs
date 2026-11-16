@@ -1,7 +1,7 @@
 //! 右侧下方卡片：排除项规则列表（文件/目录 + 注册表、行内生效状态、一键撤销修改与导入导出）。
 
 use eframe::egui::{
-    self, Align, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
+    self, Align, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Stroke,
 };
 
 use crate::app::{ExclusionItem, UwfApp};
@@ -13,7 +13,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_width(ui.available_width());
         ui.set_min_height(avail_h.max(200.0));
 
-        // 第一行：标题与导入导出按钮，第二行：说明副标题（防止较窄窗口下拥挤）
+        // 第一行：标题与导入导出按钮；第二行：说明副标题
         let count = app.visible_exclusions().len();
         let busy = app.is_busy();
         ui.horizontal(|ui| {
@@ -42,7 +42,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         ui.add_space(8.0);
 
-        // 第二行：高频添加与撤销操作工具栏（不换行）
+        // 第三行：高频添加与撤销操作工具栏（不换行）
         let revert_plan = app.exclusion_revert_plan();
         let revert_count = revert_plan.remove_count() + revert_plan.add_count();
         ui.horizontal(|ui| {
@@ -93,14 +93,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         // 主体列表区（撑满卡片剩余空间）
         let rows = app.exclusion_rows();
-        let selected_key = app.selected_exclusion_key.clone();
         let filter_current_enabled = app
             .snapshot
             .filter_state
             .is_some_and(|fs| fs.current_enabled);
 
         let list_h = (ui.available_height() - 18.0).max(120.0);
-        let mut clicked_item: Option<ExclusionItem> = None;
         let mut removed_item: Option<ExclusionItem> = None;
 
         egui::Frame::NONE
@@ -138,10 +136,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     .max_height(list_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // 允许点击行内文本区域直接选中整行（完整路径仍可通过悬停提示或导出查看）
-                        ui.style_mut().interaction.selectable_labels = false;
                         for (idx, (item, in_current)) in rows.into_iter().enumerate() {
-                            let is_selected = selected_key.as_ref() == Some(&item);
                             let full_text = item.display();
                             let (kind_lbl, kind_fg, kind_bg) = if item.is_registry() {
                                 ("注册表", theme::WARN_FG, theme::WARN_BG)
@@ -149,22 +144,14 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                 ("文件/目录", theme::INFO_FG, theme::INFO_BG)
                             };
 
-                            let row_fill = if is_selected {
-                                theme::BG_SELECTED
-                            } else if idx % 2 == 0 {
+                            let row_fill = if idx % 2 == 0 {
                                 theme::BG_CARD
                             } else {
                                 theme::BG_SUBTLE
                             };
-                            let row_stroke = if is_selected {
-                                Stroke::new(1.0, theme::ACCENT)
-                            } else {
-                                Stroke::NONE
-                            };
 
-                            let inner_resp = egui::Frame::NONE
+                            egui::Frame::NONE
                                 .fill(row_fill)
-                                .stroke(row_stroke)
                                 .corner_radius(CornerRadius::same(6))
                                 .inner_margin(Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
@@ -180,11 +167,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                             egui::Label::new(
                                                 RichText::new(&full_text)
                                                     .font(FontId::monospace(12.5))
-                                                    .color(if is_selected {
-                                                        theme::ACCENT
-                                                    } else {
-                                                        theme::TEXT_PRIMARY
-                                                    }),
+                                                    .color(theme::TEXT_PRIMARY),
                                             )
                                             .truncate(),
                                         )
@@ -193,32 +176,27 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
-                                                let rm_rect = ui
-                                                    .add_enabled_ui(!busy, |ui| {
-                                                        let rm_resp = ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    RichText::new("移除")
-                                                                        .font(FontId::proportional(
-                                                                            11.5,
-                                                                        ))
-                                                                        .color(theme::ERR_FG),
-                                                                )
-                                                                .fill(theme::ERR_BG)
-                                                                .stroke(Stroke::NONE)
-                                                                .corner_radius(CornerRadius::same(
-                                                                    5,
-                                                                )),
+                                                ui.add_enabled_ui(!busy, |ui| {
+                                                    let rm_resp = ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                RichText::new("移除")
+                                                                    .font(FontId::proportional(
+                                                                        11.5,
+                                                                    ))
+                                                                    .color(theme::ERR_FG),
                                                             )
-                                                            .on_hover_text(format!(
-                                                                "删除规则：{full_text}"
-                                                            ));
-                                                        if rm_resp.clicked() {
-                                                            removed_item = Some(item.clone());
-                                                        }
-                                                        rm_resp.rect
-                                                    })
-                                                    .inner;
+                                                            .fill(theme::ERR_BG)
+                                                            .stroke(Stroke::NONE)
+                                                            .corner_radius(CornerRadius::same(5)),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "删除规则：{full_text}"
+                                                        ));
+                                                    if rm_resp.clicked() {
+                                                        removed_item = Some(item.clone());
+                                                    }
+                                                });
                                                 if !filter_current_enabled {
                                                     theme::status_pill(
                                                         ui,
@@ -241,30 +219,10 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                                         theme::WARN_BG,
                                                     );
                                                 }
-                                                rm_rect
                                             },
-                                        )
-                                        .inner
-                                    })
-                                    .inner
+                                        );
+                                    });
                                 });
-
-                            let row_rect = inner_resp.response.rect;
-                            let rm_rect = inner_resp.inner;
-                            let select_rect = egui::Rect::from_min_max(
-                                row_rect.min,
-                                egui::pos2(
-                                    (rm_rect.min.x - 4.0).max(row_rect.min.x + 1.0),
-                                    row_rect.max.y,
-                                ),
-                            );
-                            if ui
-                                .interact(select_rect, ui.scope_id().with(("excl_row", idx)), Sense::click())
-                                .clicked()
-                                && removed_item.is_none()
-                            {
-                                clicked_item = Some(item);
-                            }
                             ui.add_space(3.0);
                         }
                     });
@@ -272,8 +230,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         if let Some(item) = removed_item {
             app.remove_exclusion(&item);
-        } else if let Some(item) = clicked_item {
-            app.select_exclusion(item);
         }
     });
 }

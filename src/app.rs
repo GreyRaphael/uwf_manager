@@ -61,6 +61,12 @@ impl CacheForm {
         self.error = None;
     }
 
+    pub fn sync_thresholds_from_runtime(&mut self, runtime: &crate::model::OverlayRuntime) {
+        self.warning_text = runtime.warning_threshold_mb.to_string();
+        self.critical_text = runtime.critical_threshold_mb.to_string();
+        self.error = None;
+    }
+
     pub fn validate(&self, snapshot: &FullSnapshot) -> Result<(u32, u32, u32), String> {
         let parse = |s: &str, what: &str| -> Result<u32, String> {
             s.trim()
@@ -133,6 +139,22 @@ enum PowerAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePendingAction {
+    /// 缓存表单保存成功时刷新表单，失败时把错误写入 `cache.error`
+    Save(RequestId),
+    /// 全局重置成功时强制刷新表单，失败时只记录全局/状态栏错误而不污染 `cache.error`
+    ResetSync(RequestId),
+}
+
+impl CachePendingAction {
+    fn request_id(self) -> RequestId {
+        match self {
+            Self::Save(id) | Self::ResetSync(id) => id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Ok,
     Warn,
@@ -161,14 +183,12 @@ pub struct UwfApp {
     pub phase: Phase,
     pub snapshot: FullSnapshot,
     pub cache: CacheForm,
-    /// 跨刷新保持排除项选中身份的稳定 key
-    pub selected_exclusion_key: Option<ExclusionItem>,
     pub os_version: Option<String>,
     pub modal: Option<Modal>,
     pub logs: VecDeque<StatusEntry>,
     /// 当前在途变更请求 id；仅匹配回包可解除锁定
     pub mutation: Option<RequestId>,
-    pending_cache_save: Option<RequestId>,
+    pending_cache_action: Option<CachePendingAction>,
     power_action: Option<(RequestId, PowerAction)>,
     next_request_id: RequestId,
     last_overlay_tick: Instant,
@@ -205,12 +225,11 @@ impl UwfApp {
             phase: Phase::Loading,
             snapshot: FullSnapshot::default(),
             cache: CacheForm::default(),
-            selected_exclusion_key: None,
             os_version: None,
             modal: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             mutation: None,
-            pending_cache_save: None,
+            pending_cache_action: None,
             power_action: None,
             next_request_id: 1,
             last_overlay_tick: Instant::now(),
@@ -258,7 +277,7 @@ impl UwfApp {
         self.phase = Phase::BackendLost;
         self.modal = None;
         self.mutation = None;
-        self.pending_cache_save = None;
+        self.pending_cache_action = None;
         self.power_action = None;
         if first {
             self.log(false, message);
@@ -357,7 +376,6 @@ impl UwfApp {
                 if first_ready || !self.cache.dirty {
                     self.cache.sync_from_snapshot(&self.snapshot);
                 }
-                self.reconcile_selections();
                 self.log(true, "已刷新 UWF 全部状态");
                 if !self.snapshot.warnings.is_empty() {
                     let combined = self.snapshot.warnings.join("；");
@@ -370,8 +388,7 @@ impl UwfApp {
             BackendEvent::OverlayRuntime(runtime) => {
                 self.snapshot.overlay_runtime = Some(runtime);
                 if !self.cache.dirty {
-                    self.cache.warning_text = runtime.warning_threshold_mb.to_string();
-                    self.cache.critical_text = runtime.critical_threshold_mb.to_string();
+                    self.cache.sync_thresholds_from_runtime(&runtime);
                 }
             }
             BackendEvent::RefreshFailed(msg) => {
@@ -384,20 +401,22 @@ impl UwfApp {
                 if self.mutation == Some(id) {
                     self.mutation = None;
                 }
-                let is_cache_save = self.pending_cache_save == Some(id);
-                if is_cache_save {
-                    self.pending_cache_save = None;
+                let cache_action = self
+                    .pending_cache_action
+                    .filter(|act| act.request_id() == id);
+                if cache_action.is_some() {
+                    self.pending_cache_action = None;
                 }
                 match outcome {
                     Outcome::Ok(msg) => {
-                        if is_cache_save {
+                        if cache_action.is_some() {
                             self.cache.sync_from_snapshot(&self.snapshot);
                         }
                         self.log(true, &msg);
                         self.on_power_action_ok(id);
                     }
                     Outcome::OkWithRefreshWarning { message, warning } => {
-                        if is_cache_save {
+                        if cache_action.is_some() {
                             self.cache.sync_from_snapshot(&self.snapshot);
                         }
                         self.log(true, &message);
@@ -408,7 +427,7 @@ impl UwfApp {
                         self.log_warn(&msg);
                     }
                     Outcome::Err(msg) => {
-                        if is_cache_save {
+                        if matches!(cache_action, Some(CachePendingAction::Save(_))) {
                             self.cache.error = Some(msg.clone());
                         }
                         self.log(false, &msg);
@@ -426,8 +445,11 @@ impl UwfApp {
                     if self.mutation == Some(req_id) {
                         self.mutation = None;
                     }
-                    if self.pending_cache_save == Some(req_id) {
-                        self.pending_cache_save = None;
+                    if self
+                        .pending_cache_action
+                        .is_some_and(|act| act.request_id() == req_id)
+                    {
+                        self.pending_cache_action = None;
                     }
                     if self
                         .power_action
@@ -483,18 +505,7 @@ impl UwfApp {
         });
     }
 
-    // ── 选择状态与身份保持 ──
-
-    fn reconcile_selections(&mut self) {
-        let visible = self.visible_exclusions();
-        if let Some(key) = &self.selected_exclusion_key {
-            if !visible.contains(key) {
-                self.selected_exclusion_key = visible.into_iter().next();
-            }
-        } else if !visible.is_empty() {
-            self.selected_exclusion_key = visible.into_iter().next();
-        }
-    }
+    // ── 排除项视图辅助 ──
 
     pub fn visible_exclusions(&self) -> Vec<ExclusionItem> {
         let mut items = Vec::with_capacity(
@@ -547,17 +558,6 @@ impl UwfApp {
             &self.snapshot.registry_exclusions_current,
             &self.snapshot.registry_exclusions_next,
         )
-    }
-
-    pub fn select_exclusion(&mut self, item: ExclusionItem) {
-        self.selected_exclusion_key = Some(item);
-    }
-
-    pub fn selected_exclusion(&self) -> Option<ExclusionItem> {
-        let key = self.selected_exclusion_key.as_ref()?;
-        self.visible_exclusions()
-            .into_iter()
-            .find(|item| item == key)
     }
 
     // ── 业务操作派发 ──
@@ -629,7 +629,7 @@ impl UwfApp {
                     warning_mb,
                     critical_mb,
                 }) {
-                    self.pending_cache_save = Some(id);
+                    self.pending_cache_action = Some(CachePendingAction::Save(id));
                 }
             }
             Err(msg) => {
@@ -693,12 +693,6 @@ impl UwfApp {
             ExclusionItem::Registry(k) => {
                 let _ = self.begin_mutation(BackendCmd::RemoveRegistryExclusion(k.clone()));
             }
-        }
-    }
-
-    pub fn delete_selected_exclusion(&mut self) {
-        if let Some(item) = self.selected_exclusion() {
-            self.remove_exclusion(&item);
         }
     }
 
@@ -924,7 +918,7 @@ impl UwfApp {
         match action {
             ConfirmAction::ResetSettings => {
                 if let Some(id) = self.begin_mutation(BackendCmd::ResetSettings) {
-                    self.pending_cache_save = Some(id);
+                    self.pending_cache_action = Some(CachePendingAction::ResetSync(id));
                 }
             }
             ConfirmAction::Restart => {
@@ -1360,29 +1354,70 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn selection_identity_persists_across_snapshot_refresh() {
+    fn reset_settings_error_does_not_pollute_cache_error_and_success_syncs_form() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
-        let mut snap = demo_snapshot();
-        snap.file_exclusions_next = vec![
-            FileExclusion::new("C:".into(), "\\A".into()),
-            FileExclusion::new("C:".into(), "\\B".into()),
-        ];
-        app.apply_event(BackendEvent::Snapshot(snap.clone()));
+        app.cache.warning_text = "1400".into();
+        app.cache.on_edited();
+        app.execute_confirm(ConfirmAction::ResetSettings);
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::ResetSettings));
 
-        let b_item = ExclusionItem::File(FileExclusion::new("C:".into(), "\\B".into()));
-        app.select_exclusion(b_item.clone());
-        assert_eq!(app.selected_exclusion(), Some(b_item.clone()));
+        // 重置失败不应写进缓存表单的 cache.error，只记全局错误日志
+        app.apply_event(BackendEvent::Finished {
+            id,
+            outcome: Outcome::Err("WMI ResetSettings 失败".into()),
+        });
+        assert!(app.cache.error.is_none());
+        assert!(app.cache.dirty);
+        assert!(
+            app.last_log()
+                .is_some_and(|e| e.level == LogLevel::Err && e.text.contains("ResetSettings"))
+        );
 
-        // 同条目仍在列表时，刷新快照保留原选中项
-        snap.file_exclusions_next
-            .insert(0, FileExclusion::new("C:".into(), "\\0".into()));
-        app.apply_event(BackendEvent::Snapshot(snap));
-        assert_eq!(app.selected_exclusion(), Some(b_item));
-        app.delete_selected_exclusion();
-        match recv_cmd(&cmd_rx) {
-            BackendCmd::RemoveFileExclusion(path) => assert_eq!(path, "C:\\B"),
-            other => panic!("期望 RemoveFileExclusion，实际 {other:?}"),
-        }
+        // 重置成功时应强制把缓存表单同步为新快照值并清除 dirty
+        app.execute_confirm(ConfirmAction::ResetSettings);
+        let BackendCommand::Mutate { id: id2, .. } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Mutate 命令");
+        };
+        let mut reset_snap = demo_snapshot();
+        reset_snap.overlay_runtime = Some(OverlayRuntime {
+            consumption_mb: 0,
+            warning_threshold_mb: 768,
+            critical_threshold_mb: 921,
+        });
+        app.apply_event(BackendEvent::Snapshot(reset_snap));
+        app.apply_event(BackendEvent::Finished {
+            id: id2,
+            outcome: Outcome::Ok("已重置".into()),
+        });
+        assert!(!app.cache.dirty);
+        assert_eq!(app.cache.warning_text, "768");
+        assert!(app.cache.error.is_none());
+    }
+
+    #[test]
+    fn gui_delete_key_does_not_remove_exclusion_and_confirm_modal_ignores_enter() {
+        let (mut harness, _event_tx, cmd_rx) = build_gui_harness(
+            BackendKind::Mock,
+            StubFileDialog::default(),
+            Some(demo_snapshot()),
+        );
+
+        // 主界面按 Delete 不应未确认直删任何排除项
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(2);
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 高危确认弹窗按回车不得自动触发确认动作（防止焦点停在“取消”或误按回车）
+        harness.get_by_label("立即重启生效…").click();
+        harness.run();
+        assert!(harness.query_by_label("重启系统确认").is_some());
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(harness.query_by_label("重启系统确认").is_some());
     }
 
     #[test]

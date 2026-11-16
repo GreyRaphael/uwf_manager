@@ -349,19 +349,7 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut UwfApp) {
         return;
     }
 
-    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5)) && !app.is_pending() {
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5)) && !app.is_busy() {
         app.refresh_all();
-        return;
-    }
-
-    // 仅当没有任何文本输入控件正在编辑时才响应 Delete 快捷移除排除项
-    let text_editing = ctx.egui_wants_keyboard_input();
-    if !text_editing
-        && app.phase == Phase::Ready
-        && !app.is_busy()
-        && app.selected_exclusion().is_some()
-        && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete))
-    {
-        app.delete_selected_exclusion();
     }
 }

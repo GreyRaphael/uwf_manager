@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use eframe::egui::{self, Align, FontId, Key, Layout, Modifiers, RichText};
+use eframe::egui::{self, Align, FontId, Layout, RichText};
 
 use crate::ui::theme;
 
@@ -73,9 +73,7 @@ pub fn render(ctx: &egui::Context, state: &ConfirmState) -> ConfirmOutcome {
             );
             ui.add_space(16.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if theme::danger_button(ui, &state.confirm_label).clicked()
-                    || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
-                {
+                if theme::danger_button(ui, &state.confirm_label).clicked() {
                     outcome = ConfirmOutcome::Confirm(state.action.clone());
                 }
                 if theme::secondary_button(ui, "取消").clicked() {

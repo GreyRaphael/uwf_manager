@@ -13,7 +13,6 @@ pub const BG_CANVAS: Color32 = Color32::from_rgb(243, 245, 249); // #F3F5F9
 pub const BG_CARD: Color32 = Color32::WHITE;
 pub const BG_SUBTLE: Color32 = Color32::from_rgb(248, 250, 252); // #F8FAFC
 pub const BG_HOVER: Color32 = Color32::from_rgb(238, 242, 247); // #EEF2F7
-pub const BG_SELECTED: Color32 = Color32::from_rgb(224, 238, 255); // #E0EEFF
 pub const BORDER: Color32 = Color32::from_rgb(226, 232, 240); // #E2E8F0
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(203, 213, 225); // #CBD5E1
 
