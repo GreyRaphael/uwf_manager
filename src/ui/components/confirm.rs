@@ -45,7 +45,7 @@ impl ConfirmState {
             ConfirmAction::Restart => "确认重启",
             ConfirmAction::Shutdown => "确认关机",
             ConfirmAction::Quit => "强行退出",
-            ConfirmAction::CommitFileDeletion(_) => "确认删除并固化",
+            ConfirmAction::CommitFileDeletion(_) => "确认永久删除",
             ConfirmAction::RevertExclusions => "确认撤销",
         };
         Self {

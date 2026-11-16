@@ -5,11 +5,11 @@ pub use crate::error::UWF_ENABLE_CMD as NI_ENABLE_CMD;
 pub const LOADING: &str = "正在读取 UWF 系统状态…";
 pub const LOAD_FAILED: &str = "读取状态失败，请点击下方「重新加载」或按 [F5] 重试";
 pub const BACKEND_LOST: &str = "后台服务线程已意外断开，请重启本程序";
-pub const READY_EMPTY: &str = "（暂无条目）";
+pub const READY_EMPTY: &str = "当前暂无排除规则";
 
-pub const NOTICE_SHORT: &str = "修改筛选器开关、缓存模式、保护分区与排除项通常需重启计算机后生效";
+pub const NOTICE_SHORT: &str = "保护开关、缓存模式/容量、分区保护与排除列表均在重启计算机后生效";
 pub const OVERLAY_LOCK_HINT: &str =
-    "筛选器当前已启用，缓存模式与最大容量已锁定（禁用并重启后可改）";
+    "写入保护当前已开启：模式与最大容量已锁定（停用保护并重启后可修改）";
 
 pub fn app_title() -> String {
     format!("UWF 管理器 v{}", env!("CARGO_PKG_VERSION"))

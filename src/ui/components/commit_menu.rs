@@ -25,22 +25,22 @@ pub enum CommitMenuOutcome {
 const ITEMS: [(CommitChoice, &str, &str, &str, bool); 3] = [
     (
         CommitChoice::File,
-        "提交文件修改",
-        "将当前受保护卷中某文件的改动立即写回物理磁盘",
+        "永久保存文件修改",
+        "将受保护分区中指定文件的最新修改立即写回硬盘，重启后不会还原",
         "选择文件…",
         false,
     ),
     (
         CommitChoice::FileDeletion,
-        "删除并固化文件",
-        "立即删除目标文件并固化该删除，重启后不再恢复（需二次确认）",
+        "永久删除文件",
+        "立即彻底删除目标文件并同步记录，重启后不会自动恢复（需二次确认）",
         "选择待删文件…",
         true,
     ),
     (
         CommitChoice::Registry,
-        "提交注册表键值",
-        "将受保护注册表项下的指定键值立即写入物理配置（格式：键路径\\值名）",
+        "永久保存注册表键值",
+        "将受保护注册表项下的指定键值立即写入硬盘（格式：键路径\\值名）",
         "输入键值…",
         false,
     ),
@@ -51,12 +51,12 @@ pub fn render(ctx: &egui::Context) -> CommitMenuOutcome {
     let (_, should_close) = show_modal(
         ctx,
         "commit_menu_modal",
-        "提交固化操作（立即写入磁盘/注册表）",
+        "永久保存改动（立即写入硬盘）",
         theme::TEXT_PRIMARY,
         460.0,
         |ui| {
             ui.label(
-                RichText::new("以下操作直接作用于当前会话受保护对象，请选择要执行的固化类型：")
+                RichText::new("开启保护期间，若想把某项重要改动直接保存到真实硬盘，请选择：")
                     .font(FontId::proportional(12.5))
                     .color(theme::TEXT_SECONDARY),
             );

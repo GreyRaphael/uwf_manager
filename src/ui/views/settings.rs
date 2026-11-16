@@ -18,12 +18,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
     theme::card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::card_header(ui, "筛选器控制", Some("系统写入保护总开关"));
+        theme::card_header(ui, "写入保护总开关", Some("开启后改动重启自动还原"));
         ui.add_space(8.0);
 
         let Some(fs) = app.snapshot.filter_state else {
             ui.label(
-                RichText::new("尚未获取筛选器状态")
+                RichText::new("尚未获取保护开关状态")
                     .font(FontId::proportional(12.5))
                     .color(theme::TEXT_MUTED),
             );
@@ -32,15 +32,15 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("当前会话")
+                RichText::new("当前生效")
                     .font(FontId::proportional(12.5))
                     .color(theme::TEXT_SECONDARY),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if fs.current_enabled {
-                    theme::status_pill(ui, "● 已启用", theme::OK_FG, theme::OK_BG);
+                    theme::status_pill(ui, "● 已开启", theme::OK_FG, theme::OK_BG);
                 } else {
-                    theme::status_pill(ui, "○ 已禁用", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                    theme::status_pill(ui, "○ 已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
                 }
             });
         });
@@ -48,7 +48,7 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("重启后状态")
+                RichText::new("重启后")
                     .font(FontId::proportional(12.5))
                     .color(theme::TEXT_SECONDARY),
             );
@@ -56,15 +56,15 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
                 let pending_change = fs.current_enabled != fs.next_enabled;
                 if pending_change {
                     let label = if fs.next_enabled {
-                        "将启用 (待重启)"
+                        "将开启 (待重启)"
                     } else {
-                        "将禁用 (待重启)"
+                        "将关闭 (待重启)"
                     };
                     theme::status_pill(ui, label, theme::WARN_FG, theme::WARN_BG);
                 } else if fs.next_enabled {
-                    theme::status_pill(ui, "已启用", theme::OK_FG, theme::OK_BG);
+                    theme::status_pill(ui, "已开启", theme::OK_FG, theme::OK_BG);
                 } else {
-                    theme::status_pill(ui, "已禁用", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                    theme::status_pill(ui, "已关闭", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
                 }
             });
         });
@@ -74,9 +74,9 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 let clicked = if fs.next_enabled {
-                    theme::secondary_button(ui, "停用筛选器").clicked()
+                    theme::secondary_button(ui, "停用保护").clicked()
                 } else {
-                    theme::primary_button(ui, "启用筛选器").clicked()
+                    theme::primary_button(ui, "启用保护").clicked()
                 };
                 if clicked {
                     app.toggle_write_filter();
@@ -98,9 +98,9 @@ fn render_overlay_card(ui: &mut egui::Ui, app: &mut UwfApp) {
         let subtitle = if app.cache.dirty {
             Some("* 有未保存改动")
         } else {
-            Some("实时缓存监控与上限配额")
+            Some("临时缓存占用与配额")
         };
-        theme::card_header(ui, "写入缓存 (Overlay)", subtitle);
+        theme::card_header(ui, "保护缓存", subtitle);
         ui.add_space(8.0);
 
         render_usage_section(ui, app);
@@ -157,7 +157,7 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("筛选器当前未开启，启用并重启后将实时监测缓存使用率")
+                    RichText::new("写入保护当前未开启，开启并重启后将实时监测缓存使用率")
                         .font(FontId::proportional(12.0))
                         .color(theme::TEXT_MUTED),
                 );

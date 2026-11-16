@@ -18,7 +18,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         theme::card_header(
             ui,
             "排除项规则",
-            Some(&format!("共 {count} 条 · 修改在下次重启后生效")),
+            Some(&format!("共 {count} 条 · 例外清单内的改动重启后仍会保留")),
         );
 
         ui.add_space(8.0);
@@ -103,11 +103,21 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                 if rows.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new(text::READY_EMPTY)
-                                .font(FontId::proportional(13.0))
-                                .color(theme::TEXT_MUTED),
-                        );
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(((list_h - 46.0) * 0.5).max(8.0));
+                            ui.label(
+                                RichText::new(text::READY_EMPTY)
+                                    .font(FontId::proportional(13.0))
+                                    .strong()
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("添加到此列表的文件、文件夹或注册表路径，在保护期间修改也会永久保留")
+                                    .font(FontId::proportional(12.0))
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        });
                     });
                     return;
                 }

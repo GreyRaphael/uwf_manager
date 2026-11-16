@@ -788,25 +788,25 @@ impl UwfApp {
         match choice {
             CommitChoice::File => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "提交文件修改",
-                    "受保护卷中的文件绝对路径",
-                    "将目标文件当前会话的更改立即固化到物理磁盘（如 C:\\data\\config.ini）",
+                    "永久保存文件修改",
+                    "受保护分区中的文件绝对路径",
+                    "立即将目标文件当前的修改永久写入真实硬盘，重启后不还原（如 C:\\data\\config.ini）",
                     InputAction::CommitFile,
                     BrowseKind::File,
                 )));
             }
             CommitChoice::FileDeletion => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "删除并固化文件（第 1 / 2 步）",
-                    "待删除的文件绝对路径",
-                    "先物理删除目标文件，随后向 UWF 固化删除（下一步需二次确认）",
+                    "永久删除文件（第 1 / 2 步）",
+                    "待永久删除的文件绝对路径",
+                    "立即彻底删除目标文件并同步记录，重启后不会自动恢复（下一步需二次确认）",
                     InputAction::CommitFileDeletion,
                     BrowseKind::File,
                 )));
             }
             CommitChoice::Registry => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "提交注册表键值",
+                    "永久保存注册表键值",
                     "注册表完整路径（含值名）",
                     "格式为 键路径\\值名称（如 HKLM\\SOFTWARE\\Example\\ValueName）",
                     InputAction::CommitRegistry,
@@ -870,9 +870,9 @@ impl UwfApp {
             InputAction::CommitFileDeletion => {
                 let path = PathBuf::from(&text);
                 self.modal = Some(Modal::Confirm(ConfirmState::new(
-                    "删除并固化文件确认（第 2 / 2 步）",
+                    "永久删除文件确认（第 2 / 2 步）",
                     format!(
-                        "警告：即将立即物理删除文件：\n{}\n并固化该删除，计算机重启后不会恢复。\n\n确定继续？",
+                        "警告：即将立即彻底删除文件：\n{}\n且计算机重启后不会自动恢复。\n\n确定继续？",
                         path.display()
                     ),
                     ConfirmAction::CommitFileDeletion(path),
@@ -1393,8 +1393,8 @@ pub(crate) mod tests {
         assert!(harness.query_by_label_contains("UWF 管理器").is_none());
         assert!(harness.query_by_label_contains("当前: ").is_none());
 
-        // 切换筛选器（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
-        harness.get_by_label("停用筛选器").click();
+        // 切换写入保护总开关（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
+        harness.get_by_label("停用保护").click();
         harness.run_steps(2);
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
             panic!("期望 Mutate 命令");
@@ -1507,7 +1507,7 @@ pub(crate) mod tests {
         let (mut harness, _event_tx, cmd_rx) =
             build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
 
-        harness.get_by_label("提交操作…").click();
+        harness.get_by_label("永久保存…").click();
         harness.run();
         harness.get_by_label("选择待删文件…").click();
         harness.run();
@@ -1518,7 +1518,7 @@ pub(crate) mod tests {
         // 第一步仅切到二次确认，尚未发命令
         assert!(cmd_rx.try_recv().is_err());
 
-        harness.get_by_label("确认删除并固化").click();
+        harness.get_by_label("确认永久删除").click();
         harness.run_steps(2);
         match recv_cmd(&cmd_rx) {
             BackendCmd::CommitFileDeletion(path) => assert_eq!(path, "C:\\data\\a.txt"),
@@ -1583,8 +1583,8 @@ pub(crate) mod tests {
         let (mut harness, event_tx, cmd_rx) =
             build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
 
-        // 仅保护 C: 时，选 D: 删除并固化在第 1 步即内联拦截，不进入第 2 步也不发后端命令
-        harness.get_by_label("提交操作…").click();
+        // 仅保护 C: 时，选 D: 永久删除在第 1 步即内联拦截，不进入第 2 步也不发后端命令
+        harness.get_by_label("永久保存…").click();
         harness.run();
         harness.get_by_label("选择待删文件…").click();
         harness.run();
@@ -1598,7 +1598,7 @@ pub(crate) mod tests {
                 .query_by_label_contains("卷 D: 当前会话未受 UWF 保护")
                 .is_some()
         );
-        assert!(harness.query_by_label("确认删除并固化").is_none());
+        assert!(harness.query_by_label("确认永久删除").is_none());
         harness.get_by_label("取消").click();
         harness.run();
 
@@ -1617,8 +1617,8 @@ pub(crate) mod tests {
                 .is_err_and(|e| e.contains("筛选器当前会话未启用"))
         );
 
-        // 即使直接绕过弹窗传未受保护盘符给提交文件修改，也会被预检拦下并写红字错误
-        harness.get_by_label("提交操作…").click();
+        // 即使直接绕过弹窗传未受保护盘符给永久保存文件修改，也会被预检拦下并写红字错误
+        harness.get_by_label("永久保存…").click();
         harness.run();
         harness.get_by_label("选择文件…").click();
         harness.run();
@@ -1650,8 +1650,8 @@ pub(crate) mod tests {
 
         let logs_rect = harness.get_by_label_contains("日志 (").rect();
         let help_rect = harness.get_by_label("帮助 (F1)").rect();
-        let commit_rect = harness.get_by_label("提交操作…").rect();
-        let filter_hdr_rect = harness.get_by_label("筛选器控制").rect();
+        let commit_rect = harness.get_by_label("永久保存…").rect();
+        let filter_hdr_rect = harness.get_by_label("写入保护总开关").rect();
         assert!(
             logs_rect.max.x <= help_rect.min.x,
             "日志按钮应位于帮助按钮左侧: logs={logs_rect:?}, help={help_rect:?}"

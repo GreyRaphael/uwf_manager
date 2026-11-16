@@ -12,8 +12,8 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
 
         theme::card_header(
             ui,
-            "受保护分区 (Volumes)",
-            Some("每行拨动右侧开关即可设置（下次重启后生效）"),
+            "受保护磁盘分区",
+            Some("拨动右侧开关即可切换保护状态（下次重启后生效）"),
         );
 
         ui.add_space(8.0);
@@ -45,7 +45,8 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 .column(Column::initial(95.0).at_least(85.0))
                 .column(Column::initial(172.0).at_least(160.0))
                 .header(26.0, |mut header| {
-                    for title in ["分区", "状态说明", "当前会话", "重启后保护"] {
+                    for title in ["分区", "保护效果说明", "当前生效", "重启后生效"]
+                    {
                         header.col(|ui| {
                             ui.label(
                                 RichText::new(title)
@@ -73,14 +74,14 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                         row.col(|ui| {
                             let note = if vol.current_protected != vol.next_protected {
                                 if vol.next_protected {
-                                    "已加入待保护队列（重启后启用）"
+                                    "重启后将开始保护（改动不保留）"
                                 } else {
-                                    "已计划取消保护（重启后解除）"
+                                    "重启后将取消保护（改动直接保存）"
                                 }
                             } else if vol.current_protected {
-                                "正在拦截该分区全部写入"
+                                "保护中（重启后自动还原全部改动）"
                             } else {
-                                "直接写入物理磁盘"
+                                "未保护（直接保存到物理硬盘）"
                             };
                             ui.label(
                                 RichText::new(note)
