@@ -38,6 +38,9 @@ pub const ERR_BAR: Color32 = Color32::from_rgb(220, 38, 38); // #DC2626
 pub const INFO_BG: Color32 = Color32::from_rgb(239, 246, 255); // #EFF6FF
 pub const INFO_FG: Color32 = Color32::from_rgb(29, 78, 216); // #1D4ED8
 
+/// 表单左侧固定标签宽度（保证「缓存位置」与下方输入行左侧标签对齐）。
+pub const FIELD_LABEL_WIDTH: f32 = 78.0;
+
 /// 初始化全局浅色 Fluent 视觉与排版节奏。
 pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Light);
@@ -111,12 +114,27 @@ pub fn modal_frame() -> Frame {
 
 /// 卡片头部标题 + 下方可选说明文字（避免在窄边栏与右侧控件争抢宽度）。
 pub fn card_header(ui: &mut Ui, title: &str, subtitle: Option<&str>) {
-    ui.label(
-        RichText::new(title)
-            .font(FontId::proportional(15.0))
-            .strong()
-            .color(TEXT_PRIMARY),
-    );
+    card_header_with_action(ui, title, subtitle, |_| {});
+}
+
+/// 带右侧扩展操作区的卡片头部（左侧标题，右侧可选操作区，下方可选说明文字）。
+pub fn card_header_with_action(
+    ui: &mut Ui,
+    title: &str,
+    subtitle: Option<&str>,
+    right_action: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .font(FontId::proportional(15.0))
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right_action(ui);
+        });
+    });
     if let Some(sub) = subtitle {
         ui.add_space(1.0);
         ui.add(
@@ -178,6 +196,41 @@ pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
             .corner_radius(CornerRadius::same(6))
             .min_size(Vec2::new(0.0, 28.0)),
     )
+}
+
+/// 统一风格下拉菜单按钮（次级描边风格与内边距）。
+pub fn menu_button<R>(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui) -> R) {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(11.0, 6.0);
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = BG_SUBTLE;
+        w.inactive.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
+        ui.menu_button(label, add_contents);
+    });
+}
+
+/// 实测当前主题/DPI 下单行文本的渲染宽度，避免固定像素预留导致缩放截断。
+pub fn measure_text_width(
+    ui: &Ui,
+    text: impl Into<egui::WidgetText>,
+    fallback_style: egui::TextStyle,
+) -> f32 {
+    text.into()
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            fallback_style,
+        )
+        .size()
+        .x
+}
+
+/// 实测标准按钮占用宽度（用于左侧输入框与右侧按钮同一水平行精确分配剩余宽度）。
+pub fn measure_button_width(ui: &Ui, label: &str) -> f32 {
+    measure_text_width(ui, label, egui::TextStyle::Button)
+        + ui.spacing().button_padding.x * 2.0
+        + 4.0
 }
 
 /// 语义胶囊标签（状态/徽章/计数）。
@@ -247,29 +300,36 @@ pub fn segmented_toggle<T: Copy + PartialEq>(
     changed
 }
 
-/// 带左侧固定标签、末尾可选单位与无障碍关联的单行文本输入。
+/// 带左侧固定标签、末尾对齐单位列与无障碍关联的单行文本输入。
 pub fn labeled_input_row(
     ui: &mut Ui,
     label: &str,
     value: &mut String,
     unit: Option<&str>,
+    unit_reserve_w: f32,
     enabled: bool,
-    width: f32,
 ) -> Response {
     ui.horizontal(|ui| {
         let lbl = ui.add_sized(
-            [78.0, 24.0],
+            [FIELD_LABEL_WIDTH, 24.0],
             egui::Label::new(
                 RichText::new(label)
                     .font(FontId::proportional(12.5))
                     .color(if enabled { TEXT_PRIMARY } else { TEXT_MUTED }),
             ),
         );
+        let spacing = ui.spacing().item_spacing.x;
+        let reserved_unit = if unit.is_some() {
+            unit_reserve_w + spacing
+        } else {
+            0.0
+        };
+        let input_w = (ui.available_width() - reserved_unit).max(64.0);
         let resp = ui
             .add_enabled(
                 enabled,
                 egui::TextEdit::singleline(value)
-                    .desired_width(width)
+                    .desired_width(input_w)
                     .align(Align2::LEFT_CENTER),
             )
             .labelled_by(lbl.id);

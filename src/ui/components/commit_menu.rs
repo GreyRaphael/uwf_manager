@@ -1,8 +1,6 @@
 //! 提交固化菜单弹窗（提交文件修改 / 删除并固化文件 / 提交注册表键值）。
 
-use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, FontId, Layout, Margin, RichText, Stroke,
-};
+use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Layout, Margin, RichText, Stroke};
 
 use crate::ui::theme;
 
@@ -81,9 +79,11 @@ pub fn render(ctx: &egui::Context) -> CommitMenuOutcome {
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(12, 10))
                     .show(ui, |ui| {
+                        let btn_w = theme::measure_button_width(ui, btn_label);
+                        let spacing = ui.spacing().item_spacing.x;
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.set_width((ui.available_width() - 118.0).max(180.0));
+                                ui.set_width((ui.available_width() - btn_w - spacing).max(160.0));
                                 ui.label(
                                     RichText::new(title)
                                         .font(FontId::proportional(13.5))
@@ -98,15 +98,7 @@ pub fn render(ctx: &egui::Context) -> CommitMenuOutcome {
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let btn = if danger {
-                                    ui.add(
-                                        Button::new(RichText::new(btn_label).color(theme::ERR_FG))
-                                            .fill(theme::ERR_BG)
-                                            .stroke(Stroke::new(
-                                                1.0,
-                                                Color32::from_rgb(252, 165, 165),
-                                            ))
-                                            .corner_radius(CornerRadius::same(6)),
-                                    )
+                                    theme::danger_button(ui, btn_label)
                                 } else {
                                     theme::secondary_button(ui, btn_label)
                                 };

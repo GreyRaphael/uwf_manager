@@ -111,17 +111,10 @@ fn load_window_icon() -> Option<egui::IconData> {
 
 fn show_fatal_dialog(title: &str, message: &str) {
     eprintln!("{title}: {message}");
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title(title)
-            .set_description(message)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    let has_display = cfg!(any(windows, target_os = "macos"))
+        || std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if has_display {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title(title)

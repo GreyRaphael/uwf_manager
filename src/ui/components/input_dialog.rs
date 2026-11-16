@@ -105,11 +105,14 @@ pub fn render(ctx: &egui::Context, state: &mut InputState, browse_busy: bool) ->
 
         let mut enter_pressed = false;
         ui.horizontal(|ui| {
-            let browse_w = if state.browse == BrowseKind::None {
-                0.0
-            } else {
-                86.0
+            let browse_lbl = match state.browse {
+                BrowseKind::Folder => Some("选择目录…"),
+                BrowseKind::File => Some("浏览文件…"),
+                BrowseKind::None => None,
             };
+            let browse_w = browse_lbl.map_or(0.0, |lbl| {
+                theme::measure_button_width(ui, lbl) + ui.spacing().item_spacing.x
+            });
             let input_w = (ui.available_width() - browse_w).max(180.0);
             let edit_resp = ui
                 .add(
@@ -130,23 +133,12 @@ pub fn render(ctx: &egui::Context, state: &mut InputState, browse_busy: bool) ->
                 enter_pressed = true;
             }
 
-            if state.browse != BrowseKind::None {
-                let browse_lbl = match state.browse {
-                    BrowseKind::Folder => "选择目录…",
-                    BrowseKind::File => "浏览文件…",
-                    BrowseKind::None => "",
-                };
-                if ui
-                    .add_enabled(
-                        !browse_busy,
-                        egui::Button::new(browse_lbl)
-                            .fill(theme::BG_SUBTLE)
-                            .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG)),
-                    )
-                    .clicked()
-                {
-                    outcome = InputOutcome::Browse(state.browse);
-                }
+            if let Some(lbl) = browse_lbl {
+                ui.add_enabled_ui(!browse_busy, |ui| {
+                    if theme::secondary_button(ui, lbl).clicked() {
+                        outcome = InputOutcome::Browse(state.browse);
+                    }
+                });
             }
         });
 

@@ -77,11 +77,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(10, 8))
                     .show(ui, |ui| {
+                        let copy_w = theme::measure_button_width(ui, "复制命令");
+                        let spacing = ui.spacing().item_spacing.x;
                         ui.horizontal(|ui| {
                             let mut cmd_ref: &str = text::NI_ENABLE_CMD;
                             ui.add(
                                 egui::TextEdit::singleline(&mut cmd_ref)
-                                    .desired_width((ui.available_width() - 96.0).max(180.0))
+                                    .desired_width((ui.available_width() - copy_w - spacing).max(180.0))
                                     .font(FontId::monospace(12.0)),
                             )
                             .labelled_by(cmd_label.id);

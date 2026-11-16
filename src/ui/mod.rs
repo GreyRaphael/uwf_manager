@@ -97,21 +97,15 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                             let ready = app.phase == Phase::Ready && !app.is_busy();
                             ui.add_enabled_ui(ready, |ui| {
-                                ui.scope(|ui| {
-                                    ui.spacing_mut().button_padding = egui::vec2(11.0, 6.0);
-                                    let w = &mut ui.visuals_mut().widgets;
-                                    w.inactive.weak_bg_fill = theme::BG_SUBTLE;
-                                    w.inactive.bg_stroke = Stroke::new(1.0, theme::BORDER_STRONG);
-                                    ui.menu_button("电源 ▾", |ui| {
-                                        if ui.button("重启计算机…").clicked() {
-                                            ui.close();
-                                            app.open_restart_confirm();
-                                        }
-                                        if ui.button("关闭计算机…").clicked() {
-                                            ui.close();
-                                            app.open_shutdown_confirm();
-                                        }
-                                    });
+                                theme::menu_button(ui, "电源 ▾", |ui| {
+                                    if ui.button("重启计算机…").clicked() {
+                                        ui.close();
+                                        app.open_restart_confirm();
+                                    }
+                                    if ui.button("关闭计算机…").clicked() {
+                                        ui.close();
+                                        app.open_shutdown_confirm();
+                                    }
                                 });
 
                                 if theme::secondary_button(ui, "永久保存…").clicked() {
@@ -141,29 +135,31 @@ fn render_left_rail(ui: &mut egui::Ui, app: &mut UwfApp) {
                 }),
         )
         .show(ui, |ui| {
-            let total_h = ui.available_height();
-            let rail_w = ui.available_width();
-            let os_h_id = ui.make_persistent_id("left_rail_os_card_h");
-            let prev_os_h: f32 = ui.data(|d| d.get_temp::<f32>(os_h_id)).unwrap_or(122.0);
-            let scroll_h = (total_h - prev_os_h - 10.0).max(120.0);
+            Panel::bottom("uwf_left_os_panel")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::BG_CANVAS)
+                        .inner_margin(Margin {
+                            top: 10,
+                            ..Margin::ZERO
+                        }),
+                )
+                .show(ui, |ui| {
+                    views::settings::render_os_card(ui, app);
+                });
 
-            ui.allocate_ui(egui::vec2(rail_w, scroll_h), |ui| {
-                ScrollArea::vertical()
-                    .id_salt("left_rail_scroll")
-                    .max_height(scroll_h)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        views::settings::render(ui, app);
-                    });
-            });
-
-            ui.add_space(10.0);
-            let os_resp = views::settings::render_os_card(ui, app);
-            let measured_h = os_resp.rect.height();
-            if measured_h > 20.0 && (measured_h - prev_os_h).abs() > 0.5 {
-                ui.data_mut(|d| d.insert_temp(os_h_id, measured_h));
-                ui.ctx().request_repaint();
-            }
+            egui::CentralPanel::no_frame()
+                .frame(egui::Frame::NONE.fill(theme::BG_CANVAS))
+                .show(ui, |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("left_rail_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            views::settings::render(ui, app);
+                        });
+                });
         });
 }
 

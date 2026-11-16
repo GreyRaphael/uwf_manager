@@ -18,14 +18,11 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_width(ui.available_width());
         let busy = app.is_busy();
 
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("写入保护总开关")
-                    .font(FontId::proportional(15.0))
-                    .strong()
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        theme::card_header_with_action(
+            ui,
+            "写入保护总开关",
+            Some("开启后受保护分区的改动重启后自动还原"),
+            |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     let reset_btn = ui.add(
                         egui::Button::new(
@@ -43,12 +40,7 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
                         app.open_reset_confirm();
                     }
                 });
-            });
-        });
-        ui.label(
-            RichText::new("开启后受保护分区的改动重启后自动还原")
-                .font(FontId::proportional(11.5))
-                .color(theme::TEXT_MUTED),
+            },
         );
         ui.add_space(8.0);
 
@@ -118,23 +110,15 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 fn render_overlay_card(ui: &mut egui::Ui, app: &mut UwfApp) {
     theme::card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("保护缓存")
-                    .font(FontId::proportional(15.0))
-                    .strong()
-                    .color(theme::TEXT_PRIMARY),
-            );
-            if app.cache.dirty {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        theme::card_header_with_action(
+            ui,
+            "保护缓存",
+            Some("临时缓存占用与配额上限"),
+            |ui| {
+                if app.cache.dirty {
                     theme::status_pill(ui, "* 未保存", theme::WARN_FG, theme::WARN_BG);
-                });
-            }
-        });
-        ui.label(
-            RichText::new("临时缓存占用与配额上限")
-                .font(FontId::proportional(11.5))
-                .color(theme::TEXT_MUTED),
+                }
+            },
         );
         ui.add_space(8.0);
 
@@ -202,14 +186,19 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
     let busy = app.is_busy();
     let locked = is_overlay_locked(&app.snapshot);
     let mut edited = false;
+    // 以最宽后缀「MB (100%)」动态预留单位列，保证三行输入框右边缘对齐且高 DPI 下不截断
+    let unit_reserve_w = theme::measure_text_width(
+        ui,
+        RichText::new("MB (100%)").font(FontId::proportional(12.0)),
+        egui::TextStyle::Body,
+    );
 
     let render_locked_pair = |ui: &mut egui::Ui, app: &mut UwfApp, edited: &mut bool| {
-        let input_w = (ui.available_width() - 148.0).max(76.0);
         if let Some(cfg_next) = app.snapshot.overlay_config_next {
             let mut selected_type = cfg_next.overlay_type;
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [74.0, 24.0],
+                    [theme::FIELD_LABEL_WIDTH, 24.0],
                     egui::Label::new(
                         RichText::new("缓存位置")
                             .font(FontId::proportional(12.5))
@@ -241,8 +230,8 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
             "最大容量",
             &mut app.cache.max_size_text,
             Some("MB"),
+            unit_reserve_w,
             !busy && !locked,
-            input_w,
         )
         .changed();
     };
@@ -271,15 +260,14 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
 
     let warn_unit = format_threshold_unit(&app.cache.warning_text, app);
     let crit_unit = format_threshold_unit(&app.cache.critical_text, app);
-    let thresh_w = (ui.available_width() - 150.0).max(76.0);
 
     edited |= theme::labeled_input_row(
         ui,
         "警告阈值",
         &mut app.cache.warning_text,
         Some(&warn_unit),
+        unit_reserve_w,
         !busy,
-        thresh_w,
     )
     .changed();
 
@@ -288,8 +276,8 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
         "严重阈值",
         &mut app.cache.critical_text,
         Some(&crit_unit),
+        unit_reserve_w,
         !busy,
-        thresh_w,
     )
     .changed();
 
@@ -349,76 +337,74 @@ fn format_threshold_unit(val_text: &str, app: &UwfApp) -> String {
 }
 
 /// 左下角系统版本与 UWF 版本兼容性提示面板。
-pub fn render_os_card(ui: &mut egui::Ui, app: &UwfApp) -> egui::Response {
-    theme::card_frame()
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+pub fn render_os_card(ui: &mut egui::Ui, app: &UwfApp) {
+    theme::card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
 
-            let os_text = app
-                .os_version
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("正在检测 Windows 版本…");
-            let support = app
-                .os_version
-                .as_deref()
-                .map(check_windows_edition_support)
-                .unwrap_or(EditionSupport::Unknown);
+        let os_text = app
+            .os_version
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("正在检测 Windows 版本…");
+        let support = app
+            .os_version
+            .as_deref()
+            .map(check_windows_edition_support)
+            .unwrap_or(EditionSupport::Unknown);
 
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("系统环境")
-                        .font(FontId::proportional(13.5))
-                        .strong()
-                        .color(theme::TEXT_PRIMARY),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match support {
-                    EditionSupport::Supported => {
-                        theme::status_pill(ui, "支持 UWF", theme::OK_FG, theme::OK_BG);
-                    }
-                    EditionSupport::Unsupported => {
-                        theme::status_pill(ui, "需企业/教育版", theme::WARN_FG, theme::WARN_BG);
-                    }
-                    EditionSupport::Unknown => {
-                        theme::status_pill(ui, "版本未知", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
-                    }
-                });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("系统环境")
+                    .font(FontId::proportional(13.5))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match support {
+                EditionSupport::Supported => {
+                    theme::status_pill(ui, "支持 UWF", theme::OK_FG, theme::OK_BG);
+                }
+                EditionSupport::Unsupported => {
+                    theme::status_pill(ui, "需企业/教育版", theme::WARN_FG, theme::WARN_BG);
+                }
+                EditionSupport::Unknown => {
+                    theme::status_pill(ui, "版本未知", theme::TEXT_SECONDARY, theme::BG_SUBTLE);
+                }
             });
+        });
 
-            ui.add_space(6.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(os_text)
-                        .font(FontId::proportional(12.5))
-                        .strong()
-                        .color(theme::TEXT_PRIMARY),
-                )
-                .wrap(),
-            );
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(os_text)
+                    .font(FontId::proportional(12.5))
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            )
+            .wrap(),
+        );
 
-            ui.add_space(4.0);
-            let (hint_text, hint_color) = match support {
-                EditionSupport::Unsupported => (
-                    "提示：当前非企业版或教育版，需要 Windows 企业版或教育版才能使用 UWF 功能。",
-                    theme::WARN_FG,
-                ),
-                EditionSupport::Supported => (
-                    "当前版本符合要求（需要 Windows 企业版和教育版才能使用 UWF 功能）。",
-                    theme::TEXT_MUTED,
-                ),
-                EditionSupport::Unknown => (
-                    "提示：需要 Windows 企业版和教育版才能使用 UWF 功能。",
-                    theme::TEXT_MUTED,
-                ),
-            };
-            ui.add(
-                egui::Label::new(
-                    RichText::new(hint_text)
-                        .font(FontId::proportional(11.5))
-                        .color(hint_color),
-                )
-                .wrap(),
-            );
-        })
-        .response
+        ui.add_space(4.0);
+        let (hint_text, hint_color) = match support {
+            EditionSupport::Unsupported => (
+                "提示：当前非企业版或教育版，需要 Windows 企业版或教育版才能使用 UWF 功能。",
+                theme::WARN_FG,
+            ),
+            EditionSupport::Supported => (
+                "当前版本符合要求（需要 Windows 企业版和教育版才能使用 UWF 功能）。",
+                theme::TEXT_MUTED,
+            ),
+            EditionSupport::Unknown => (
+                "提示：需要 Windows 企业版和教育版才能使用 UWF 功能。",
+                theme::TEXT_MUTED,
+            ),
+        };
+        ui.add(
+            egui::Label::new(
+                RichText::new(hint_text)
+                    .font(FontId::proportional(11.5))
+                    .color(hint_color),
+            )
+            .wrap(),
+        );
+    });
 }

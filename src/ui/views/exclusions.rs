@@ -16,29 +16,17 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         // 第一行：标题与导入导出按钮；第二行：说明副标题
         let count = app.visible_exclusions().len();
         let busy = app.is_busy();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("排除项规则")
-                    .font(FontId::proportional(15.0))
-                    .strong()
-                    .color(theme::TEXT_PRIMARY),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if theme::secondary_button(ui, "导出列表").clicked() {
-                        app.open_export_dialog(ui.ctx());
-                    }
-                    if theme::secondary_button(ui, "导入列表").clicked() {
-                        app.open_import_dialog(ui.ctx());
-                    }
-                });
+        let subtitle = format!("共 {count} 条 · 例外清单内的改动重启后仍会保留");
+        theme::card_header_with_action(ui, "排除项规则", Some(&subtitle), |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if theme::secondary_button(ui, "导出列表").clicked() {
+                    app.open_export_dialog(ui.ctx());
+                }
+                if theme::secondary_button(ui, "导入列表").clicked() {
+                    app.open_import_dialog(ui.ctx());
+                }
             });
         });
-        ui.label(
-            RichText::new(format!("共 {count} 条 · 例外清单内的改动重启后仍会保留"))
-                .font(FontId::proportional(11.5))
-                .color(theme::TEXT_MUTED),
-        );
 
         ui.add_space(8.0);
 
@@ -156,72 +144,72 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                 .inner_margin(Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        theme::status_pill(ui, kind_lbl, kind_fg, kind_bg);
-
-                                        let right_badge_w = 132.0;
-                                        let text_w =
-                                            (ui.available_width() - right_badge_w).max(80.0);
-                                        ui.add_sized(
-                                            [text_w, 20.0],
-                                            egui::Label::new(
-                                                RichText::new(&full_text)
-                                                    .font(FontId::monospace(12.5))
-                                                    .color(theme::TEXT_PRIMARY),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&full_text);
-
-                                        ui.with_layout(
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                ui.add_enabled_ui(!busy, |ui| {
-                                                    let rm_resp = ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("移除")
-                                                                    .font(FontId::proportional(
-                                                                        11.5,
-                                                                    ))
-                                                                    .color(theme::ERR_FG),
-                                                            )
-                                                            .fill(theme::ERR_BG)
-                                                            .stroke(Stroke::NONE)
-                                                            .corner_radius(CornerRadius::same(5)),
+                                    ui.with_layout(
+                                        Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            ui.add_enabled_ui(!busy, |ui| {
+                                                let rm_resp = ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("移除")
+                                                                .font(FontId::proportional(11.5))
+                                                                .color(theme::ERR_FG),
                                                         )
-                                                        .on_hover_text(format!(
-                                                            "删除规则：{full_text}"
-                                                        ));
-                                                    if rm_resp.clicked() {
-                                                        removed_item = Some(item.clone());
-                                                    }
-                                                });
-                                                if !filter_current_enabled {
-                                                    theme::status_pill(
-                                                        ui,
-                                                        "已配置",
-                                                        theme::TEXT_SECONDARY,
-                                                        theme::BG_SUBTLE,
-                                                    );
-                                                } else if in_current {
-                                                    theme::status_pill(
-                                                        ui,
-                                                        "已生效",
-                                                        theme::OK_FG,
-                                                        theme::OK_BG,
-                                                    );
-                                                } else {
-                                                    theme::status_pill(
-                                                        ui,
-                                                        "待重启生效",
-                                                        theme::WARN_FG,
-                                                        theme::WARN_BG,
-                                                    );
+                                                        .fill(theme::ERR_BG)
+                                                        .stroke(Stroke::NONE)
+                                                        .corner_radius(CornerRadius::same(5)),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "删除规则：{full_text}"
+                                                    ));
+                                                if rm_resp.clicked() {
+                                                    removed_item = Some(item.clone());
                                                 }
-                                            },
-                                        );
-                                    });
+                                            });
+                                            if !filter_current_enabled {
+                                                theme::status_pill(
+                                                    ui,
+                                                    "已配置",
+                                                    theme::TEXT_SECONDARY,
+                                                    theme::BG_SUBTLE,
+                                                );
+                                            } else if in_current {
+                                                theme::status_pill(
+                                                    ui,
+                                                    "已生效",
+                                                    theme::OK_FG,
+                                                    theme::OK_BG,
+                                                );
+                                            } else {
+                                                theme::status_pill(
+                                                    ui,
+                                                    "待重启生效",
+                                                    theme::WARN_FG,
+                                                    theme::WARN_BG,
+                                                );
+                                            }
+
+                                            let left_w = ui.available_width().max(80.0);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(left_w, 20.0),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    theme::status_pill(
+                                                        ui, kind_lbl, kind_fg, kind_bg,
+                                                    );
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&full_text)
+                                                                .font(FontId::monospace(12.5))
+                                                                .color(theme::TEXT_PRIMARY),
+                                                        )
+                                                        .truncate(),
+                                                    )
+                                                    .on_hover_text(&full_text);
+                                                },
+                                            );
+                                        },
+                                    );
                                 });
                             ui.add_space(3.0);
                         }
