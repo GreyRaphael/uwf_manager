@@ -23,7 +23,7 @@ pub enum CommitMenuOutcome {
 const ITEMS: [(CommitChoice, &str, &str, &str, bool); 3] = [
     (
         CommitChoice::File,
-        "永久保存文件修改",
+        "强制保存文件修改",
         "将受保护分区中指定文件的最新修改立即写回硬盘，重启后不会还原",
         "选择文件…",
         false,
@@ -37,7 +37,7 @@ const ITEMS: [(CommitChoice, &str, &str, &str, bool); 3] = [
     ),
     (
         CommitChoice::Registry,
-        "永久保存注册表键值",
+        "强制保存注册表键值",
         "将受保护注册表项下的指定键值立即写入硬盘（格式：键路径\\值名）",
         "输入键值…",
         false,
@@ -49,7 +49,7 @@ pub fn render(ctx: &egui::Context) -> CommitMenuOutcome {
     let (_, should_close) = show_modal(
         ctx,
         "commit_menu_modal",
-        "永久保存改动（立即写入硬盘）",
+        "强制保存改动（立即写入硬盘）",
         theme::TEXT_PRIMARY,
         460.0,
         |ui| {

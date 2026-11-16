@@ -20,7 +20,7 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 
         theme::card_header_with_action(
             ui,
-            "写入保护总开关",
+            "写保护总开关",
             Some("开启后受保护分区的改动重启后自动还原"),
             |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
@@ -68,11 +68,11 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
                     let switch_tip = if fs.next_enabled {
-                        "点击切换：将在下次重启后停用写入保护"
+                        "点击切换：将在下次重启后停用写保护"
                     } else {
-                        "点击切换：将在下次重启后启用写入保护"
+                        "点击切换：将在下次重启后启用写保护"
                     };
-                    if theme::toggle_switch(ui, fs.next_enabled, "切换写入保护总开关")
+                    if theme::toggle_switch(ui, fs.next_enabled, "切换写保护总开关")
                         .on_hover_text(switch_tip)
                         .on_disabled_hover_text("有操作正在执行，请稍候")
                         .clicked()
@@ -174,7 +174,7 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("写入保护当前未开启，开启并重启后将实时监测缓存使用率")
+                    RichText::new("写保护当前未开启，开启并重启后将实时监测缓存使用率")
                         .font(FontId::proportional(12.0))
                         .color(theme::TEXT_MUTED),
                 );

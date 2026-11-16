@@ -415,8 +415,8 @@ fn gui_dashboard_renders_and_dispatches_filter_volume_and_cache_actions() {
     assert!(harness.query_by_label_contains("UWF 管理器").is_none());
     assert!(harness.query_by_label_contains("当前: ").is_none());
 
-    // 切换写入保护总开关（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
-    harness.get_by_label("切换写入保护总开关").click();
+    // 切换写保护总开关（执行期间顶部 Spinner 持续重绘，使用 run_steps 推进一帧）
+    harness.get_by_label("切换写保护总开关").click();
     harness.run_steps(2);
     let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
         panic!("期望 Mutate 命令");
@@ -432,7 +432,12 @@ fn gui_dashboard_renders_and_dispatches_filter_volume_and_cache_actions() {
     assert!(harness.query_by_label("保护选中分区").is_none());
     assert!(harness.query_by_label("取消保护").is_none());
 
-    // 直接拨动 D: 行开关开启保护
+    // 初始 2 个分区的「当前状态 / 重启后状态」分别为 (保护, 保护) 与 (不保护, 不保护)，仅 2 条排除项显示「待重启生效」
+    assert_eq!(harness.query_all_by_label("保护").count(), 2);
+    assert_eq!(harness.query_all_by_label("不保护").count(), 2);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 2);
+
+    // 直接拨动 D: 行开关开启保护（不保护 -> on(待重启生效) -> 保护）
     harness.get_by_label("切换 D: 重启后保护").click();
     harness.run_steps(2);
     let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
@@ -442,21 +447,34 @@ fn gui_dashboard_renders_and_dispatches_filter_volume_and_cache_actions() {
 
     let mut updated = demo_snapshot();
     updated.volumes[1].next_protected = true;
-    let _ = event_tx.send(BackendEvent::Snapshot(updated));
+    let _ = event_tx.send(BackendEvent::Snapshot(updated.clone()));
     let _ = event_tx.send(BackendEvent::Finished {
         id,
         outcome: Outcome::Ok("D: 保护成功".into()),
     });
     harness.run_steps(4);
-    assert!(harness.query_by_label("将保护 (待重启)").is_some());
+    assert_eq!(harness.query_all_by_label("保护").count(), 3);
+    assert_eq!(harness.query_all_by_label("不保护").count(), 1);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 3);
 
-    // 直接拨动 C: 行开关取消保护
+    // 直接拨动 C: 行开关取消保护（保护 -> off(待重启生效) -> 不保护）
     harness.get_by_label("切换 C: 重启后保护").click();
     harness.run_steps(2);
-    match recv_cmd(&cmd_rx) {
-        BackendCmd::Unprotect(drive) => assert_eq!(drive, "C:"),
-        other => panic!("期望 Unprotect(C:)，实际 {other:?}"),
-    }
+    let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+        panic!("期望 Unprotect 命令");
+    };
+    assert!(matches!(cmd, BackendCmd::Unprotect(ref drive) if drive == "C:"));
+
+    updated.volumes[0].next_protected = false;
+    let _ = event_tx.send(BackendEvent::Snapshot(updated));
+    let _ = event_tx.send(BackendEvent::Finished {
+        id,
+        outcome: Outcome::Ok("C: 已取消保护".into()),
+    });
+    harness.run_steps(4);
+    assert_eq!(harness.query_all_by_label("保护").count(), 2);
+    assert_eq!(harness.query_all_by_label("不保护").count(), 2);
+    assert_eq!(harness.query_all_by_label("待重启生效").count(), 4);
 }
 
 #[test]
@@ -529,7 +547,7 @@ fn gui_commit_file_deletion_enforces_two_step_confirm() {
     let (mut harness, _event_tx, cmd_rx) =
         build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
 
-    harness.get_by_label("永久保存…").click();
+    harness.get_by_label("强制保存…").click();
     harness.run();
     harness.get_by_label("选择待删文件…").click();
     harness.run();
@@ -620,7 +638,7 @@ fn gui_commit_preflight_blocks_unprotected_drive_and_disabled_filter() {
         build_gui_harness(BackendKind::Mock, stub, Some(demo_snapshot()));
 
     // 仅保护 C: 时，选 D: 永久删除在第 1 步即内联拦截，不进入第 2 步也不发后端命令
-    harness.get_by_label("永久保存…").click();
+    harness.get_by_label("强制保存…").click();
     harness.run();
     harness.get_by_label("选择待删文件…").click();
     harness.run();
@@ -653,11 +671,14 @@ fn gui_commit_preflight_blocks_unprotected_drive_and_disabled_filter() {
             .is_err_and(|e| e.contains("筛选器当前会话未启用"))
     );
 
-    // 即使直接绕过弹窗传未受保护盘符给永久保存文件修改，也会被预检拦下并写红字错误
-    harness.get_by_label("永久保存…").click();
+    // 即使直接绕过弹窗传未受保护盘符给强制保存文件修改，也会被预检拦下并写红字错误
+    harness.get_by_label("强制保存…").click();
     harness.run();
+    assert!(harness.query_by_label("强制保存文件修改").is_some());
+    assert!(harness.query_by_label("强制保存注册表键值").is_some());
     harness.get_by_label("选择文件…").click();
     harness.run();
+    assert!(harness.query_by_label("强制保存文件修改").is_some());
     harness.get_by_label("浏览文件…").click();
     harness.run();
     harness.get_by_label("确认").click();
@@ -686,8 +707,8 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
 
     let logs_rect = harness.get_by_label_contains("日志 (").rect();
     let help_rect = harness.get_by_label("帮助 (F1)").rect();
-    let commit_rect = harness.get_by_label("永久保存…").rect();
-    let filter_hdr_rect = harness.get_by_label("写入保护总开关").rect();
+    let commit_rect = harness.get_by_label("强制保存…").rect();
+    let filter_hdr_rect = harness.get_by_label("写保护总开关").rect();
     assert!(
         logs_rect.max.x <= help_rect.min.x,
         "日志按钮应位于帮助按钮左侧: logs={logs_rect:?}, help={help_rect:?}"
@@ -743,9 +764,14 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     assert!(harness.query_by_label("⚠ 待重启生效").is_some());
     assert!(harness.query_by_label("立即重启生效…").is_some());
 
-    // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，分区常态显示「保持不变」，每行支持直觉移除排除项
+    // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，分区表改为 5 列，每行支持直觉移除排除项
     assert!(harness.query_by_label("512 / 2048 MB").is_some());
-    assert_eq!(harness.query_all_by_label("保持不变").count(), 2);
+    assert!(harness.query_by_label("当前状态").is_some());
+    assert!(harness.query_by_label("开关").is_some());
+    assert!(harness.query_by_label("重启后状态").is_some());
+    assert!(harness.query_by_label("保持不变").is_none());
+    assert_eq!(harness.query_all_by_label("保护").count(), 2);
+    assert_eq!(harness.query_all_by_label("不保护").count(), 2);
     assert!(harness.query_by_label_contains("(75%)").is_some());
     assert!(harness.query_by_label_contains("(90%)").is_some());
     assert!(harness.query_by_label("移除选中").is_none());
@@ -786,7 +812,7 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     assert!(harness.query_by_label("✔ 当前设置已全部生效").is_some());
 
     // 5. 也测试点击「立即重启生效…」会弹出重启确认对话框
-    harness.get_by_label("切换写入保护总开关").click();
+    harness.get_by_label("切换写保护总开关").click();
     harness.run_steps(2);
     let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
         panic!("期望 Mutate 命令");

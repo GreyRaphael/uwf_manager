@@ -13,7 +13,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
         theme::card_header(
             ui,
             "受保护磁盘分区",
-            Some("拨动右侧开关即可切换保护状态（下次重启后生效）"),
+            Some("拨动开关即可切换保护状态（下次重启后生效）"),
         );
 
         ui.add_space(8.0);
@@ -42,10 +42,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 .min_scrolled_height(100.0)
                 .column(Column::initial(64.0).at_least(56.0))
                 .column(Column::remainder().at_least(150.0))
-                .column(Column::initial(95.0).at_least(85.0))
-                .column(Column::initial(172.0).at_least(160.0))
+                .column(Column::initial(84.0).at_least(76.0))
+                .column(Column::initial(142.0).at_least(132.0))
+                .column(Column::initial(92.0).at_least(84.0))
                 .header(28.0, |mut header| {
-                    for title in ["分区", "保护效果说明", "当前生效", "重启后生效"]
+                    for title in ["分区", "保护效果说明", "当前状态", "开关", "重启后状态"]
                     {
                         header.col(|ui| {
                             ui.label(
@@ -91,21 +92,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                         });
 
                         row.col(|ui| {
-                            if vol.current_protected {
-                                theme::status_pill(
-                                    ui,
-                                    text::protected_zh(true),
-                                    theme::OK_FG,
-                                    theme::OK_BG,
-                                );
-                            } else {
-                                theme::status_pill(
-                                    ui,
-                                    text::protected_zh(false),
-                                    theme::TEXT_SECONDARY,
-                                    theme::BG_SUBTLE,
-                                );
-                            }
+                            render_protection_pill(ui, vol.current_protected, false);
                         });
 
                         row.col(|ui| {
@@ -126,21 +113,19 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                                 }
                             });
 
-                            let pending = vol.current_protected != vol.next_protected;
-                            if pending {
-                                let label = if vol.next_protected {
-                                    "将保护 (待重启)"
-                                } else {
-                                    "将取消 (待重启)"
-                                };
-                                theme::status_pill(ui, label, theme::WARN_FG, theme::WARN_BG);
-                            } else {
-                                ui.label(
-                                    RichText::new("保持不变")
-                                        .font(FontId::proportional(12.0))
-                                        .color(theme::TEXT_MUTED),
+                            if vol.current_protected != vol.next_protected {
+                                theme::status_pill(
+                                    ui,
+                                    "待重启生效",
+                                    theme::WARN_FG,
+                                    theme::WARN_BG,
                                 );
                             }
+                        });
+
+                        row.col(|ui| {
+                            let pending = vol.current_protected != vol.next_protected;
+                            render_protection_pill(ui, vol.next_protected, pending);
                         });
                     });
                 });
@@ -150,4 +135,15 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
             app.set_volume_protected(&drive, protect);
         }
     });
+}
+
+fn render_protection_pill(ui: &mut egui::Ui, protected: bool, pending: bool) {
+    let (fg, bg) = if pending {
+        (theme::WARN_FG, theme::WARN_BG)
+    } else if protected {
+        (theme::OK_FG, theme::OK_BG)
+    } else {
+        (theme::TEXT_SECONDARY, theme::BG_SUBTLE)
+    };
+    theme::status_pill(ui, text::protected_zh(protected), fg, bg);
 }

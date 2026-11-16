@@ -7,14 +7,14 @@ pub const READY_EMPTY: &str = "当前暂无排除规则";
 
 pub const NOTICE_SHORT: &str = "保护开关、缓存模式/容量、分区保护与排除列表均在重启计算机后生效";
 pub const OVERLAY_LOCK_HINT: &str =
-    "写入保护当前已开启：模式与最大容量已锁定（停用保护并重启后可修改）";
+    "写保护当前已开启：模式与最大容量已锁定（停用保护并重启后可修改）";
 
 pub fn app_title() -> String {
     format!("UWF 管理器 v{}", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn protected_zh(value: bool) -> &'static str {
-    if value { "已保护" } else { "未保护" }
+    if value { "保护" } else { "不保护" }
 }
 
 // ── UWF 未安装引导页 ──

@@ -672,9 +672,9 @@ impl UwfApp {
         match choice {
             CommitChoice::File => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "永久保存文件修改",
+                    "强制保存文件修改",
                     "受保护分区中的文件绝对路径",
-                    "立即将目标文件当前的修改永久写入真实硬盘，重启后不还原（如 C:\\data\\config.ini）",
+                    "立即将目标文件当前的修改强制写入真实硬盘，重启后不还原（如 C:\\data\\config.ini）",
                     InputAction::CommitFile,
                     BrowseKind::File,
                 )));
@@ -690,7 +690,7 @@ impl UwfApp {
             }
             CommitChoice::Registry => {
                 self.open_action_modal(Modal::Input(InputState::new(
-                    "永久保存注册表键值",
+                    "强制保存注册表键值",
                     "注册表完整路径（含值名）",
                     "格式为 键路径\\值名称（如 HKLM\\SOFTWARE\\Example\\ValueName）",
                     InputAction::CommitRegistry,

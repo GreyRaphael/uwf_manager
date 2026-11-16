@@ -108,7 +108,7 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                                     }
                                 });
 
-                                if theme::secondary_button(ui, "永久保存…").clicked() {
+                                if theme::secondary_button(ui, "强制保存…").clicked() {
                                     app.open_commit_menu();
                                 }
                             });
