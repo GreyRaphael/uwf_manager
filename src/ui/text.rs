@@ -1,6 +1,5 @@
 //! 界面中文文案与共享标签常量。
 
-use crate::backend::BackendKind;
 pub use crate::error::UWF_ENABLE_CMD as NI_ENABLE_CMD;
 
 pub const LOADING: &str = "正在读取 UWF 系统状态…";
@@ -14,13 +13,6 @@ pub const OVERLAY_LOCK_HINT: &str =
 
 pub fn app_title() -> String {
     format!("UWF 管理器 v{}", env!("CARGO_PKG_VERSION"))
-}
-
-pub fn backend_badge(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Windows => "WMI 实机",
-        BackendKind::Mock => "Mock 演示",
-    }
 }
 
 pub fn protected_zh(value: bool) -> &'static str {

@@ -11,7 +11,6 @@ use eframe::egui::{
 };
 
 use crate::app::{Phase, UwfApp};
-use crate::backend::BackendKind;
 use crate::ui::components::commit_menu::{self, CommitMenuOutcome};
 use crate::ui::components::confirm::{self, ConfirmOutcome};
 use crate::ui::components::help;
@@ -20,8 +19,15 @@ use crate::ui::components::logs;
 
 /// 绘制整个应用窗口（供 [`eframe::App::ui`] 调用）。
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
-    render_top_bar(ui, app);
+    // Panel 声明顺序决定边框归属：
+    // 1. bottom 独占最底部；
+    // 2. Ready 状态下 left 独占左侧全高（使「筛选器控制」贴顶并把 top bar 左边界右移到右侧工作区上方）；
+    // 3. top 占剩余宽度的顶部；4. CentralPanel 填满右下方工作区。
     render_footer_bar(ui, app);
+    if app.phase == Phase::Ready {
+        render_left_rail(ui, app);
+    }
+    render_top_bar(ui, app);
     render_central_workspace(ui, app);
     render_modals(ui.ctx(), app);
     handle_shortcuts(ui.ctx(), app);
@@ -29,53 +35,99 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
 
 fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
     Panel::top("uwf_top_bar")
+        .show_separator_line(false)
         .frame(
             egui::Frame::NONE
-                .fill(theme::BG_CARD)
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::symmetric(16, 10)),
+                .fill(theme::BG_CANVAS)
+                .inner_margin(Margin {
+                    left: 14,
+                    right: 14,
+                    top: 14,
+                    bottom: 0,
+                }),
         )
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (b_fg, b_bg) = match app.backend_kind {
-                    BackendKind::Windows => (theme::OK_FG, theme::OK_BG),
-                    BackendKind::Mock => (theme::WARN_FG, theme::WARN_BG),
-                };
-                theme::status_pill(ui, text::backend_badge(app.backend_kind), b_fg, b_bg);
-
-                if app.is_busy() {
-                    ui.add_space(6.0);
-                    ui.spinner();
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::secondary_button(ui, "帮助 (F1)").clicked() {
-                        app.open_help();
-                    }
-                    let log_lbl = format!("日志 ({})", app.logs.len());
-                    if theme::secondary_button(ui, &log_lbl).clicked() {
-                        app.open_logs();
-                    }
-
-                    let ready = app.phase == Phase::Ready && !app.is_busy();
-                    ui.add_enabled_ui(ready, |ui| {
-                        ui.menu_button("电源 ▾", |ui| {
-                            if ui.button("重启计算机…").clicked() {
-                                ui.close();
-                                app.open_restart_confirm();
-                            }
-                            if ui.button("关闭计算机…").clicked() {
-                                ui.close();
-                                app.open_shutdown_confirm();
-                            }
-                        });
-
-                        if theme::secondary_button(ui, "提交操作…").clicked() {
-                            app.open_commit_menu();
+            theme::card_frame()
+                .inner_margin(Margin::symmetric(14, 9))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        if app.is_busy() {
+                            ui.spinner();
                         }
+
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::secondary_button(ui, "帮助 (F1)").clicked() {
+                                app.open_help();
+                            }
+                            let log_lbl = format!("日志 ({})", app.logs.len());
+                            if theme::secondary_button(ui, &log_lbl).clicked() {
+                                app.open_logs();
+                            }
+
+                            let ready = app.phase == Phase::Ready && !app.is_busy();
+                            ui.add_enabled_ui(ready, |ui| {
+                                ui.menu_button("电源 ▾", |ui| {
+                                    if ui.button("重启计算机…").clicked() {
+                                        ui.close();
+                                        app.open_restart_confirm();
+                                    }
+                                    if ui.button("关闭计算机…").clicked() {
+                                        ui.close();
+                                        app.open_shutdown_confirm();
+                                    }
+                                });
+
+                                if theme::secondary_button(ui, "提交操作…").clicked() {
+                                    app.open_commit_menu();
+                                }
+                            });
+                        });
                     });
                 });
+        });
+}
+
+fn render_left_rail(ui: &mut egui::Ui, app: &mut UwfApp) {
+    let left_w = ((ui.available_width() - 28.0) * 0.30).clamp(285.0, 330.0);
+    Panel::left("uwf_left_rail")
+        .resizable(false)
+        .show_separator_line(false)
+        .exact_size(left_w + 14.0)
+        .frame(
+            egui::Frame::NONE
+                .fill(theme::BG_CANVAS)
+                .inner_margin(Margin {
+                    left: 14,
+                    right: 0,
+                    top: 14,
+                    bottom: 14,
+                }),
+        )
+        .show(ui, |ui| {
+            let total_h = ui.available_height();
+            let rail_w = ui.available_width();
+            let os_h_id = ui.make_persistent_id("left_rail_os_card_h");
+            let prev_os_h: f32 = ui.data(|d| d.get_temp::<f32>(os_h_id)).unwrap_or(122.0);
+            let scroll_h = (total_h - prev_os_h - 10.0).max(120.0);
+
+            ui.allocate_ui(egui::vec2(rail_w, scroll_h), |ui| {
+                ScrollArea::vertical()
+                    .id_salt("left_rail_scroll")
+                    .max_height(scroll_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        views::settings::render(ui, app);
+                    });
             });
+
+            ui.add_space(10.0);
+            let os_resp = views::settings::render_os_card(ui, app);
+            let measured_h = os_resp.rect.height();
+            if measured_h > 20.0 && (measured_h - prev_os_h).abs() > 0.5 {
+                ui.data_mut(|d| d.insert_temp(os_h_id, measured_h));
+                ui.ctx().request_repaint();
+            }
         });
 }
 
@@ -121,11 +173,21 @@ fn render_footer_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
 }
 
 fn render_central_workspace(ui: &mut egui::Ui, app: &mut UwfApp) {
+    let margin = if app.phase == Phase::Ready {
+        Margin {
+            left: 14,
+            right: 14,
+            top: 12,
+            bottom: 14,
+        }
+    } else {
+        Margin::same(14)
+    };
     egui::CentralPanel::default()
         .frame(
             egui::Frame::NONE
                 .fill(theme::BG_CANVAS)
-                .inner_margin(Margin::same(14)),
+                .inner_margin(margin),
         )
         .show(ui, |ui| match app.phase {
             Phase::NotInstalled => views::not_installed::render(ui, app),
@@ -183,55 +245,11 @@ fn render_status_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 }
 
 fn render_ready_dashboard(ui: &mut egui::Ui, app: &mut UwfApp) {
-    let total_w = ui.available_width();
     let total_h = ui.available_height();
-    let left_w = (total_w * 0.30).clamp(285.0, 330.0);
-    let right_w = (total_w - left_w - 14.0).max(320.0);
-
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 14.0;
-
-        // 左侧控制、缓存监控与左下角系统环境面板（纯 top-down 计算高度，将系统面板贴底展示）
-        ui.allocate_ui_with_layout(
-            egui::vec2(left_w, total_h),
-            Layout::top_down(Align::Min),
-            |ui| {
-                let os_h_id = ui.make_persistent_id("left_rail_os_card_h");
-                let prev_os_h: f32 = ui.data(|d| d.get_temp::<f32>(os_h_id)).unwrap_or(122.0);
-                let scroll_h = (total_h - prev_os_h - 10.0).max(120.0);
-
-                ui.allocate_ui(egui::vec2(left_w, scroll_h), |ui| {
-                    ScrollArea::vertical()
-                        .id_salt("left_rail_scroll")
-                        .max_height(scroll_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            views::settings::render(ui, app);
-                        });
-                });
-
-                ui.add_space(10.0);
-                let os_resp = views::settings::render_os_card(ui, app);
-                let measured_h = os_resp.rect.height();
-                if measured_h > 20.0 && (measured_h - prev_os_h).abs() > 0.5 {
-                    ui.data_mut(|d| d.insert_temp(os_h_id, measured_h));
-                    ui.ctx().request_repaint();
-                }
-            },
-        );
-
-        // 右侧核心工作区（上：受保护分区表，下：排除项规则卡片）
-        ui.allocate_ui_with_layout(
-            egui::vec2(right_w, total_h),
-            Layout::top_down(Align::Min),
-            |ui| {
-                let vol_max_h = (total_h * 0.34).clamp(130.0, 220.0);
-                views::volumes::render(ui, app, vol_max_h);
-                ui.add_space(12.0);
-                views::exclusions::render(ui, app);
-            },
-        );
-    });
+    let vol_max_h = (total_h * 0.34).clamp(130.0, 220.0);
+    views::volumes::render(ui, app, vol_max_h);
+    ui.add_space(12.0);
+    views::exclusions::render(ui, app);
 }
 
 fn render_modals(ctx: &egui::Context, app: &mut UwfApp) {
@@ -305,7 +323,6 @@ fn handle_shortcuts(ctx: &egui::Context, app: &mut UwfApp) {
     if !text_editing
         && app.phase == Phase::Ready
         && !app.is_busy()
-        && !app.exclusion_session_current
         && app.selected_exclusion().is_some()
         && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete))
     {

@@ -281,3 +281,45 @@ pub fn log_badge(level: LogLevel) -> (&'static str, Color32, Color32) {
         LogLevel::Err => ("✖", ERR_FG, ERR_BG),
     }
 }
+
+/// Fluent 风格布尔开关（用于分区保护等行内直接切换），状态以 `on` 为唯一真相源。
+pub fn toggle_switch(ui: &mut Ui, on: bool, a11y_label: &str) -> Response {
+    let desired_size = Vec2::new(36.0, 20.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), on, a11y_label)
+    });
+
+    if ui.is_rect_visible(rect) {
+        let how_on = ui.ctx().animate_bool_responsive(response.id, on);
+        let enabled = ui.is_enabled();
+        let hovered = enabled && (response.hovered() || response.has_focus());
+
+        let off_bg = if enabled { BORDER_STRONG } else { BORDER };
+        let on_bg = if enabled {
+            ACCENT
+        } else {
+            Color32::from_rgb(147, 197, 253)
+        };
+        let bg = off_bg.lerp_to_gamma(on_bg, how_on);
+
+        let painter = ui.painter();
+        let radius = 0.5 * rect.height();
+        painter.rect_filled(rect, radius, bg);
+        if hovered {
+            painter.rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        let center = egui::pos2(circle_x, rect.center().y);
+        let knob_color = if enabled { Color32::WHITE } else { BG_SUBTLE };
+        painter.circle_filled(center, 0.72 * radius, knob_color);
+    }
+
+    response
+}

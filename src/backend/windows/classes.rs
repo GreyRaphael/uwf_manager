@@ -3,6 +3,9 @@
 //! 结构体名必须即 WMI 类名（wmi crate 以类型名定位类定义/生成查询），
 //! 字段名与 WMI 属性名、方法参数名完全一致。
 
+use std::fmt;
+
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
 // ── 查询行类型（含 __Path，供实例方法调用）──
@@ -21,7 +24,6 @@ pub struct UWF_Filter {
 pub struct UWF_Overlay {
     #[serde(rename = "__Path")]
     pub path: String,
-    pub AvailableSpace: u32,
     pub OverlayConsumption: u32,
     pub WarningOverlayThreshold: u32,
     pub CriticalOverlayThreshold: u32,
@@ -59,13 +61,109 @@ pub struct Win32_Volume {
     pub DriveLetter: Option<String>,
 }
 
-/// `ROOT\CIMV2` 操作系统版本信息（用于左下角系统版本与兼容性提示）。
+/// 将 WMI 的 `CIM_UINT64`（可能以整数或十进制字符串返回）及空值安全解析为 `Option<u64>`。
+fn deserialize_opt_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptU64Visitor;
+
+    impl<'de> Visitor<'de> for OptU64Visitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an optional u64 integer or numeric string")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> std::result::Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(Self)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(u64::try_from(value).ok())
+        }
+
+        fn visit_u128<E>(self, value: u128) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(u64::try_from(value).ok())
+        }
+
+        fn visit_i128<E>(self, value: i128) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(u64::try_from(value).ok())
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(trimmed.parse::<u64>().ok())
+            }
+        }
+    }
+
+    deserializer.deserialize_any(OptU64Visitor)
+}
+
+/// `ROOT\CIMV2` 操作系统版本与内存信息（用于左下角系统环境面板）。
 #[derive(Deserialize)]
 #[allow(non_snake_case, non_camel_case_types)]
 pub struct Win32_OperatingSystem {
     pub Caption: Option<String>,
     pub BuildNumber: Option<String>,
-    pub OSArchitecture: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_u64")]
+    pub TotalVisibleMemorySize: Option<u64>,
+}
+
+/// `ROOT\CIMV2` 物理内存条容量（优先累加物理内存条字节数以对齐系统标称内存如 `16G`）。
+#[derive(Deserialize)]
+#[allow(non_snake_case, non_camel_case_types)]
+pub struct Win32_PhysicalMemory {
+    #[serde(default, deserialize_with = "deserialize_opt_u64")]
+    pub Capacity: Option<u64>,
+}
+
+/// `ROOT\CIMV2` 计算机系统总物理内存（`Win32_PhysicalMemory` 不可用时的回退来源）。
+#[derive(Deserialize)]
+#[allow(non_snake_case, non_camel_case_types)]
+pub struct Win32_ComputerSystem {
+    #[serde(default, deserialize_with = "deserialize_opt_u64")]
+    pub TotalPhysicalMemory: Option<u64>,
 }
 
 #[derive(Deserialize)]

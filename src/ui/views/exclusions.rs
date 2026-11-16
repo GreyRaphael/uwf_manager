@@ -1,4 +1,4 @@
-//! 右侧下方卡片：排除项规则列表（文件/目录 + 注册表、双会话视图与导入导出）。
+//! 右侧下方卡片：排除项规则列表（文件/目录 + 注册表、行内生效状态、一键撤销修改与导入导出）。
 
 use eframe::egui::{
     self, Align, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Sense, Stroke,
@@ -13,22 +13,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_width(ui.available_width());
         ui.set_min_height(avail_h.max(200.0));
 
-        // 第一行：标题 + 会话视角切换（重启后生效可编辑 / 当前生效只读）
-        ui.horizontal(|ui| {
-            let count = app.visible_exclusions().len();
-            theme::card_header(ui, "排除项规则", Some(&format!("共 {count} 条")));
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let mut session_current = app.exclusion_session_current;
-                if theme::segmented_toggle(
-                    ui,
-                    &mut session_current,
-                    &[(false, "重启后生效 (可编辑)"), (true, "当前生效 (只读)")],
-                ) {
-                    app.set_exclusion_session(session_current);
-                }
-            });
-        });
+        // 第一行：标题与生效机制说明（仅展示重启后配置视图，行内通过标签区分是否已生效）
+        let count = app.visible_exclusions().len();
+        theme::card_header(
+            ui,
+            "排除项规则",
+            Some(&format!("共 {count} 条 · 修改在下次重启后生效")),
+        );
 
         ui.add_space(8.0);
 
@@ -36,7 +27,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         let revert_plan = app.exclusion_revert_plan();
         ui.horizontal(|ui| {
             let busy = app.is_busy();
-            let editable = !busy && !app.exclusion_session_current;
+            let editable = !busy;
             let has_selected = app.selected_exclusion().is_some();
             let can_revert = editable && !revert_plan.is_empty();
 
@@ -58,10 +49,10 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                 ui.add_enabled_ui(can_revert, |ui| {
                     let revert_btn = theme::secondary_button(ui, "撤销修改");
                     let tip = if revert_plan.is_empty() {
-                        "重启后生效列表已与当前生效一致，无需撤销".to_string()
+                        "重启后排除列表已与当前生效一致，无需撤销".to_string()
                     } else {
                         format!(
-                            "撤销修改并恢复为与「当前生效 (只读)」一致（将移除 {} 项、恢复 {} 项）",
+                            "撤销修改并恢复为与当前生效一致（将移除 {} 项、恢复 {} 项）",
                             revert_plan.remove_count(),
                             revert_plan.add_count(),
                         )
@@ -81,25 +72,12 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     if theme::secondary_button(ui, "导出列表").clicked() {
                         app.open_export_dialog(ui.ctx());
                     }
-                });
-                ui.add_enabled_ui(editable, |ui| {
                     if theme::secondary_button(ui, "导入列表").clicked() {
                         app.open_import_dialog(ui.ctx());
                     }
                 });
             });
         });
-
-        if app.exclusion_session_current {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "当前视图仅反映已生效只读规则；需增删改或撤销修改请切换到「重启后生效 (可编辑)」",
-                )
-                .font(FontId::proportional(11.5))
-                .color(theme::WARN_FG),
-            );
-        }
 
         ui.add_space(8.0);
 
@@ -110,7 +88,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
             .snapshot
             .filter_state
             .is_some_and(|fs| fs.current_enabled);
-        let view_is_current = app.exclusion_session_current;
 
         let list_h = (ui.available_height() - 18.0).max(120.0);
         let mut clicked_item: Option<ExclusionItem> = None;
@@ -195,14 +172,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
                                             |ui| {
-                                                if view_is_current {
-                                                    theme::status_pill(
-                                                        ui,
-                                                        "生效中",
-                                                        theme::OK_FG,
-                                                        theme::OK_BG,
-                                                    );
-                                                } else if !filter_current_enabled {
+                                                if !filter_current_enabled {
                                                     theme::status_pill(
                                                         ui,
                                                         "已配置",

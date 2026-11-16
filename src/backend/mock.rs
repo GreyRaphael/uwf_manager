@@ -170,7 +170,6 @@ impl UwfBackend for MockUwfBackend {
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
         // 查询必须无副作用：保持稳定值，避免每次刷新都改变用量。
         Ok(OverlayRuntime {
-            available_space_mb: self.max_size_current.saturating_sub(self.consumption_mb),
             consumption_mb: self.consumption_mb,
             warning_threshold_mb: self.warning_mb,
             critical_threshold_mb: self.critical_mb,
@@ -294,7 +293,7 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn get_os_version(&mut self) -> Option<String> {
-        Some("Windows 10 Enterprise LTSC 2021 (Mock 模拟)".to_string())
+        Some("Windows 10 Enterprise LTSC 2021 16G".to_string())
     }
 }
 

@@ -12,7 +12,7 @@ use crate::backend::{
     Outcome, RequestId, plan_exclusion_revert, split_absolute_path, split_registry_path,
     validate_filter_commit_ready, validate_volume_commit_ready,
 };
-use crate::model::{FileExclusion, OverlayType, VolumeInfo};
+use crate::model::{FileExclusion, OverlayType};
 use crate::ui::components::commit_menu::CommitChoice;
 use crate::ui::components::confirm::{ConfirmAction, ConfirmState};
 use crate::ui::components::input_dialog::{BrowseKind, InputAction, InputState};
@@ -161,10 +161,7 @@ pub struct UwfApp {
     pub phase: Phase,
     pub snapshot: FullSnapshot,
     pub cache: CacheForm,
-    pub selected_volume_drive: Option<String>,
-    /// 排除列表视图：true = 当前生效（只读），false = 重启后生效（默认，可编辑）
-    pub exclusion_session_current: bool,
-    /// 跨刷新/切换视图保持选中身份的稳定 key
+    /// 跨刷新保持排除项选中身份的稳定 key
     pub selected_exclusion_key: Option<ExclusionItem>,
     pub os_version: Option<String>,
     pub modal: Option<Modal>,
@@ -208,8 +205,6 @@ impl UwfApp {
             phase: Phase::Loading,
             snapshot: FullSnapshot::default(),
             cache: CacheForm::default(),
-            selected_volume_drive: None,
-            exclusion_session_current: false,
             selected_exclusion_key: None,
             os_version: None,
             modal: None,
@@ -338,7 +333,7 @@ impl UwfApp {
                 FileDialogTarget::ExportExclusions => {
                     let _ = self.begin_mutation(BackendCmd::ExportExclusions {
                         path,
-                        current_session: self.exclusion_session_current,
+                        current_session: false,
                     });
                 }
             },
@@ -491,25 +486,9 @@ impl UwfApp {
     // ── 选择状态与身份保持 ──
 
     fn reconcile_selections(&mut self) {
-        // 卷选中：若原选盘符仍在列表则保持，否则默认选第一行
-        let still_exists = self.selected_volume_drive.as_ref().is_some_and(|sel| {
-            self.snapshot
-                .volumes
-                .iter()
-                .any(|v| v.drive_letter.eq_ignore_ascii_case(sel))
-        });
-        if !still_exists {
-            self.selected_volume_drive = self
-                .snapshot
-                .volumes
-                .first()
-                .map(|v| v.drive_letter.clone());
-        }
-
-        // 排除项选中：仅在非空可见区且原 key 消失时回退首个，保留跨空视图切换的身份记忆
         let visible = self.visible_exclusions();
         if let Some(key) = &self.selected_exclusion_key {
-            if !visible.is_empty() && !visible.contains(key) && !self.exclusion_session_current {
+            if !visible.contains(key) {
                 self.selected_exclusion_key = visible.into_iter().next();
             }
         } else if !visible.is_empty() {
@@ -517,37 +496,28 @@ impl UwfApp {
         }
     }
 
-    pub fn selected_volume(&self) -> Option<&VolumeInfo> {
-        let drive = self.selected_volume_drive.as_ref()?;
-        self.snapshot
-            .volumes
-            .iter()
-            .find(|v| v.drive_letter.eq_ignore_ascii_case(drive))
-    }
-
-    pub fn select_volume(&mut self, drive_letter: String) {
-        self.selected_volume_drive = Some(drive_letter);
-    }
-
     pub fn visible_exclusions(&self) -> Vec<ExclusionItem> {
-        let (files, regs) = if self.exclusion_session_current {
-            (
-                &self.snapshot.file_exclusions_current,
-                &self.snapshot.registry_exclusions_current,
-            )
-        } else {
-            (
-                &self.snapshot.file_exclusions_next,
-                &self.snapshot.registry_exclusions_next,
-            )
-        };
-        let mut items = Vec::with_capacity(files.len() + regs.len());
-        items.extend(files.iter().cloned().map(ExclusionItem::File));
-        items.extend(regs.iter().cloned().map(ExclusionItem::Registry));
+        let mut items = Vec::with_capacity(
+            self.snapshot.file_exclusions_next.len() + self.snapshot.registry_exclusions_next.len(),
+        );
+        items.extend(
+            self.snapshot
+                .file_exclusions_next
+                .iter()
+                .cloned()
+                .map(ExclusionItem::File),
+        );
+        items.extend(
+            self.snapshot
+                .registry_exclusions_next
+                .iter()
+                .cloned()
+                .map(ExclusionItem::Registry),
+        );
         items
     }
 
-    /// 供 UI 渲染使用：直接返回全部可见排除项，并标明是否已存在于当前会话。
+    /// 供 UI 渲染使用：返回重启后排除项列表，并标明是否已在当前会话生效。
     pub fn exclusion_rows(&self) -> Vec<(ExclusionItem, bool)> {
         self.visible_exclusions()
             .into_iter()
@@ -569,7 +539,7 @@ impl UwfApp {
             .collect()
     }
 
-    /// 计算将“重启后生效”排除项恢复成与“当前生效 (只读)”一致所需的操作计划。
+    /// 计算将“重启后生效”排除项恢复成与当前生效状态一致所需的操作计划。
     pub fn exclusion_revert_plan(&self) -> ExclusionRevertPlan {
         plan_exclusion_revert(
             &self.snapshot.file_exclusions_current,
@@ -588,11 +558,6 @@ impl UwfApp {
         self.visible_exclusions()
             .into_iter()
             .find(|item| item == key)
-    }
-
-    pub fn set_exclusion_session(&mut self, current: bool) {
-        self.exclusion_session_current = current;
-        self.reconcile_selections();
     }
 
     // ── 业务操作派发 ──
@@ -647,22 +612,16 @@ impl UwfApp {
         self.cache.sync_from_snapshot(&self.snapshot);
     }
 
-    pub fn protect_selected(&mut self, protect: bool) {
-        let Some(drive) = self.selected_volume().map(|v| v.drive_letter.clone()) else {
-            return;
-        };
+    pub fn set_volume_protected(&mut self, drive_letter: &str, protect: bool) {
         let cmd = if protect {
-            BackendCmd::Protect(drive)
+            BackendCmd::Protect(drive_letter.to_string())
         } else {
-            BackendCmd::Unprotect(drive)
+            BackendCmd::Unprotect(drive_letter.to_string())
         };
         let _ = self.begin_mutation(cmd);
     }
 
     pub fn open_add_file_exclusion(&mut self, folder: bool) {
-        if !self.ensure_mutable_exclusions() {
-            return;
-        }
         let (title, hint, browse) = if folder {
             (
                 "添加文件夹排除",
@@ -686,9 +645,6 @@ impl UwfApp {
     }
 
     pub fn open_add_registry_exclusion(&mut self) {
-        if !self.ensure_mutable_exclusions() {
-            return;
-        }
         self.open_action_modal(Modal::Input(InputState::new(
             "添加注册表排除",
             "注册表键路径",
@@ -699,9 +655,6 @@ impl UwfApp {
     }
 
     pub fn delete_selected_exclusion(&mut self) {
-        if !self.ensure_mutable_exclusions() {
-            return;
-        }
         match self.selected_exclusion() {
             Some(ExclusionItem::File(f)) => {
                 let _ = self.begin_mutation(BackendCmd::RemoveFileExclusion(f.display()));
@@ -714,7 +667,7 @@ impl UwfApp {
     }
 
     pub fn open_import_dialog(&mut self, ctx: &egui::Context) {
-        if !self.ensure_mutable_exclusions() || self.phase != Phase::Ready || self.is_busy() {
+        if self.phase != Phase::Ready || self.is_busy() {
             return;
         }
         self.launch_file_dialog(
@@ -810,13 +763,10 @@ impl UwfApp {
         if plan.is_empty() {
             return;
         }
+        let message = format_revert_confirm_message(&plan);
         self.open_action_modal(Modal::Confirm(ConfirmState::new(
             "撤销排除项修改确认",
-            format!(
-                "将把「重启后生效 (可编辑)」排除项列表恢复为与「当前生效 (只读)」完全一致。\n\n预计移除 {} 项新增规则、恢复 {} 项已删规则。\n确定继续？",
-                plan.remove_count(),
-                plan.add_count(),
-            ),
+            message,
             ConfirmAction::RevertExclusions,
         )));
     }
@@ -830,15 +780,6 @@ impl UwfApp {
             return;
         }
         self.modal = Some(modal);
-    }
-
-    fn ensure_mutable_exclusions(&mut self) -> bool {
-        if self.exclusion_session_current {
-            self.log(false, "当前生效视图只读，请切换到「重启后生效 (可编辑)」");
-            false
-        } else {
-            true
-        }
     }
 
     // ── 弹窗回调 ──
@@ -1020,10 +961,55 @@ impl eframe::App for UwfApp {
     }
 }
 
+fn format_revert_confirm_message(plan: &ExclusionRevertPlan) -> String {
+    let mut lines = vec![
+        "将把「重启后生效」排除项列表恢复为与当前生效状态完全一致：".to_string(),
+        String::new(),
+    ];
+
+    let remove_items: Vec<String> = plan
+        .files_to_remove
+        .iter()
+        .map(FileExclusion::display)
+        .chain(plan.regs_to_remove.iter().cloned())
+        .collect();
+    format_revert_section(&mut lines, "将移除（重启后新增）：", &remove_items, '-');
+
+    let add_items: Vec<String> = plan
+        .files_to_add
+        .iter()
+        .map(FileExclusion::display)
+        .chain(plan.regs_to_add.iter().cloned())
+        .collect();
+    format_revert_section(&mut lines, "将恢复（当前仍生效但已删）：", &add_items, '+');
+
+    lines.push(String::new());
+    lines.push(format!(
+        "预计移除 {} 项、恢复 {} 项。确定继续？",
+        plan.remove_count(),
+        plan.add_count(),
+    ));
+    lines.join("\n")
+}
+
+fn format_revert_section(lines: &mut Vec<String>, title: &str, items: &[String], prefix: char) {
+    const MAX_PREVIEW: usize = 4;
+    if items.is_empty() {
+        return;
+    }
+    lines.push(title.to_string());
+    for item in items.iter().take(MAX_PREVIEW) {
+        lines.push(format!("  {prefix} {item}"));
+    }
+    if items.len() > MAX_PREVIEW {
+        lines.push(format!("  … 等共 {} 项", items.len()));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{FilterState, OverlayConfig, OverlayRuntime};
+    use crate::model::{FilterState, OverlayConfig, OverlayRuntime, VolumeInfo};
     use egui_kittest::{Harness, kittest::Queryable as _};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1070,7 +1056,6 @@ pub(crate) mod tests {
                 max_size_mb: 2048,
             }),
             overlay_runtime: Some(OverlayRuntime {
-                available_space_mb: 1536,
                 consumption_mb: 512,
                 warning_threshold_mb: 1536,
                 critical_threshold_mb: 1843,
@@ -1091,7 +1076,7 @@ pub(crate) mod tests {
             file_exclusions_next: vec![FileExclusion::new("C:".into(), "\\Windows\\Temp".into())],
             registry_exclusions_current: vec![],
             registry_exclusions_next: vec!["HKLM\\SOFTWARE\\UwfManagerDemo".into()],
-            os_version: Some("Windows 10 Enterprise LTSC 2021 (Mock 模拟)".into()),
+            os_version: Some("Windows 10 Enterprise LTSC 2021 16G".into()),
             warnings: vec![],
         }
     }
@@ -1217,7 +1202,7 @@ pub(crate) mod tests {
         assert!(matches!(cmd, BackendCmd::DisableFilter));
         assert_eq!(app.mutation, Some(id));
 
-        app.protect_selected(false);
+        app.set_volume_protected("C:", false);
         assert!(cmd_rx.try_recv().is_err());
 
         app.apply_event(BackendEvent::Finished {
@@ -1225,7 +1210,7 @@ pub(crate) mod tests {
             outcome: Outcome::Ok("ok".into()),
         });
         assert!(!app.is_pending());
-        app.protect_selected(false);
+        app.set_volume_protected("C:", false);
         assert!(matches!(recv_cmd(&cmd_rx), BackendCmd::Unprotect(_)));
     }
 
@@ -1339,26 +1324,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn selection_identity_and_session_toggle_preserve_key() {
+    fn selection_identity_persists_across_snapshot_refresh() {
         let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
         let mut snap = demo_snapshot();
         snap.file_exclusions_next = vec![
             FileExclusion::new("C:".into(), "\\A".into()),
             FileExclusion::new("C:".into(), "\\B".into()),
         ];
-        app.apply_event(BackendEvent::Snapshot(snap));
+        app.apply_event(BackendEvent::Snapshot(snap.clone()));
 
         let b_item = ExclusionItem::File(FileExclusion::new("C:".into(), "\\B".into()));
         app.select_exclusion(b_item.clone());
         assert_eq!(app.selected_exclusion(), Some(b_item.clone()));
 
-        // 切到只读当前视图（空），不允许新增/删除；切回后必须保持选中 \B
-        app.set_exclusion_session(true);
-        assert!(app.selected_exclusion().is_none());
-        app.delete_selected_exclusion();
-        assert!(cmd_rx.try_recv().is_err());
-
-        app.set_exclusion_session(false);
+        // 同条目仍在列表时，刷新快照保留原选中项
+        snap.file_exclusions_next
+            .insert(0, FileExclusion::new("C:".into(), "\\0".into()));
+        app.apply_event(BackendEvent::Snapshot(snap));
         assert_eq!(app.selected_exclusion(), Some(b_item));
         app.delete_selected_exclusion();
         match recv_cmd(&cmd_rx) {
@@ -1424,14 +1406,34 @@ pub(crate) mod tests {
         });
         harness.run();
 
-        // 选中 D: 行并点击保护
-        harness.get_by_label_contains("D:").click();
-        harness.run();
-        harness.get_by_label("保护选中分区").click();
+        // 受保护分区已改为每行直接开关切换，顶部不再存在「保护选中分区 / 取消保护」按钮
+        assert!(harness.query_by_label("保护选中分区").is_none());
+        assert!(harness.query_by_label("取消保护").is_none());
+
+        // 直接拨动 D: 行开关开启保护
+        harness.get_by_label("切换 D: 重启后保护").click();
+        harness.run_steps(2);
+        let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {
+            panic!("期望 Protect 命令");
+        };
+        assert!(matches!(cmd, BackendCmd::Protect(ref drive) if drive == "D:"));
+
+        let mut updated = demo_snapshot();
+        updated.volumes[1].next_protected = true;
+        let _ = event_tx.send(BackendEvent::Snapshot(updated));
+        let _ = event_tx.send(BackendEvent::Finished {
+            id,
+            outcome: Outcome::Ok("D: 保护成功".into()),
+        });
+        harness.run_steps(4);
+        assert!(harness.query_by_label("将保护 (待重启)").is_some());
+
+        // 直接拨动 C: 行开关取消保护
+        harness.get_by_label("切换 C: 重启后保护").click();
         harness.run_steps(2);
         match recv_cmd(&cmd_rx) {
-            BackendCmd::Protect(drive) => assert_eq!(drive, "D:"),
-            other => panic!("期望 Protect(D:)，实际 {other:?}"),
+            BackendCmd::Unprotect(drive) => assert_eq!(drive, "C:"),
+            other => panic!("期望 Unprotect(C:)，实际 {other:?}"),
         }
     }
 
@@ -1640,17 +1642,38 @@ pub(crate) mod tests {
             Some(demo_snapshot()),
         );
 
-        // 1. 顶栏中「日志」位于「帮助」左侧
+        // 1. 顶栏去掉「WMI 实机 / Mock 演示」，左边界右移到右侧工作区上方，「日志」位于「帮助」左侧；
+        //    同时「筛选器控制」卡片上移到左侧顶部与顶栏齐平，缓存区域去掉「可用剩余空间」
+        assert!(harness.query_by_label("WMI 实机").is_none());
+        assert!(harness.query_by_label("Mock 演示").is_none());
+        assert!(harness.query_by_label_contains("可用剩余空间").is_none());
+
         let logs_rect = harness.get_by_label_contains("日志 (").rect();
         let help_rect = harness.get_by_label("帮助 (F1)").rect();
+        let commit_rect = harness.get_by_label("提交操作…").rect();
+        let filter_hdr_rect = harness.get_by_label("筛选器控制").rect();
         assert!(
             logs_rect.max.x <= help_rect.min.x,
             "日志按钮应位于帮助按钮左侧: logs={logs_rect:?}, help={help_rect:?}"
         );
+        assert!(
+            filter_hdr_rect.min.x < 350.0,
+            "筛选器控制应位于左侧栏: filter={filter_hdr_rect:?}"
+        );
+        assert!(
+            (filter_hdr_rect.center().y - logs_rect.center().y).abs() < 40.0,
+            "筛选器控制应向上移至顶栏齐平位置: filter={filter_hdr_rect:?}, logs={logs_rect:?}"
+        );
+        assert!(
+            commit_rect.min.x > filter_hdr_rect.max.x + 60.0,
+            "顶栏左边界应右移让出左侧栏顶部空间: commit={commit_rect:?}, filter={filter_hdr_rect:?}"
+        );
 
-        // 2. 左下角系统环境面板展示版本文本、企业版/教育版提示，且位于工作区下半部分偏左
+        // 2. 左下角系统环境面板展示带物理内存后缀的版本文本与企业版/教育版提示，且位于工作区下半部分偏左
+        assert!(harness.query_by_label_contains("(Build").is_none());
+        assert!(harness.query_by_label_contains("64-bit").is_none());
         let os_node_rect = harness
-            .get_by_label_contains("Windows 10 Enterprise LTSC 2021")
+            .get_by_label_contains("Windows 10 Enterprise LTSC 2021 16G")
             .rect();
         assert!(os_node_rect.min.x < 350.0);
         assert!(os_node_rect.min.y > 450.0);
@@ -1660,9 +1683,11 @@ pub(crate) mod tests {
                 .is_some()
         );
 
-        // 3. 排除项规则去掉了全部/文件与目录/注册表筛选开关，但列表行仍保留类型徽章，且工具栏单行不换行
+        // 3. 排除项规则去掉了全部/文件与目录/注册表筛选开关，也去掉了双会话视角切换；列表行仍保留类型徽章，工具栏单行不换行
         assert!(harness.query_by_label("全部").is_none());
         assert!(harness.query_by_label("文件与目录").is_none());
+        assert!(harness.query_by_label("当前生效 (只读)").is_none());
+        assert!(harness.query_by_label("重启后生效 (可编辑)").is_none());
         assert!(harness.query_by_label("文件/目录").is_some());
         assert!(harness.query_by_label("注册表").is_some());
         let add_file_rect = harness.get_by_label("+ 文件").rect();
@@ -1672,10 +1697,21 @@ pub(crate) mod tests {
             "排除项工具栏按钮不应换行: add={add_file_rect:?}, export={export_rect:?}"
         );
 
-        // 4. 点击「撤销修改」并确认，验证下发 RevertExclusionsToCurrent，回包后差异清零
+        // 4. 点击「撤销修改」可预览明细并确认，验证下发 RevertExclusionsToCurrent，回包后差异清零
         harness.get_by_label("撤销修改").click();
         harness.run();
         assert!(harness.query_by_label_contains("预计移除 2 项").is_some());
+        assert!(
+            harness
+                .query_by_label_contains("将移除（重启后新增）：")
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("C:\\Windows\\Temp")
+                .count()
+                >= 2
+        );
         harness.get_by_label("确认撤销").click();
         harness.run_steps(2);
         let BackendCommand::Mutate { id, cmd } = cmd_rx.try_recv().unwrap() else {

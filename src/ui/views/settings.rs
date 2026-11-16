@@ -148,13 +148,6 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
                 .corner_radius(CornerRadius::same(6))
                 .text(format!("已用 {} / {} MB", runtime.consumption_mb, max_size)),
         );
-
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("可用剩余空间：{} MB", runtime.available_space_mb))
-                .font(FontId::proportional(11.5))
-                .color(theme::TEXT_MUTED),
-        );
     } else {
         egui::Frame::NONE
             .fill(theme::BG_SUBTLE)

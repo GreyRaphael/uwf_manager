@@ -43,7 +43,6 @@ pub struct OverlayConfig {
 /// Overlay 运行时状态（对应 `UWF_Overlay`，2 秒轮询目标）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayRuntime {
-    pub available_space_mb: u32,
     pub consumption_mb: u32,
     pub warning_threshold_mb: u32,
     pub critical_threshold_mb: u32,

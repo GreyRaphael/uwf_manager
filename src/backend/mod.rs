@@ -1053,16 +1053,32 @@ pub enum EditionSupport {
     Unknown,
 }
 
-/// 规范化 `Win32_OperatingSystem` 返回的系统版本文本。
+/// 将物理内存字节数格式化为紧凑的容量后缀（如 `16G`）。
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn format_os_version(caption: &str, build: Option<&str>, arch: Option<&str>) -> String {
+pub fn format_memory_gib(bytes: u64) -> Option<String> {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes == 0 {
+        return None;
+    }
+    if bytes >= GIB / 2 {
+        let gib = bytes.saturating_add(GIB / 2) / GIB;
+        Some(format!("{gib}G"))
+    } else {
+        let mib = (bytes.saturating_add(MIB / 2) / MIB).max(1);
+        Some(format!("{mib}M"))
+    }
+}
+
+/// 规范化 `Win32_OperatingSystem` 返回的系统版本与物理内存文本，例如 `Windows 10 Enterprise LTSC 2021 16G`。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn format_os_version(caption: &str, build: Option<&str>, memory_bytes: Option<u64>) -> String {
     let mut base = caption
         .trim()
         .strip_prefix("Microsoft ")
         .unwrap_or(caption.trim())
         .to_string();
     let build = build.map(str::trim).filter(|s| !s.is_empty());
-    let arch = arch.map(str::trim).filter(|s| !s.is_empty());
 
     // Windows LTSC 的 Caption 常省略年份，结合 Build 号补齐以便一目了然辨识
     if base.contains("LTSC") {
@@ -1079,17 +1095,14 @@ pub fn format_os_version(caption: &str, build: Option<&str>, arch: Option<&str>)
         }
     }
 
-    let mut meta = Vec::new();
-    if let Some(b) = build {
-        meta.push(format!("Build {b}"));
-    }
-    if let Some(a) = arch {
-        meta.push(a.to_string());
-    }
-    if meta.is_empty() {
-        base
+    if let Some(mem) = memory_bytes.and_then(format_memory_gib) {
+        if base.is_empty() {
+            mem
+        } else {
+            format!("{base} {mem}")
+        }
     } else {
-        format!("{base} ({})", meta.join(", "))
+        base
     }
 }
 
@@ -1962,25 +1975,40 @@ mod tests {
 
     #[test]
     fn os_version_formatting_and_edition_detection() {
+        let gib = 1024_u64 * 1024 * 1024;
         let formatted = format_os_version(
             "Microsoft Windows 10 Enterprise LTSC",
             Some("19044"),
-            Some("64-bit"),
+            Some(16 * gib),
+        );
+        assert_eq!(formatted, "Windows 10 Enterprise LTSC 2021 16G");
+        assert_eq!(
+            format_os_version(
+                "Microsoft Windows 11 Enterprise",
+                Some("22631"),
+                // 核显保留后 TotalPhysicalMemory 略低于 32 GiB 的常见数值应四舍五入到 32G
+                Some(31 * gib + 800 * 1024 * 1024),
+            ),
+            "Windows 11 Enterprise 32G"
         );
         assert_eq!(
-            formatted,
-            "Windows 10 Enterprise LTSC 2021 (Build 19044, 64-bit)"
+            format_os_version("Microsoft Windows 10 教育版", None, None),
+            "Windows 10 教育版"
         );
+        assert_eq!(format_memory_gib(0), None);
+        assert_eq!(format_memory_gib(512 * 1024 * 1024), Some("1G".into()));
+        assert_eq!(format_memory_gib(256 * 1024 * 1024), Some("256M".into()));
+
         assert_eq!(
             check_windows_edition_support(&formatted),
             EditionSupport::Supported
         );
         assert_eq!(
-            check_windows_edition_support("Windows 11 教育版 (Build 22631)"),
+            check_windows_edition_support("Windows 11 教育版 16G"),
             EditionSupport::Supported
         );
         assert_eq!(
-            check_windows_edition_support("Windows 11 Pro (Build 22631)"),
+            check_windows_edition_support("Windows 11 Pro 16G"),
             EditionSupport::Unsupported
         );
         assert_eq!(check_windows_edition_support(""), EditionSupport::Unknown);
