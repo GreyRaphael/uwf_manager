@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "uwf_manager"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3180,6 +3180,8 @@ dependencies = [
  "egui_kittest",
  "embed-resource",
  "image",
+ "memmap2",
+ "raw-window-handle",
  "rfd",
  "serde",
  "thiserror 2.0.21",

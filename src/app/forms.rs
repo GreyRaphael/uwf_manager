@@ -87,6 +87,14 @@ pub enum ExclusionItem {
     Registry(String),
 }
 
+/// 缓存的单行排除项展示数据（避免每帧重算拼接与生效状态对比）
+#[derive(Debug, Clone)]
+pub struct ExclusionRow {
+    pub item: ExclusionItem,
+    pub display: String,
+    pub in_current: bool,
+}
+
 impl ExclusionItem {
     pub fn display(&self) -> String {
         match self {

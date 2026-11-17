@@ -14,7 +14,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.set_min_height(avail_h.max(200.0));
 
         // 第一行：标题与导入导出按钮；第二行：说明副标题
-        let count = app.visible_exclusions().len();
+        let count = app.exclusion_rows().len();
         let busy = app.is_busy();
         let subtitle = format!("共 {count} 条 · 例外清单内的改动重启后仍会保留");
         theme::card_header_with_action(ui, "排除项规则", Some(&subtitle), |ui| {
@@ -31,8 +31,11 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.add_space(8.0);
 
         // 第三行：高频添加与撤销操作工具栏（不换行）
-        let revert_plan = app.exclusion_revert_plan();
-        let revert_count = revert_plan.remove_count() + revert_plan.add_count();
+        let (revert_remove, revert_add) = {
+            let plan = app.exclusion_revert_plan();
+            (plan.remove_count(), plan.add_count())
+        };
+        let revert_count = revert_remove + revert_add;
         ui.horizontal(|ui| {
             let editable = !busy;
             let can_revert = editable && revert_count > 0;
@@ -56,19 +59,18 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
                     } else {
                         "撤销修改".to_string()
                     };
-                    let revert_btn = theme::secondary_button(ui, &revert_label);
-                    let tip = if revert_plan.is_empty() {
-                        "重启后排除列表已与当前生效一致，无需撤销".to_string()
-                    } else {
-                        format!(
-                            "撤销修改并恢复为与当前生效一致（将移除 {} 项、恢复 {} 项）",
-                            revert_plan.remove_count(),
-                            revert_plan.add_count(),
-                        )
+                    let show_tip = |ui: &mut egui::Ui| {
+                        if revert_count == 0 {
+                            ui.label("重启后排除列表已与当前生效一致，无需撤销");
+                        } else {
+                            ui.label(format!(
+                                "撤销修改并恢复为与当前生效一致（将移除 {revert_remove} 项、恢复 {revert_add} 项）",
+                            ));
+                        }
                     };
-                    if revert_btn
-                        .on_hover_text(&tip)
-                        .on_disabled_hover_text(&tip)
+                    if theme::secondary_button(ui, &revert_label)
+                        .on_hover_ui(show_tip)
+                        .on_disabled_hover_ui(show_tip)
                         .clicked()
                     {
                         app.open_revert_exclusions_confirm();
@@ -80,7 +82,6 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         ui.add_space(8.0);
 
         // 主体列表区（撑满卡片剩余空间）
-        let rows = app.exclusion_rows();
         let filter_current_enabled = app
             .snapshot
             .filter_state
@@ -89,136 +90,143 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
         let list_h = (ui.available_height() - 18.0).max(120.0);
         let mut removed_item: Option<ExclusionItem> = None;
 
-        egui::Frame::NONE
-            .fill(theme::BG_SUBTLE)
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::same(6))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.set_min_height(list_h);
+        {
+            let rows = app.exclusion_rows();
+            egui::Frame::NONE
+                .fill(theme::BG_SUBTLE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_min_height(list_h);
 
-                if rows.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(((list_h - 46.0) * 0.5).max(8.0));
-                            ui.label(
-                                RichText::new(text::READY_EMPTY)
-                                    .font(FontId::proportional(13.0))
-                                    .strong()
-                                    .color(theme::TEXT_SECONDARY),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("添加到此列表的文件、文件夹或注册表路径，在保护期间修改也会永久保留")
-                                    .font(FontId::proportional(12.0))
-                                    .color(theme::TEXT_MUTED),
-                            );
+                    if rows.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(((list_h - 46.0) * 0.5).max(8.0));
+                                ui.label(
+                                    RichText::new(text::READY_EMPTY)
+                                        .font(FontId::proportional(13.0))
+                                        .strong()
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("添加到此列表的文件、文件夹或注册表路径，在保护期间修改也会永久保留")
+                                        .font(FontId::proportional(12.0))
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            });
                         });
-                    });
-                    return;
-                }
+                        return;
+                    }
 
-                ScrollArea::vertical()
-                    .id_salt("exclusions_scroll")
-                    .max_height(list_h)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (idx, (item, in_current)) in rows.into_iter().enumerate() {
-                            let full_text = item.display();
-                            let (kind_lbl, kind_fg, kind_bg) = if item.is_registry() {
-                                ("注册表", theme::WARN_FG, theme::WARN_BG)
-                            } else {
-                                ("文件/目录", theme::INFO_FG, theme::INFO_BG)
-                            };
+                    ScrollArea::vertical()
+                        .id_salt("exclusions_scroll")
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (idx, row) in rows.iter().enumerate() {
+                                let (kind_lbl, kind_fg, kind_bg) = if row.item.is_registry() {
+                                    ("注册表", theme::WARN_FG, theme::WARN_BG)
+                                } else {
+                                    ("文件/目录", theme::INFO_FG, theme::INFO_BG)
+                                };
 
-                            let row_fill = if idx % 2 == 0 {
-                                theme::BG_CARD
-                            } else {
-                                theme::BG_SUBTLE
-                            };
+                                let row_fill = if idx % 2 == 0 {
+                                    theme::BG_CARD
+                                } else {
+                                    theme::BG_SUBTLE
+                                };
 
-                            egui::Frame::NONE
-                                .fill(row_fill)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 5))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    // 显式限定单行高度为 interact_size.y，防止在 auto_shrink([false, false]) 的
-                                    // ScrollArea 中直接调用 with_layout 吃满剩余可视高度并把状态胶囊纵向拉长。
-                                    let row_h = ui.spacing().interact_size.y;
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(ui.available_width(), row_h),
-                                        Layout::right_to_left(Align::Center),
-                                        |ui| {
-                                            ui.add_enabled_ui(!busy, |ui| {
-                                                let rm_resp = ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("移除")
-                                                                .font(FontId::proportional(11.5))
-                                                                .color(theme::ERR_FG),
+                                egui::Frame::NONE
+                                    .fill(row_fill)
+                                    .corner_radius(CornerRadius::same(6))
+                                    .inner_margin(Margin::symmetric(8, 5))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        // 显式限定单行高度为 interact_size.y，防止在 auto_shrink([false, false]) 的
+                                        // ScrollArea 中直接调用 with_layout 吃满剩余可视高度并把状态胶囊纵向拉长。
+                                        let row_h = ui.spacing().interact_size.y;
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width(), row_h),
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                ui.add_enabled_ui(!busy, |ui| {
+                                                    let rm_resp = ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                RichText::new("移除")
+                                                                    .font(FontId::proportional(11.5))
+                                                                    .color(theme::ERR_FG),
+                                                            )
+                                                            .fill(theme::ERR_BG)
+                                                            .stroke(Stroke::NONE)
+                                                            .corner_radius(CornerRadius::same(5)),
                                                         )
-                                                        .fill(theme::ERR_BG)
-                                                        .stroke(Stroke::NONE)
-                                                        .corner_radius(CornerRadius::same(5)),
-                                                    )
-                                                    .on_hover_text(format!(
-                                                        "删除规则：{full_text}"
-                                                    ));
-                                                if rm_resp.clicked() {
-                                                    removed_item = Some(item.clone());
-                                                }
-                                            });
-                                            if !filter_current_enabled {
-                                                theme::status_pill(
-                                                    ui,
-                                                    "已配置",
-                                                    theme::TEXT_SECONDARY,
-                                                    theme::BG_SUBTLE,
-                                                );
-                                            } else if in_current {
-                                                theme::status_pill(
-                                                    ui,
-                                                    "已生效",
-                                                    theme::OK_FG,
-                                                    theme::OK_BG,
-                                                );
-                                            } else {
-                                                theme::status_pill(
-                                                    ui,
-                                                    "待重启生效",
-                                                    theme::WARN_FG,
-                                                    theme::WARN_BG,
-                                                );
-                                            }
-
-                                            let left_w = ui.available_width().max(80.0);
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(left_w, row_h),
-                                                Layout::left_to_right(Align::Center),
-                                                |ui| {
+                                                        .on_hover_ui(|ui| {
+                                                            ui.label(format!(
+                                                                "删除规则：{}",
+                                                                row.display
+                                                            ));
+                                                        });
+                                                    if rm_resp.clicked() {
+                                                        removed_item = Some(row.item.clone());
+                                                    }
+                                                });
+                                                if !filter_current_enabled {
                                                     theme::status_pill(
-                                                        ui, kind_lbl, kind_fg, kind_bg,
+                                                        ui,
+                                                        "已配置",
+                                                        theme::TEXT_SECONDARY,
+                                                        theme::BG_SUBTLE,
                                                     );
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(&full_text)
-                                                                .font(FontId::monospace(12.5))
-                                                                .color(theme::TEXT_PRIMARY),
+                                                } else if row.in_current {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "已生效",
+                                                        theme::OK_FG,
+                                                        theme::OK_BG,
+                                                    );
+                                                } else {
+                                                    theme::status_pill(
+                                                        ui,
+                                                        "待重启生效",
+                                                        theme::WARN_FG,
+                                                        theme::WARN_BG,
+                                                    );
+                                                }
+
+                                                let left_w = ui.available_width().max(80.0);
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(left_w, row_h),
+                                                    Layout::left_to_right(Align::Center),
+                                                    |ui| {
+                                                        theme::status_pill(
+                                                            ui, kind_lbl, kind_fg, kind_bg,
+                                                        );
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&row.display)
+                                                                    .font(FontId::monospace(12.5))
+                                                                    .color(theme::TEXT_PRIMARY),
+                                                            )
+                                                            .truncate(),
                                                         )
-                                                        .truncate(),
-                                                    )
-                                                    .on_hover_text(&full_text);
-                                                },
-                                            );
-                                        },
-                                    );
-                                });
-                            ui.add_space(3.0);
-                        }
-                    });
-            });
+                                                        .on_hover_ui(|ui| {
+                                                            ui.label(&row.display);
+                                                        });
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    });
+                                ui.add_space(3.0);
+                            }
+                        });
+                });
+        }
 
         if let Some(item) = removed_item {
             app.remove_exclusion(&item);

@@ -911,3 +911,92 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     harness.run();
     assert!(harness.state().modal.is_none());
 }
+
+#[test]
+fn raw_input_hook_clamps_max_texture_side() {
+    use eframe::App as _;
+
+    let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+    let ctx = egui::Context::default();
+
+    let mut large = egui::RawInput {
+        max_texture_side: Some(16_384),
+        ..Default::default()
+    };
+    app.raw_input_hook(&ctx, &mut large);
+    assert_eq!(large.max_texture_side, Some(MAX_FONT_ATLAS_SIDE));
+
+    let mut small = egui::RawInput {
+        max_texture_side: Some(1024),
+        ..Default::default()
+    };
+    app.raw_input_hook(&ctx, &mut small);
+    assert_eq!(small.max_texture_side, Some(1024));
+
+    let mut none = egui::RawInput::default();
+    app.raw_input_hook(&ctx, &mut none);
+    assert_eq!(none.max_texture_side, None);
+}
+
+#[test]
+fn snapshot_cache_updates_rows_plan_and_reasons() {
+    let (mut app, _cmd_rx) = ready_app(BackendKind::Mock);
+    assert_eq!(app.exclusion_rows().len(), 2);
+    assert_eq!(app.exclusion_rows()[0].display, "C:\\Windows\\Temp");
+    assert!(!app.exclusion_rows()[0].in_current);
+    assert_eq!(app.exclusion_revert_plan().remove_count(), 2);
+    assert_eq!(app.pending_reboot_reasons(), &["排除项规则"]);
+
+    let mut aligned = demo_snapshot();
+    aligned.file_exclusions_current = aligned.file_exclusions_next.clone();
+    aligned.registry_exclusions_current = aligned.registry_exclusions_next.clone();
+    app.apply_event(BackendEvent::Snapshot(aligned));
+    assert!(app.exclusion_rows().iter().all(|r| r.in_current));
+    assert!(app.exclusion_revert_plan().is_empty());
+    assert!(app.pending_reboot_reasons().is_empty());
+}
+
+#[test]
+fn minimized_window_skips_overlay_poll_and_idle_repaint() {
+    let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
+    let ctx = egui::Context::default();
+    // 消耗 egui Context 初始化的默认首帧重绘配额
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+    }
+
+    app.last_overlay_tick = Instant::now() - Duration::from_secs(3);
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.tick_overlay_poll(ui.ctx(), true);
+    });
+    out.textures_delta.clear();
+    assert!(cmd_rx.try_recv().is_err());
+    assert_eq!(
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        Duration::MAX
+    );
+
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.tick_overlay_poll(ui.ctx(), false);
+    });
+    out.textures_delta.clear();
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(BackendCommand::RefreshOverlayRuntime)
+    ));
+    assert_eq!(
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        OVERLAY_POLL
+    );
+
+    // 紧接着同一周期内不再以 500ms 空转，而是等待剩余 ~2s
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.tick_overlay_poll(ui.ctx(), false);
+    });
+    out.textures_delta.clear();
+    assert!(cmd_rx.try_recv().is_err());
+    assert!(
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::from_millis(1500)
+    );
+}

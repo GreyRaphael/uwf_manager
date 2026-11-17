@@ -1,6 +1,6 @@
 [package]
 name = "uwf_manager"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 rust-version = "1.99"
 
@@ -8,13 +8,8 @@ rust-version = "1.99"
 eframe = { version = "0.37.0", default-features = false, features = [
     "glow",
     "clipboard",
-    "default_fonts",
-    "system_fonts",
-    "x11",
-    "wayland",
 ] }
 egui_extras = { version = "0.37.0", default-features = false }
-image = { version = "0.25", default-features = false, features = ["ico"] }
 rfd = "0.18.0"
 thiserror = "2"
 anyhow = "1"
@@ -22,14 +17,28 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37.0", features = ["eframe"] }
+image = { version = "0.25", default-features = false, features = ["ico"] }
+
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = [
+    "default_fonts",
+    "system_fonts",
+    "x11",
+    "wayland",
+] }
+image = { version = "0.25", default-features = false, features = ["ico"] }
 
 [target.'cfg(windows)'.dependencies]
 wmi = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]

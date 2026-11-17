@@ -3,7 +3,7 @@
 //! 架构：UI 线程运行 `eframe` / `egui` 渲染与交互；后端线程以 actor 模式独占 `dyn UwfBackend`
 //! （Windows 下 WMI 连接为 `!Send`），两者通过 `std::sync::mpsc` 通信，后端回包后主动触发窗口重绘。
 //!
-//! unsafe 政策：crate 级 deny；唯一例外是 `backend::windows::elevate` 中提权检测的 Win32 只读调用。
+//! unsafe 政策：crate 级 deny；例外仅限 `backend::windows::elevate` 提权只读检测与 `win_platform` 的 Win32 内存/字体/图标边界。
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -13,6 +13,8 @@ mod backend;
 mod error;
 mod model;
 mod ui;
+#[cfg(windows)]
+mod win_platform;
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -62,6 +64,12 @@ fn main() -> anyhow::Result<()> {
         .with_title(ui::text::app_title())
         .with_inner_size([1240.0, 780.0])
         .with_min_inner_size([1080.0, 640.0]);
+    #[cfg(windows)]
+    {
+        // 传入空 IconData 阻止 eframe 加载默认图标并在启动期编码 PNG；改由 PE 资源图标直接绑定 HWND
+        viewport = viewport.with_icon(Arc::new(egui::IconData::default()));
+    }
+    #[cfg(not(windows))]
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }
@@ -78,6 +86,11 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             let _ = wake_ctx.set(cc.egui_ctx.clone());
+            #[cfg(windows)]
+            {
+                win_platform::apply_pe_window_icon(cc);
+                win_platform::configure_fonts(&cc.egui_ctx);
+            }
             ui::theme::apply_theme(&cc.egui_ctx);
             let mut app = app::UwfApp::new(cmd_tx, event_rx, kind);
             app.refresh_all();
@@ -97,7 +110,8 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 从内嵌 `icon.ico` 解析窗口运行时图标（与 Windows `.rc` 共用同一图标源）。
+/// 从内嵌 `icon.ico` 解析窗口运行时图标（仅非 Windows 与单元测试使用；Windows 直接复用 PE `.rc` 资源）。
+#[cfg(any(not(windows), test))]
 fn load_window_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../icon.ico");
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico).ok()?;

@@ -4,7 +4,9 @@ mod forms;
 #[cfg(test)]
 mod tests;
 
-pub use forms::{CacheForm, ExclusionItem, LogLevel, Modal, Phase, StatusEntry, is_overlay_locked};
+pub use forms::{
+    CacheForm, ExclusionItem, ExclusionRow, LogLevel, Modal, Phase, StatusEntry, is_overlay_locked,
+};
 use forms::{CachePendingAction, PowerAction, format_revert_confirm_message};
 
 use std::collections::VecDeque;
@@ -30,8 +32,8 @@ use crate::ui::theme;
 
 /// Overlay 运行时用量后台刷新周期（2 秒）
 const OVERLAY_POLL: Duration = Duration::from_secs(2);
-/// 底层状态无事可做时的最大周期唤醒间隔（兼顾 2s 轮询与低空转）
-const IDLE_REPAINT: Duration = Duration::from_millis(500);
+/// 钳位字形纹理图集单边最大尺寸，避免显卡驱动返回的 16384/32768 上限导致图集占满数 MB 甚至十数 MB
+const MAX_FONT_ATLAS_SIDE: usize = 2048;
 /// 操作日志弹窗最大保留条数
 const MAX_LOG_ENTRIES: usize = 50;
 
@@ -55,6 +57,15 @@ pub struct UwfApp {
     event_rx: Receiver<BackendEvent>,
     file_dialog: Box<dyn FileDialogService>,
     active_file_dialog: Option<(FileDialogTarget, Receiver<Option<PathBuf>>)>,
+    cached_exclusion_rows: Vec<ExclusionRow>,
+    cached_revert_plan: ExclusionRevertPlan,
+    cached_reboot_reasons: Vec<&'static str>,
+    #[cfg(windows)]
+    was_minimized: bool,
+    #[cfg(windows)]
+    initial_trim_done: bool,
+    #[cfg(windows)]
+    startup_trim_countdown: Option<u8>,
 }
 
 impl UwfApp {
@@ -96,6 +107,15 @@ impl UwfApp {
             event_rx,
             file_dialog,
             active_file_dialog: None,
+            cached_exclusion_rows: Vec::new(),
+            cached_revert_plan: ExclusionRevertPlan::default(),
+            cached_reboot_reasons: Vec::new(),
+            #[cfg(windows)]
+            was_minimized: false,
+            #[cfg(windows)]
+            initial_trim_done: false,
+            #[cfg(windows)]
+            startup_trim_countdown: None,
         }
     }
 
@@ -226,7 +246,13 @@ impl UwfApp {
                     self.os_version = Some(ver.clone());
                 }
                 self.snapshot = snapshot;
+                self.rebuild_snapshot_cache();
                 self.phase = Phase::Ready;
+                #[cfg(windows)]
+                if !self.initial_trim_done {
+                    self.initial_trim_done = true;
+                    self.startup_trim_countdown = Some(2);
+                }
                 if first_ready || !self.cache.dirty {
                     self.cache.sync_from_snapshot(&self.snapshot);
                 }
@@ -314,6 +340,11 @@ impl UwfApp {
                 }
                 self.phase = Phase::NotInstalled;
                 self.modal = None;
+                #[cfg(windows)]
+                if !self.initial_trim_done {
+                    self.initial_trim_done = true;
+                    self.startup_trim_countdown = Some(2);
+                }
                 self.log(false, "UWF 功能未安装或未启用");
             }
             BackendEvent::Disconnected => {
@@ -359,65 +390,49 @@ impl UwfApp {
         });
     }
 
-    // ── 排除项视图辅助 ──
+    // ── 排除项与变更汇总缓存（仅快照到达时重算，避免 UI 每帧克隆/拼接） ──
 
-    pub fn visible_exclusions(&self) -> Vec<ExclusionItem> {
-        let mut items = Vec::with_capacity(
+    fn rebuild_snapshot_cache(&mut self) {
+        let mut rows = Vec::with_capacity(
             self.snapshot.file_exclusions_next.len() + self.snapshot.registry_exclusions_next.len(),
         );
-        items.extend(
-            self.snapshot
-                .file_exclusions_next
+        for f in &self.snapshot.file_exclusions_next {
+            let in_current = self
+                .snapshot
+                .file_exclusions_current
                 .iter()
-                .cloned()
-                .map(ExclusionItem::File),
-        );
-        items.extend(
-            self.snapshot
-                .registry_exclusions_next
+                .any(|cur| cur.matches_ignore_case(f));
+            let item = ExclusionItem::File(f.clone());
+            let display = item.display();
+            rows.push(ExclusionRow {
+                item,
+                display,
+                in_current,
+            });
+        }
+        for k in &self.snapshot.registry_exclusions_next {
+            let in_current = self
+                .snapshot
+                .registry_exclusions_current
                 .iter()
-                .cloned()
-                .map(ExclusionItem::Registry),
-        );
-        items
-    }
+                .any(|cur| cur.eq_ignore_ascii_case(k));
+            let item = ExclusionItem::Registry(k.clone());
+            let display = item.display();
+            rows.push(ExclusionRow {
+                item,
+                display,
+                in_current,
+            });
+        }
+        self.cached_exclusion_rows = rows;
 
-    /// 供 UI 渲染使用：返回重启后排除项列表，并标明是否已在当前会话生效。
-    pub fn exclusion_rows(&self) -> Vec<(ExclusionItem, bool)> {
-        self.visible_exclusions()
-            .into_iter()
-            .map(|item| {
-                let in_current = match &item {
-                    ExclusionItem::File(f) => self
-                        .snapshot
-                        .file_exclusions_current
-                        .iter()
-                        .any(|cur| cur.matches_ignore_case(f)),
-                    ExclusionItem::Registry(k) => self
-                        .snapshot
-                        .registry_exclusions_current
-                        .iter()
-                        .any(|cur| cur.eq_ignore_ascii_case(k)),
-                };
-                (item, in_current)
-            })
-            .collect()
-    }
-
-    /// 计算将“重启后生效”排除项恢复成与当前生效状态一致所需的操作计划。
-    pub fn exclusion_revert_plan(&self) -> ExclusionRevertPlan {
-        plan_exclusion_revert(
+        self.cached_revert_plan = plan_exclusion_revert(
             &self.snapshot.file_exclusions_current,
             &self.snapshot.file_exclusions_next,
             &self.snapshot.registry_exclusions_current,
             &self.snapshot.registry_exclusions_next,
-        )
-    }
+        );
 
-    // ── 业务操作派发 ──
-
-    /// 汇总当前已配置但尚未生效（需重启计算机）的变更分类，供顶栏引导条展示。
-    pub fn pending_reboot_reasons(&self) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if self
             .snapshot
@@ -441,10 +456,27 @@ impl UwfApp {
         {
             reasons.push("磁盘分区保护");
         }
-        if !self.exclusion_revert_plan().is_empty() {
+        if !self.cached_revert_plan.is_empty() {
             reasons.push("排除项规则");
         }
-        reasons
+        self.cached_reboot_reasons = reasons;
+    }
+
+    /// 供 UI 渲染使用：返回重启后排除项列表，并标明是否已在当前会话生效。
+    pub fn exclusion_rows(&self) -> &[ExclusionRow] {
+        &self.cached_exclusion_rows
+    }
+
+    /// 计算将“重启后生效”排除项恢复成与当前生效状态一致所需的操作计划。
+    pub fn exclusion_revert_plan(&self) -> &ExclusionRevertPlan {
+        &self.cached_revert_plan
+    }
+
+    // ── 业务操作派发 ──
+
+    /// 汇总当前已配置但尚未生效（需重启计算机）的变更分类，供顶栏引导条展示。
+    pub fn pending_reboot_reasons(&self) -> &[&'static str] {
+        &self.cached_reboot_reasons
     }
 
     pub fn toggle_write_filter(&mut self) {
@@ -647,7 +679,7 @@ impl UwfApp {
         if plan.is_empty() {
             return;
         }
-        let message = format_revert_confirm_message(&plan);
+        let message = format_revert_confirm_message(plan);
         self.open_action_modal(Modal::Confirm(ConfirmState::new(
             "撤销排除项修改确认",
             message,
@@ -799,6 +831,19 @@ impl UwfApp {
             }
         }
     }
+    pub(crate) fn tick_overlay_poll(&mut self, ctx: &egui::Context, minimized: bool) {
+        if self.phase != Phase::Ready || minimized {
+            return;
+        }
+        let elapsed = self.last_overlay_tick.elapsed();
+        if elapsed >= OVERLAY_POLL {
+            self.last_overlay_tick = Instant::now();
+            self.send_overlay_refresh();
+            ctx.request_repaint_after(OVERLAY_POLL);
+        } else {
+            ctx.request_repaint_after(OVERLAY_POLL - elapsed);
+        }
+    }
 }
 
 impl eframe::App for UwfApp {
@@ -806,18 +851,37 @@ impl eframe::App for UwfApp {
         theme::BG_CANVAS.to_normalized_gamma_f32()
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(side) = raw_input.max_texture_side.as_mut() {
+            *side = (*side).min(MAX_FONT_ATLAS_SIDE);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.poll_file_dialog();
 
-        if self.last_overlay_tick.elapsed() >= OVERLAY_POLL {
-            self.last_overlay_tick = Instant::now();
-            self.send_overlay_refresh();
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+
+        #[cfg(windows)]
+        {
+            if minimized && !self.was_minimized {
+                crate::win_platform::trim_working_set();
+            }
+            self.was_minimized = minimized;
+
+            if let Some(rem) = self.startup_trim_countdown.as_mut() {
+                if *rem == 0 {
+                    self.startup_trim_countdown = None;
+                    crate::win_platform::trim_working_set();
+                } else {
+                    *rem -= 1;
+                    ctx.request_repaint();
+                }
+            }
         }
 
-        if self.phase == Phase::Ready {
-            ctx.request_repaint_after(IDLE_REPAINT);
-        }
+        self.tick_overlay_poll(ctx, minimized);
 
         if ctx.input(|i| i.viewport().close_requested())
             && self.is_pending()

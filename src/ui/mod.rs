@@ -57,29 +57,33 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                         }
 
                         if app.phase == Phase::Ready {
-                            let reasons = app.pending_reboot_reasons();
-                            if reasons.is_empty() {
+                            if app.pending_reboot_reasons().is_empty() {
                                 ui.label(
                                     RichText::new("✔ 当前设置已全部生效")
                                         .font(FontId::proportional(12.0))
                                         .color(theme::TEXT_MUTED),
                                 );
                             } else {
-                                let detail = format!(
-                                    "以下更改将在下次重启计算机后生效：{}",
-                                    reasons.join("、")
-                                );
                                 theme::status_pill(
                                     ui,
                                     "⚠ 待重启生效",
                                     theme::WARN_FG,
                                     theme::WARN_BG,
                                 );
-                                ui.add_enabled_ui(!app.is_busy(), |ui| {
-                                    if theme::secondary_button(ui, "立即重启生效…")
-                                        .on_hover_text(&detail)
-                                        .clicked()
-                                    {
+                                let busy = app.is_busy();
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    let restart_clicked = {
+                                        let reasons = app.pending_reboot_reasons();
+                                        theme::secondary_button(ui, "立即重启生效…")
+                                            .on_hover_ui(|ui| {
+                                                ui.label(format!(
+                                                    "以下更改将在下次重启计算机后生效：{}",
+                                                    reasons.join("、")
+                                                ));
+                                            })
+                                            .clicked()
+                                    };
+                                    if restart_clicked {
                                         app.open_restart_confirm();
                                     }
                                 });

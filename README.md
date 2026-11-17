@@ -87,4 +87,4 @@ cargo test --locked   # 包含模型、WMI 消歧逻辑、状态机及 egui_kitt
 cargo build --locked
 ```
 
-架构：UI 线程运行 `eframe` / `egui`（含非阻塞 `rfd` 原生文件对话框后台线程）⇄ `std::sync::mpsc` ⇄ 后端 actor 线程（独占 `dyn UwfBackend`，天然满足 COM 套间约束）；后端回包通过 `egui::Context::request_repaint` 立即唤醒重绘。运行时 `unsafe` 仅 `backend/windows/elevate.rs` 一处（模块内显式 allow）。
+架构：UI 线程运行 `eframe` / `egui`（含非阻塞 `rfd` 原生文件对话框后台线程）⇄ `std::sync::mpsc` ⇄ 后端 actor 线程（独占 `dyn UwfBackend`，天然满足 COM 套间约束）；后端回包通过 `egui::Context::request_repaint` 立即唤醒重绘。运行时 `unsafe` 仅限 `backend/windows/elevate.rs` 与 `win_platform.rs` 两处 Windows 边界模块（显式 allow）。
