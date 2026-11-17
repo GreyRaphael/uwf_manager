@@ -154,16 +154,16 @@ fn query_events_do_not_clear_mutation() {
     let mutation = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
 
     app.apply_event(BackendEvent::RefreshFailed("刷新失败".into()));
-    assert_eq!(app.mutation, Some(mutation));
+    assert_eq!(app.active_mutation_id(), Some(mutation));
 
     app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
-    assert_eq!(app.mutation, Some(mutation));
+    assert_eq!(app.active_mutation_id(), Some(mutation));
 
     app.apply_event(BackendEvent::NotInstalled(None));
-    assert_eq!(app.mutation, Some(mutation));
+    assert_eq!(app.active_mutation_id(), Some(mutation));
 
     app.apply_event(BackendEvent::NotInstalled(Some(mutation)));
-    assert_eq!(app.mutation, None);
+    assert_eq!(app.active_mutation_id(), None);
 
     app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
     let mutation = app.begin_mutation(BackendCmd::EnableFilter).unwrap();
@@ -171,7 +171,7 @@ fn query_events_do_not_clear_mutation() {
         id: mutation,
         outcome: Outcome::Ok("ok".into()),
     });
-    assert_eq!(app.mutation, None);
+    assert_eq!(app.active_mutation_id(), None);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn mutation_gated_while_pending() {
         panic!("期望 Mutate 命令");
     };
     assert!(matches!(cmd, BackendCmd::DisableFilter));
-    assert_eq!(app.mutation, Some(id));
+    assert_eq!(app.active_mutation_id(), Some(id));
 
     app.set_volume_protected("C:", false);
     assert!(cmd_rx.try_recv().is_err());
@@ -204,7 +204,13 @@ fn power_action_not_armed_when_mutation_is_pending() {
 
     app.execute_confirm(ConfirmAction::Restart);
     assert!(cmd_rx.try_recv().is_err());
-    assert!(app.power_action.is_none());
+    assert!(!matches!(
+        app.in_flight,
+        Some(InFlightMutation {
+            kind: MutationKind::Power(_),
+            ..
+        })
+    ));
 
     app.apply_event(BackendEvent::Finished {
         id: first,
@@ -674,7 +680,7 @@ fn gui_commit_preflight_blocks_unprotected_drive_and_disabled_filter() {
         current_enabled: false,
         next_enabled: false,
     });
-    let _ = event_tx.send(BackendEvent::Snapshot(disabled_snap));
+    let _ = event_tx.send(BackendEvent::Snapshot(disabled_snap.clone()));
     harness.run();
     assert!(
         harness
@@ -682,6 +688,20 @@ fn gui_commit_preflight_blocks_unprotected_drive_and_disabled_filter() {
             .validate_input_preflight(InputAction::CommitFile, "C:\\data\\a.txt")
             .is_err_and(|e| e.contains("筛选器当前会话未启用"))
     );
+
+    // 若筛选器状态缺失，高危提交操作也必须默认拒绝（而非静默放行）
+    let mut missing_filter_snap = demo_snapshot();
+    missing_filter_snap.filter_state = None;
+    let _ = event_tx.send(BackendEvent::Snapshot(missing_filter_snap));
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .validate_input_preflight(InputAction::CommitFile, "C:\\data\\a.txt")
+            .is_err_and(|e| e.contains("尚未加载完成"))
+    );
+    let _ = event_tx.send(BackendEvent::Snapshot(disabled_snap));
+    harness.run();
 
     // 即使直接绕过弹窗传未受保护盘符给强制保存文件修改，也会被预检拦下并写红字错误
     harness.get_by_label("强制保存…").click();

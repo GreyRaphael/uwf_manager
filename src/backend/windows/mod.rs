@@ -44,8 +44,6 @@ fn session_kw(current_session: bool) -> &'static str {
 
 pub struct WindowsWmiBackend {
     con: Option<WMIConnection>,
-    /// 非致命读取警告（如单卷 GetExclusions 失败），由 collect_snapshot / export_exclusions 取走
-    warnings: Vec<String>,
     /// 缓存已成功识别的操作系统版本文本（查询失败时不负缓存，允许 F5 重试）
     cached_os_version: Option<String>,
 }
@@ -56,7 +54,6 @@ impl WindowsWmiBackend {
     pub fn new() -> Self {
         Self {
             con: None,
-            warnings: Vec::new(),
             cached_os_version: None,
         }
     }
@@ -150,13 +147,70 @@ impl WindowsWmiBackend {
         rows.into_iter().next().ok_or(UwfError::NotInstalled)
     }
 
-    fn overlay_config_instance(&mut self, current_session: bool) -> Result<UWF_OverlayConfig> {
+    fn next_overlay_config_path(&mut self) -> Result<String> {
         let wql = format!(
             "SELECT * FROM UWF_OverlayConfig WHERE CurrentSession = {}",
-            session_kw(current_session)
+            session_kw(false)
         );
         let rows: Vec<UWF_OverlayConfig> = self.raw_query(&wql)?;
-        rows.into_iter().next().ok_or(UwfError::NotInstalled)
+        rows.into_iter()
+            .next()
+            .map(|c| c.path)
+            .ok_or(UwfError::NotInstalled)
+    }
+
+    fn set_next_overlay_config<P: Serialize>(
+        &mut self,
+        what: &'static str,
+        method: &'static str,
+        param: P,
+    ) -> Result<()> {
+        self.ensure_overlay_editable(what)?;
+        // 配置写入下次会话实例
+        let path = self.next_overlay_config_path()?;
+        let out: ReturnOnly = self.exec::<UWF_OverlayConfig, _>(&path, method, param)?;
+        Self::ensure_ok(method, out)
+    }
+
+    fn set_overlay_threshold(&mut self, method: &'static str, size_mb: u32) -> Result<()> {
+        let path = self.overlay_instance()?.path;
+        let out: ReturnOnly =
+            self.exec::<UWF_Overlay, _>(&path, method, SizeParam { size: size_mb })?;
+        Self::ensure_ok(method, out)
+    }
+
+    fn exec_file_exclusion(
+        &mut self,
+        ensure_next: bool,
+        drive_letter: &str,
+        method: &'static str,
+        file_rel_path: &str,
+    ) -> Result<()> {
+        let path = if ensure_next {
+            self.ensure_next_volume_path(drive_letter)?
+        } else {
+            self.find_volume_path(false, drive_letter)?
+        };
+        let out: ReturnOnly = self.exec::<UWF_Volume, _>(
+            &path,
+            method,
+            FileNameParam {
+                FileName: file_rel_path.to_string(),
+            },
+        )?;
+        Self::ensure_ok(method, out)
+    }
+
+    fn exec_registry_exclusion(&mut self, method: &'static str, key: &str) -> Result<()> {
+        let path = self.registry_filter_path(false)?;
+        let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
+            &path,
+            method,
+            RegistryKeyParam {
+                RegistryKey: key.to_string(),
+            },
+        )?;
+        Self::ensure_ok(method, out)
     }
 
     /// 单次全量读取 `UWF_OverlayConfig` 并拆分为 `(current, next)`，避免快照刷新双倍往返。
@@ -350,8 +404,9 @@ impl WindowsWmiBackend {
         &mut self,
         volumes: &[ResolvedVolume],
         current_session: bool,
-    ) -> Vec<FileExclusion> {
+    ) -> (Vec<FileExclusion>, Vec<String>) {
         let mut items = Vec::new();
+        let mut warnings = Vec::new();
         for volume in volumes
             .iter()
             .filter(|v| v.current_session == current_session)
@@ -366,15 +421,14 @@ impl WindowsWmiBackend {
                 {
                     Ok(out) if out.ReturnValue == 0 => out,
                     Ok(out) => {
-                        self.warnings.push(format!(
+                        warnings.push(format!(
                             "卷 {} 读取排除项失败: ReturnValue=0x{:08X}",
                             volume.drive_letter, out.ReturnValue
                         ));
                         continue;
                     }
                     Err(e) => {
-                        self.warnings
-                            .push(format!("卷 {} 读取排除项失败: {e}", volume.drive_letter));
+                        warnings.push(format!("卷 {} 读取排除项失败: {e}", volume.drive_letter));
                         continue;
                     }
                 };
@@ -386,7 +440,7 @@ impl WindowsWmiBackend {
             }
         }
         items.sort();
-        items
+        (items, warnings)
     }
 
     fn registry_exclusions_at_path(&mut self, path: &str) -> Result<Vec<String>> {
@@ -448,14 +502,6 @@ impl UwfBackend for WindowsWmiBackend {
 
     // ── Overlay ──
 
-    fn get_overlay_config(&mut self, current_session: bool) -> Result<OverlayConfig> {
-        let c = self.overlay_config_instance(current_session)?;
-        Ok(OverlayConfig {
-            overlay_type: OverlayType::from_u32(c.Type),
-            max_size_mb: c.MaximumSize,
-        })
-    }
-
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
         let o = self.overlay_instance()?;
         Ok(OverlayRuntime {
@@ -466,54 +512,32 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn set_overlay_type(&mut self, overlay_type: OverlayType) -> Result<()> {
-        self.ensure_overlay_editable("Overlay 类型")?;
-        // 配置写入下次会话实例
-        let path = self.overlay_config_instance(false)?.path;
-        let out: ReturnOnly = self.exec::<UWF_OverlayConfig, _>(
-            &path,
+        self.set_next_overlay_config(
+            "Overlay 类型",
             "SetType",
             TypeParam {
                 r#type: overlay_type.as_u32(),
             },
-        )?;
-        Self::ensure_ok("SetType", out)
+        )
     }
 
     fn set_overlay_max_size(&mut self, size_mb: u32) -> Result<()> {
-        self.ensure_overlay_editable("Overlay 最大容量")?;
-        let path = self.overlay_config_instance(false)?.path;
-        let out: ReturnOnly = self.exec::<UWF_OverlayConfig, _>(
-            &path,
+        self.set_next_overlay_config(
+            "Overlay 最大容量",
             "SetMaximumSize",
             SizeParam { size: size_mb },
-        )?;
-        Self::ensure_ok("SetMaximumSize", out)
+        )
     }
 
     fn set_warning_threshold(&mut self, size_mb: u32) -> Result<()> {
-        let path = self.overlay_instance()?.path;
-        let out: ReturnOnly =
-            self.exec::<UWF_Overlay, _>(&path, "SetWarningThreshold", SizeParam { size: size_mb })?;
-        Self::ensure_ok("SetWarningThreshold", out)
+        self.set_overlay_threshold("SetWarningThreshold", size_mb)
     }
 
     fn set_critical_threshold(&mut self, size_mb: u32) -> Result<()> {
-        let path = self.overlay_instance()?.path;
-        let out: ReturnOnly = self.exec::<UWF_Overlay, _>(
-            &path,
-            "SetCriticalThreshold",
-            SizeParam { size: size_mb },
-        )?;
-        Self::ensure_ok("SetCriticalThreshold", out)
+        self.set_overlay_threshold("SetCriticalThreshold", size_mb)
     }
 
     // ── Volume ──
-
-    fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
-        // R2 / PLAN：单次全量消歧查询后按会话合并，next-only 卷与未注册的 current-only 卷均可见。
-        let volumes = self.read_volumes()?;
-        Ok(Self::merge_resolved_volumes(&volumes))
-    }
 
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {
         // R2：作用于下次会话实例；未曾保护过的卷先按当前会话 GUID 自动创建下次会话实例
@@ -599,38 +623,21 @@ impl UwfBackend for WindowsWmiBackend {
 
     // ── Exclusion ──
 
-    fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
+    fn get_file_exclusions(
+        &mut self,
+        current_session: bool,
+    ) -> Result<(Vec<FileExclusion>, Vec<String>)> {
         let volumes = self.read_volumes()?;
         Ok(self.file_exclusions_from_volumes(&volumes, current_session))
     }
 
-    fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
-    }
-
     fn add_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
         // R4：作用于下次会话实例；若卷尚未注册下次会话则先自动创建
-        let path = self.ensure_next_volume_path(drive_letter)?;
-        let out: ReturnOnly = self.exec::<UWF_Volume, _>(
-            &path,
-            "AddExclusion",
-            FileNameParam {
-                FileName: file_rel_path.to_string(),
-            },
-        )?;
-        Self::ensure_ok("AddExclusion", out)
+        self.exec_file_exclusion(true, drive_letter, "AddExclusion", file_rel_path)
     }
 
     fn remove_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
-        let path = self.find_volume_path(false, drive_letter)?;
-        let out: ReturnOnly = self.exec::<UWF_Volume, _>(
-            &path,
-            "RemoveExclusion",
-            FileNameParam {
-                FileName: file_rel_path.to_string(),
-            },
-        )?;
-        Self::ensure_ok("RemoveExclusion", out)
+        self.exec_file_exclusion(false, drive_letter, "RemoveExclusion", file_rel_path)
     }
 
     fn get_registry_exclusions(&mut self, current_session: bool) -> Result<Vec<String>> {
@@ -639,27 +646,11 @@ impl UwfBackend for WindowsWmiBackend {
     }
 
     fn add_registry_exclusion(&mut self, key: &str) -> Result<()> {
-        let path = self.registry_filter_path(false)?;
-        let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
-            &path,
-            "AddExclusion",
-            RegistryKeyParam {
-                RegistryKey: key.to_string(),
-            },
-        )?;
-        Self::ensure_ok("AddExclusion", out)
+        self.exec_registry_exclusion("AddExclusion", key)
     }
 
     fn remove_registry_exclusion(&mut self, key: &str) -> Result<()> {
-        let path = self.registry_filter_path(false)?;
-        let out: ReturnOnly = self.exec::<UWF_RegistryFilter, _>(
-            &path,
-            "RemoveExclusion",
-            RegistryKeyParam {
-                RegistryKey: key.to_string(),
-            },
-        )?;
-        Self::ensure_ok("RemoveExclusion", out)
+        self.exec_registry_exclusion("RemoveExclusion", key)
     }
 
     fn commit_registry(&mut self, key: &str, value_name: &str) -> Result<()> {
@@ -696,8 +687,11 @@ impl UwfBackend for WindowsWmiBackend {
         // UWF_Volume 单次全量查询后供卷列表与当前/下次文件排除项共同消费
         let resolved_volumes = self.read_volumes()?;
         let volumes = Self::merge_resolved_volumes(&resolved_volumes);
-        let file_exclusions_current = self.file_exclusions_from_volumes(&resolved_volumes, true);
-        let file_exclusions_next = self.file_exclusions_from_volumes(&resolved_volumes, false);
+        let (file_exclusions_current, mut warnings) =
+            self.file_exclusions_from_volumes(&resolved_volumes, true);
+        let (file_exclusions_next, next_warnings) =
+            self.file_exclusions_from_volumes(&resolved_volumes, false);
+        warnings.extend(next_warnings);
 
         let (reg_current_path, reg_next_path) = self.registry_filter_paths()?;
         let registry_exclusions_current = self.registry_exclusions_at_path(&reg_current_path)?;
@@ -714,7 +708,7 @@ impl UwfBackend for WindowsWmiBackend {
             registry_exclusions_current,
             registry_exclusions_next,
             os_version: self.get_os_version(),
-            warnings: self.take_warnings(),
+            warnings,
         })
     }
 }

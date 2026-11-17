@@ -6,14 +6,16 @@ Windows 统一写入筛选器（Unified Write Filter, UWF）的轻量级桌面�
 
 ### {{TAG}} 更新说明
 
-- **Windows 10 运行时内存占用优化**：
-  - **精简字体加载与禁用系统全量扫描**：Windows 产物关闭 `eframe` 的 `system_fonts` 与 `default_fonts`，改由 `memmap2` 按需只读共享映射必要系统字体（微软雅黑 / Consolas / Segoe UI Symbol），避免 `DirectWrite` 全系统字体索引、多套中文字体并发回退与私有堆拷贝。
-  - **限制字形纹理图集宽度**：通过 `raw_input_hook` 将 `max_texture_side` 钳位至 `2048`，防止显卡驱动返回的 `16384/32768` 上限导致字体图集占据数 MB 到十数 MB 内存。
-  - **消除 500 ms 无意义空转与每帧分配**：移除 `IDLE_REPAINT = 500ms` 唤醒循环，改为严格对齐 2 秒 `OVERLAY_POLL` 节拍并在窗口最小化时暂停轮询与重绘；缓存排除项列表、撤销计划与待重启原因，并将悬浮提示文案延后至悬停时生成。
-  - **复用 PE 资源图标与冷页工作集修剪**：Windows 端直接绑定 `.rc` 嵌入的多尺寸 `.ico` 资源（跳过运行时 256×256 RGBA 解码与 PNG 重编码），并在启动首帧稳定后及窗口最小化时触发 `SetProcessWorkingSetSize` 修剪冷页。
-- **继承 v0.4.5 界面与交互改进**：
-  - 「排除项规则」紧凑行高与 `egui_kittest` 回归校验；
-  - `glow`（OpenGL 2.0+）渲染后端与 Release `fat LTO` / `strip` 体积优化。
+- **内存与空闲唤醒进一步优化（在 v0.4.6 基础上继续降耗）**：
+  - **2 秒 Overlay 轮询下沉至后端线程**：UI 空载保持 0 定时重绘，后端仅当用量变化时推送事件并唤醒窗口；最小化期间自动暂停轮询，避免周期唤醒重新换入已修剪冷页。
+  - **字形图集与单一 UI 字体优化**：字形纹理图集上限收紧至 `1024` 并关闭 `subpixel_binning`；Windows 仅内存映射单一系统 UI 字体（优先 `msyh.ttc` Microsoft YaHei UI 字面），`Proportional` / `Monospace` 共享同一字面，并用 `Painter` 矢量图标彻底替代缺失/字符状态徽标。
+  - **去除启动期 `ROOT\CIMV2` WMI 连接**：系统版本与物理内存改由 Win32 注册表与 `GetPhysicallyInstalledSystemMemory` / `GlobalMemoryStatusEx` 直接读取（仅同盘符多卷冲突消歧时按需查询 `Win32_Volume`）。
+- **Win10 窗口高度与滚动条布局修复**：
+  - 改用 Microsoft YaHei UI 紧凑字面行高指标，默认窗高提升至 `1240×840` 并收紧卡片边距与分区表行高，解决左栏与多分区场景下「受保护磁盘分区」表格出现纵向滚动条的问题。
+- **代码精简与稳定性**：
+  - 收敛 `UwfApp` 在途请求状态与 `UwfBackend` 契约，移除 `anyhow` 依赖及无用泛型，统一批量导入/撤销统计与提交预检空值保护。
+- **继承 v0.4.6 / v0.4.5 基础能力**：
+  - `glow`（OpenGL 2.0+）渲染后端、PE 资源图标直接绑定、冷页工作集修剪与 `fat LTO` / `strip` 单文件构建。
 
 ---
 

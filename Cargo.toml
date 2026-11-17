@@ -1,6 +1,6 @@
 [package]
 name = "uwf_manager"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 rust-version = "1.99"
 
@@ -12,7 +12,6 @@ eframe = { version = "0.37.0", default-features = false, features = [
 egui_extras = { version = "0.37.0", default-features = false }
 rfd = "0.18.0"
 thiserror = "2"
-anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]

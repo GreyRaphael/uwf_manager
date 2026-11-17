@@ -124,19 +124,19 @@ pub(super) enum PowerAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CachePendingAction {
+pub(super) enum MutationKind {
+    General,
     /// 缓存表单保存成功时刷新表单，失败时把错误写入 `cache.error`
-    Save(RequestId),
+    CacheSave,
     /// 全局重置成功时强制刷新表单，失败时只记录全局/状态栏错误而不污染 `cache.error`
-    ResetSync(RequestId),
+    CacheResetSync,
+    Power(PowerAction),
 }
 
-impl CachePendingAction {
-    pub(super) fn request_id(self) -> RequestId {
-        match self {
-            Self::Save(id) | Self::ResetSync(id) => id,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InFlightMutation {
+    pub id: RequestId,
+    pub kind: MutationKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

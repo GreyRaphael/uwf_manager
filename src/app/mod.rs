@@ -7,7 +7,7 @@ mod tests;
 pub use forms::{
     CacheForm, ExclusionItem, ExclusionRow, LogLevel, Modal, Phase, StatusEntry, is_overlay_locked,
 };
-use forms::{CachePendingAction, PowerAction, format_revert_confirm_message};
+use forms::{InFlightMutation, MutationKind, PowerAction, format_revert_confirm_message};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -42,10 +42,8 @@ pub struct UwfApp {
     pub os_version: Option<String>,
     pub modal: Option<Modal>,
     pub logs: VecDeque<StatusEntry>,
-    /// 当前在途变更请求 id；仅匹配回包可解除锁定
-    pub mutation: Option<RequestId>,
-    pending_cache_action: Option<CachePendingAction>,
-    power_action: Option<(RequestId, PowerAction)>,
+    /// 当前在途变更请求（id + 收尾语义）；仅匹配回包可解除锁定
+    in_flight: Option<InFlightMutation>,
     next_request_id: RequestId,
     pub should_quit: bool,
     force_close_confirmed: bool,
@@ -91,9 +89,7 @@ impl UwfApp {
             os_version: None,
             modal: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
-            mutation: None,
-            pending_cache_action: None,
-            power_action: None,
+            in_flight: None,
             next_request_id: 1,
             should_quit: false,
             force_close_confirmed: false,
@@ -117,7 +113,12 @@ impl UwfApp {
     }
 
     pub fn is_pending(&self) -> bool {
-        self.mutation.is_some()
+        self.in_flight.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_mutation_id(&self) -> Option<RequestId> {
+        self.in_flight.map(|m| m.id)
     }
 
     pub fn is_file_dialog_open(&self) -> bool {
@@ -146,9 +147,7 @@ impl UwfApp {
         let first = self.phase != Phase::BackendLost;
         self.phase = Phase::BackendLost;
         self.modal = None;
-        self.mutation = None;
-        self.pending_cache_action = None;
-        self.power_action = None;
+        self.in_flight = None;
         if first {
             self.log(false, message);
         }
@@ -164,6 +163,10 @@ impl UwfApp {
     }
 
     pub fn begin_mutation(&mut self, cmd: BackendCmd) -> Option<RequestId> {
+        self.begin_tracked_mutation(cmd, MutationKind::General)
+    }
+
+    fn begin_tracked_mutation(&mut self, cmd: BackendCmd, kind: MutationKind) -> Option<RequestId> {
         if self.phase == Phase::BackendLost {
             self.log(false, "后端线程已退出，请重启应用");
             return None;
@@ -171,7 +174,7 @@ impl UwfApp {
         if self.phase != Phase::Ready {
             return None;
         }
-        if self.mutation.is_some() {
+        if self.in_flight.is_some() {
             self.log(false, "有操作正在执行，请稍后再试");
             return None;
         }
@@ -180,8 +183,24 @@ impl UwfApp {
             self.mark_backend_lost("后端线程已退出，操作未发送");
             return None;
         }
-        self.mutation = Some(id);
+        self.in_flight = Some(InFlightMutation { id, kind });
         Some(id)
+    }
+
+    fn take_matching_inflight(&mut self, id: RequestId) -> Option<MutationKind> {
+        let current = self.in_flight?;
+        (current.id == id).then(|| {
+            self.in_flight = None;
+            current.kind
+        })
+    }
+
+    fn arm_startup_trim(&mut self) {
+        #[cfg(windows)]
+        if !self.initial_trim_done {
+            self.initial_trim_done = true;
+            self.startup_trim_countdown = Some(2);
+        }
     }
 
     pub fn send_quit(&mut self) {
@@ -232,11 +251,7 @@ impl UwfApp {
                 self.snapshot = snapshot;
                 self.rebuild_snapshot_cache();
                 self.phase = Phase::Ready;
-                #[cfg(windows)]
-                if !self.initial_trim_done {
-                    self.initial_trim_done = true;
-                    self.startup_trim_countdown = Some(2);
-                }
+                self.arm_startup_trim();
                 if first_ready || !self.cache.dirty {
                     self.cache.sync_from_snapshot(&self.snapshot);
                 }
@@ -262,73 +277,28 @@ impl UwfApp {
                 }
             }
             BackendEvent::Finished { id, outcome } => {
-                if self.mutation == Some(id) {
-                    self.mutation = None;
-                }
-                let cache_action = self
-                    .pending_cache_action
-                    .filter(|act| act.request_id() == id);
-                if cache_action.is_some() {
-                    self.pending_cache_action = None;
-                }
+                let kind = self.take_matching_inflight(id);
                 match outcome {
-                    Outcome::Ok(msg) => {
-                        if cache_action.is_some() {
-                            self.cache.sync_from_snapshot(&self.snapshot);
-                        }
-                        self.log(true, &msg);
-                        self.on_power_action_ok(id);
-                    }
+                    Outcome::Ok(message) => self.finish_mutation_ok(kind, message, None),
                     Outcome::OkWithRefreshWarning { message, warning } => {
-                        if cache_action.is_some() {
-                            self.cache.sync_from_snapshot(&self.snapshot);
-                        }
-                        self.log(true, &message);
-                        self.log_warn(&warning);
-                        self.on_power_action_ok(id);
+                        self.finish_mutation_ok(kind, message, Some(warning));
                     }
-                    Outcome::Warning(msg) => {
-                        self.log_warn(&msg);
-                    }
+                    Outcome::Warning(msg) => self.log_warn(&msg),
                     Outcome::Err(msg) => {
-                        if matches!(cache_action, Some(CachePendingAction::Save(_))) {
+                        if matches!(kind, Some(MutationKind::CacheSave)) {
                             self.cache.error = Some(msg.clone());
                         }
                         self.log(false, &msg);
-                        if self
-                            .power_action
-                            .is_some_and(|(power_id, _)| power_id == id)
-                        {
-                            self.power_action = None;
-                        }
                     }
                 }
             }
             BackendEvent::NotInstalled(id) => {
                 if let Some(req_id) = id {
-                    if self.mutation == Some(req_id) {
-                        self.mutation = None;
-                    }
-                    if self
-                        .pending_cache_action
-                        .is_some_and(|act| act.request_id() == req_id)
-                    {
-                        self.pending_cache_action = None;
-                    }
-                    if self
-                        .power_action
-                        .is_some_and(|(power_id, _)| power_id == req_id)
-                    {
-                        self.power_action = None;
-                    }
+                    let _ = self.take_matching_inflight(req_id);
                 }
                 self.phase = Phase::NotInstalled;
                 self.modal = None;
-                #[cfg(windows)]
-                if !self.initial_trim_done {
-                    self.initial_trim_done = true;
-                    self.startup_trim_countdown = Some(2);
-                }
+                self.arm_startup_trim();
                 self.log(false, "UWF 功能未安装或未启用");
             }
             BackendEvent::Disconnected => {
@@ -337,14 +307,28 @@ impl UwfApp {
         }
     }
 
-    fn on_power_action_ok(&mut self, id: RequestId) {
-        let Some((power_id, power)) = self.power_action else {
-            return;
-        };
-        if power_id != id {
-            return;
+    fn finish_mutation_ok(
+        &mut self,
+        kind: Option<MutationKind>,
+        message: String,
+        warning: Option<String>,
+    ) {
+        if matches!(
+            kind,
+            Some(MutationKind::CacheSave | MutationKind::CacheResetSync)
+        ) {
+            self.cache.sync_from_snapshot(&self.snapshot);
         }
-        self.power_action = None;
+        self.log(true, &message);
+        if let Some(warning) = warning {
+            self.log_warn(&warning);
+        }
+        if let Some(MutationKind::Power(power)) = kind {
+            self.on_power_action_ok(power);
+        }
+    }
+
+    fn on_power_action_ok(&mut self, power: PowerAction) {
         match (power, self.backend_kind) {
             (PowerAction::Restart, BackendKind::Mock) => {
                 self.log(true, "（模拟）已重启：下次会话配置已生效");
@@ -494,13 +478,14 @@ impl UwfApp {
         match self.cache.validate(&self.snapshot) {
             Ok((max_mb, warning_mb, critical_mb)) => {
                 self.cache.error = None;
-                if let Some(id) = self.begin_mutation(BackendCmd::SetOverlayCache {
-                    max_mb,
-                    warning_mb,
-                    critical_mb,
-                }) {
-                    self.pending_cache_action = Some(CachePendingAction::Save(id));
-                }
+                let _ = self.begin_tracked_mutation(
+                    BackendCmd::SetOverlayCache {
+                        max_mb,
+                        warning_mb,
+                        critical_mb,
+                    },
+                    MutationKind::CacheSave,
+                );
             }
             Err(msg) => {
                 self.cache.error = Some(msg.clone());
@@ -722,9 +707,16 @@ impl UwfApp {
         action: InputAction,
         text: &str,
     ) -> std::result::Result<(), String> {
-        let Some(fs) = self.snapshot.filter_state else {
+        if matches!(
+            action,
+            InputAction::AddFileExclusion | InputAction::AddRegistryExclusion
+        ) {
             return Ok(());
-        };
+        }
+        let fs = self
+            .snapshot
+            .filter_state
+            .ok_or_else(|| "UWF 状态尚未加载完成，无法执行提交固化操作".to_string())?;
         match action {
             InputAction::AddFileExclusion | InputAction::AddRegistryExclusion => Ok(()),
             InputAction::CommitFile | InputAction::CommitFileDeletion => {
@@ -787,19 +779,22 @@ impl UwfApp {
     pub fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
             ConfirmAction::ResetSettings => {
-                if let Some(id) = self.begin_mutation(BackendCmd::ResetSettings) {
-                    self.pending_cache_action = Some(CachePendingAction::ResetSync(id));
-                }
+                let _ = self.begin_tracked_mutation(
+                    BackendCmd::ResetSettings,
+                    MutationKind::CacheResetSync,
+                );
             }
             ConfirmAction::Restart => {
-                if let Some(id) = self.begin_mutation(BackendCmd::RestartSystem) {
-                    self.power_action = Some((id, PowerAction::Restart));
-                }
+                let _ = self.begin_tracked_mutation(
+                    BackendCmd::RestartSystem,
+                    MutationKind::Power(PowerAction::Restart),
+                );
             }
             ConfirmAction::Shutdown => {
-                if let Some(id) = self.begin_mutation(BackendCmd::ShutdownSystem) {
-                    self.power_action = Some((id, PowerAction::Shutdown));
-                }
+                let _ = self.begin_tracked_mutation(
+                    BackendCmd::ShutdownSystem,
+                    MutationKind::Power(PowerAction::Shutdown),
+                );
             }
             ConfirmAction::CommitFileDeletion(path) => {
                 let _ = self.begin_mutation(BackendCmd::CommitFileDeletion(

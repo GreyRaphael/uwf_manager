@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::error::{Result, UwfError};
 use crate::model::*;
 
-use super::UwfBackend;
+use super::{FullSnapshot, UwfBackend};
 
 struct MockVolume {
     letter: String,
@@ -119,20 +119,48 @@ impl MockUwfBackend {
         }
     }
 
-    fn ensure_volume_commit_ready(&self, drive_letter: &str, what: &'static str) -> Result<()> {
-        if !self.filter_current {
-            return Err(UwfError::FilterNotCurrentlyEnabled { what });
-        }
-        let upper = drive_letter.to_ascii_uppercase();
-        let vol = self
-            .volumes
+    fn volume_infos(&self) -> Vec<VolumeInfo> {
+        self.volumes
             .iter()
-            .find(|v| v.letter == upper)
-            .ok_or_else(|| UwfError::VolumeNotFound(drive_letter.into()))?;
-        if !vol.current {
-            return Err(UwfError::VolumeNotProtected(vol.letter.clone()));
+            .map(|v| VolumeInfo {
+                drive_letter: v.letter.clone(),
+                current_protected: v.current,
+                next_protected: v.next,
+            })
+            .collect()
+    }
+
+    fn overlay_config(&self, current_session: bool) -> OverlayConfig {
+        if current_session {
+            OverlayConfig {
+                overlay_type: self.overlay_type_current,
+                max_size_mb: self.max_size_current,
+            }
+        } else {
+            OverlayConfig {
+                overlay_type: self.overlay_type_next,
+                max_size_mb: self.max_size_next,
+            }
         }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_overlay_config(&self, current_session: bool) -> OverlayConfig {
+        self.overlay_config(current_session)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_volumes(&self) -> Vec<VolumeInfo> {
+        self.volume_infos()
+    }
+
+    fn ensure_volume_commit_ready(&self, drive_letter: &str, what: &'static str) -> Result<()> {
+        super::validate_volume_commit_ready(
+            &self.volume_infos(),
+            self.filter_current,
+            drive_letter,
+            what,
+        )
     }
 }
 
@@ -186,20 +214,6 @@ impl UwfBackend for MockUwfBackend {
         Ok(())
     }
 
-    fn get_overlay_config(&mut self, current_session: bool) -> Result<OverlayConfig> {
-        Ok(if current_session {
-            OverlayConfig {
-                overlay_type: self.overlay_type_current,
-                max_size_mb: self.max_size_current,
-            }
-        } else {
-            OverlayConfig {
-                overlay_type: self.overlay_type_next,
-                max_size_mb: self.max_size_next,
-            }
-        })
-    }
-
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
         #[cfg(test)]
         let consumption_mb = self
@@ -247,18 +261,6 @@ impl UwfBackend for MockUwfBackend {
         Ok(())
     }
 
-    fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
-        Ok(self
-            .volumes
-            .iter()
-            .map(|v| VolumeInfo {
-                drive_letter: v.letter.clone(),
-                current_protected: v.current,
-                next_protected: v.next,
-            })
-            .collect())
-    }
-
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()> {
         // R2：只改下次会话侧
         self.find_volume_mut(drive_letter)?.next = true;
@@ -279,12 +281,16 @@ impl UwfBackend for MockUwfBackend {
         self.ensure_volume_commit_ready(drive_letter, "文件删除固化")
     }
 
-    fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>> {
-        Ok(if current_session {
+    fn get_file_exclusions(
+        &mut self,
+        current_session: bool,
+    ) -> Result<(Vec<FileExclusion>, Vec<String>)> {
+        let items = if current_session {
             self.file_excl_current.clone()
         } else {
             self.file_excl_next.clone()
-        })
+        };
+        Ok((items, Vec::new()))
     }
 
     fn add_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()> {
@@ -329,16 +335,27 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn commit_registry(&mut self, _key: &str, _value_name: &str) -> Result<()> {
-        if !self.filter_current {
-            return Err(UwfError::FilterNotCurrentlyEnabled {
-                what: "注册表提交"
-            });
-        }
-        Ok(())
+        super::validate_filter_commit_ready(self.filter_current, "注册表提交")
     }
 
     fn get_os_version(&mut self) -> Option<String> {
         Some("Windows 10 Enterprise LTSC 2021 16G".to_string())
+    }
+
+    fn collect_snapshot(&mut self) -> Result<FullSnapshot> {
+        Ok(FullSnapshot {
+            filter_state: Some(self.get_filter_state()?),
+            overlay_config_current: Some(self.overlay_config(true)),
+            overlay_config_next: Some(self.overlay_config(false)),
+            overlay_runtime: Some(self.get_overlay_runtime()?),
+            volumes: self.volume_infos(),
+            file_exclusions_current: self.file_excl_current.clone(),
+            file_exclusions_next: self.file_excl_next.clone(),
+            registry_exclusions_current: self.reg_excl_current.clone(),
+            registry_exclusions_next: self.reg_excl_next.clone(),
+            os_version: self.get_os_version(),
+            warnings: Vec::new(),
+        })
     }
 }
 
@@ -369,7 +386,7 @@ mod tests {
         b.restart_system().unwrap(); // 模拟重启后 current=disabled
         b.set_overlay_type(OverlayType::Disk).unwrap();
         b.set_overlay_max_size(4096).unwrap();
-        let next = b.get_overlay_config(false).unwrap();
+        let next = b.get_overlay_config(false);
         assert_eq!(next.overlay_type, OverlayType::Disk);
         assert_eq!(next.max_size_mb, 4096);
     }
@@ -378,13 +395,13 @@ mod tests {
     fn r2_protect_only_changes_next_session() {
         let mut b = MockUwfBackend::demo();
         b.protect_volume("D:").unwrap();
-        let volumes = b.list_volumes().unwrap();
+        let volumes = b.list_volumes();
         let d = volumes.iter().find(|v| v.drive_letter == "D:").unwrap();
         assert!(!d.current_protected);
         assert!(d.next_protected);
         // 重启后生效
         b.restart_system().unwrap();
-        let volumes = b.list_volumes().unwrap();
+        let volumes = b.list_volumes();
         let d = volumes.iter().find(|v| v.drive_letter == "D:").unwrap();
         assert!(d.current_protected);
         // 未知卷报错
@@ -398,12 +415,12 @@ mod tests {
     fn r4_exclusion_mutation_only_changes_next_session() {
         let mut b = MockUwfBackend::demo();
         b.add_file_exclusion("D:", "\\data\\cache").unwrap();
-        assert!(b.get_file_exclusions(true).unwrap().is_empty());
-        let next = b.get_file_exclusions(false).unwrap();
+        assert!(b.get_file_exclusions(true).unwrap().0.is_empty());
+        let (next, _) = b.get_file_exclusions(false).unwrap();
         assert!(next.iter().any(|e| e.display() == "D:\\data\\cache"));
         // 去重
         b.add_file_exclusion("D:", "\\data\\cache").unwrap();
-        assert_eq!(b.get_file_exclusions(false).unwrap().len(), 2);
+        assert_eq!(b.get_file_exclusions(false).unwrap().0.len(), 2);
         // 注册表排除同理
         b.add_registry_exclusion("HKLM\\SOFTWARE\\X").unwrap();
         assert!(b.get_registry_exclusions(true).unwrap().is_empty());

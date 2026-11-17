@@ -26,8 +26,7 @@ pub trait UwfBackend: 'static {
     fn shutdown_system(&mut self) -> Result<()>;
 
     // ── Overlay ──
-    fn get_overlay_config(&mut self, current_session: bool) -> Result<OverlayConfig>;
-    /// 2 秒轮询目标
+    /// 后台轮询目标
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime>;
     /// R1：筛选器"当前已启用"时必须拒绝并返回 [`UwfError::FilterCurrentlyEnabled`]
     fn set_overlay_type(&mut self, overlay_type: OverlayType) -> Result<()>;
@@ -37,8 +36,6 @@ pub trait UwfBackend: 'static {
     fn set_critical_threshold(&mut self, size_mb: u32) -> Result<()>;
 
     // ── Volume ──
-    /// R2：合并 current/next 两次查询（按盘符）
-    fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>>;
     /// R2：作用于"下次会话"实例
     fn protect_volume(&mut self, drive_letter: &str) -> Result<()>;
     fn unprotect_volume(&mut self, drive_letter: &str) -> Result<()>;
@@ -49,7 +46,11 @@ pub trait UwfBackend: 'static {
     fn commit_file_deletion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()>;
 
     // ── Exclusion ──
-    fn get_file_exclusions(&mut self, current_session: bool) -> Result<Vec<FileExclusion>>;
+    /// 返回指定会话的文件排除项及读取期间产生的非致命警告。
+    fn get_file_exclusions(
+        &mut self,
+        current_session: bool,
+    ) -> Result<(Vec<FileExclusion>, Vec<String>)>;
     /// R4：增删作用于"下次会话"实例
     fn add_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()>;
     fn remove_file_exclusion(&mut self, drive_letter: &str, file_rel_path: &str) -> Result<()>;
@@ -59,35 +60,13 @@ pub trait UwfBackend: 'static {
     /// R5：当前会话实例；key/value 由后端线程按最后一个 `\` 拆分后传入
     fn commit_registry(&mut self, key: &str, value_name: &str) -> Result<()>;
 
-    /// P1-6：取出本次快照期间累积的非致命警告（默认无）。
-    fn take_warnings(&mut self) -> Vec<String> {
-        Vec::new()
-    }
-
     /// 读取当前操作系统版本名称（如 `Windows 10 Enterprise LTSC 2021 16G`）。
     fn get_os_version(&mut self) -> Option<String> {
         None
     }
 
-    /// 采集完整状态快照。
-    ///
-    /// 默认按接口逐项查询；`WindowsWmiBackend` 会覆盖此方法，在单次快照周期内合并
-    /// `UWF_Volume` / `UWF_OverlayConfig` / `UWF_RegistryFilter` 查询，减少 WMI 往返。
-    fn collect_snapshot(&mut self) -> Result<FullSnapshot> {
-        Ok(FullSnapshot {
-            filter_state: Some(self.get_filter_state()?),
-            overlay_config_current: Some(self.get_overlay_config(true)?),
-            overlay_config_next: Some(self.get_overlay_config(false)?),
-            overlay_runtime: Some(self.get_overlay_runtime()?),
-            volumes: self.list_volumes()?,
-            file_exclusions_current: self.get_file_exclusions(true)?,
-            file_exclusions_next: self.get_file_exclusions(false)?,
-            registry_exclusions_current: self.get_registry_exclusions(true)?,
-            registry_exclusions_next: self.get_registry_exclusions(false)?,
-            os_version: self.get_os_version(),
-            warnings: self.take_warnings(),
-        })
-    }
+    /// 采集完整状态快照（Windows 后端合并同类 WMI 查询以减少往返）。
+    fn collect_snapshot(&mut self) -> Result<FullSnapshot>;
 }
 
 /// 全量状态快照（`RefreshAll` 回包）
@@ -196,7 +175,7 @@ pub enum BackendEvent {
     Disconnected,
 }
 
-/// 后端来源标识（标题栏徽标）
+/// 后端来源标识（用于区分真实重启退出与 Mock 重启模拟）
 // Windows 变体仅 Windows 构建构造；Linux 下视为保留变体
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

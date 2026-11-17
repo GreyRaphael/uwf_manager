@@ -16,21 +16,21 @@ mod ui;
 #[cfg(windows)]
 mod win_platform;
 
+use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::Context as _;
 use backend::{BackendCommand, create_backend_factory, spawn_backend_thread_with_wake};
 use eframe::egui;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
             "UWF 管理器 v{}\n用法: uwf_manager [--mock]\n  --mock  使用内置模拟数据运行界面预览（跳过系统 WMI）",
             env!("CARGO_PKG_VERSION")
         );
-        return Ok(());
+        return ExitCode::SUCCESS;
     }
 
     let force_mock = args.iter().any(|arg| arg == "--mock");
@@ -104,10 +104,10 @@ fn main() -> anyhow::Result<()> {
     if let Err(err) = gui_result {
         let msg = format!("无法启动桌面图形界面：{err}\n\n请检查显示环境或显卡驱动状态。");
         show_fatal_dialog("界面启动失败", &msg);
-        return Err(anyhow::anyhow!("{err}")).context("图形界面运行失败");
+        return ExitCode::FAILURE;
     }
 
-    Ok(())
+    ExitCode::SUCCESS
 }
 
 /// 从内嵌 `icon.ico` 解析窗口运行时图标（仅非 Windows 与单元测试使用；Windows 直接复用 PE `.rc` 资源）。

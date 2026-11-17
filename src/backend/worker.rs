@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Result, UwfError};
 use crate::model::OverlayRuntime;
 
-use super::logic::{
-    ExclusionRevertPlan, plan_exclusion_revert, split_absolute_path, split_registry_path,
-};
+use super::logic::{plan_exclusion_revert, split_absolute_path, split_registry_path};
 use super::protocol::{
     BackendCmd, BackendCommand, BackendEvent, BackendFactory, Outcome, RequestId, UwfBackend,
 };
@@ -37,16 +35,16 @@ impl BackendHandle {
     }
 }
 
-struct DisconnectGuard<E: From<BackendEvent>> {
-    tx: Sender<E>,
-    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+struct DisconnectGuard {
+    tx: Sender<BackendEvent>,
+    wake: Arc<dyn Fn() + Send + Sync>,
     clean_quit: bool,
 }
 
-impl<E: From<BackendEvent>> Drop for DisconnectGuard<E> {
+impl Drop for DisconnectGuard {
     fn drop(&mut self) {
         if !self.clean_quit {
-            let _ = self.tx.send(E::from(BackendEvent::Disconnected));
+            let _ = self.tx.send(BackendEvent::Disconnected);
             (self.wake)();
         }
     }
@@ -106,14 +104,13 @@ impl PollState {
 /// 本线程建立），顺序执行命令并在筛选器开启且窗口未最小化时在后台执行 2 秒轮询，
 /// 仅当用量变化时推送事件并唤醒 UI，`Quit` 退出。若意外退出（如 panic），`Drop` 哨兵立即发送
 /// [`BackendEvent::Disconnected`] 并唤醒 UI。
-pub fn spawn_backend_thread_with_wake<E, W>(
+pub fn spawn_backend_thread_with_wake<W>(
     factory: BackendFactory,
     rx: Receiver<BackendCommand>,
-    tx: Sender<E>,
+    tx: Sender<BackendEvent>,
     wake: W,
 ) -> BackendHandle
 where
-    E: From<BackendEvent> + Send + 'static,
     W: Fn() + Send + Sync + 'static,
 {
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
@@ -137,20 +134,17 @@ where
     }
 }
 
-pub(super) fn run_worker_loop<E>(
+pub(super) fn run_worker_loop(
     backend: &mut dyn UwfBackend,
     rx: &Receiver<BackendCommand>,
-    tx: &Sender<E>,
+    tx: &Sender<BackendEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     poll_interval: Duration,
-) -> bool
-where
-    E: From<BackendEvent>,
-{
+) -> bool {
     let state = RefCell::new(PollState::default());
     let emit = |evt: BackendEvent| {
         state.borrow_mut().observe_event(&evt, poll_interval);
-        let _ = tx.send(E::from(evt));
+        let _ = tx.send(evt);
         (wake)();
     };
     if let Some(ver) = backend.get_os_version() {
@@ -470,6 +464,50 @@ fn mutate_with(
     }
 }
 
+#[derive(Default)]
+struct BatchCounter {
+    ok: usize,
+    failed: usize,
+    first_err: Option<String>,
+}
+
+impl BatchCounter {
+    fn record(&mut self, res: Result<()>) {
+        match res {
+            Ok(()) => self.ok += 1,
+            Err(e) => {
+                self.failed += 1;
+                if self.first_err.is_none() {
+                    self.first_err = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn err_detail(&self) -> String {
+        self.first_err
+            .as_deref()
+            .map(|e| format!("（首个错误：{e}）"))
+            .unwrap_or_default()
+    }
+
+    fn into_outcome(
+        self,
+        empty_msg: &str,
+        ok_msg: impl FnOnce(usize) -> String,
+        partial_msg: impl FnOnce(usize, usize) -> String,
+        fail_msg: impl FnOnce(usize) -> String,
+    ) -> Outcome {
+        let err_detail = self.err_detail();
+        match (self.ok, self.failed) {
+            (0, 0) => Outcome::Ok(empty_msg.to_string()),
+            (0, n) => Outcome::Err(format!("{}{err_detail}", fail_msg(n))),
+            (n, 0) => Outcome::Ok(ok_msg(n)),
+            (n, m) => Outcome::Warning(format!("{}{err_detail}", partial_msg(n, m))),
+        }
+    }
+}
+
 /// 导入排除列表（原版 button_import_list_Click 语义）：
 /// 仅支持 UTF-8（含可选 UTF-8 BOM）；`HK` 开头（不区分大小写）→ 注册表排除，其余 → 文件排除。
 pub(super) fn import_exclusions(
@@ -478,52 +516,33 @@ pub(super) fn import_exclusions(
     emit: &dyn Fn(BackendEvent),
     path: &Path,
 ) {
-    let result = (|| -> Result<(usize, usize, Option<String>)> {
+    let result = (|| -> Result<BatchCounter> {
         // 明确只支持 UTF-8；非 UTF-8 给出可操作的中文错误，而不是底层 IO 报错。
         let bytes = std::fs::read(path)?;
         let content = String::from_utf8(bytes)
             .map_err(|_| UwfError::InvalidPath("导入文件须为 UTF-8 编码".into()))?;
         let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-        let mut ok = 0;
-        let mut failed = 0;
-        let mut first_err = None;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        let mut stats = BatchCounter::default();
+        for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
             let r = if line.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("HK")) {
                 backend.add_registry_exclusion(line)
             } else {
                 split_absolute_path(line)
                     .and_then(|(drive, rel)| backend.add_file_exclusion(&drive, &rel))
             };
-            match r {
-                Ok(()) => ok += 1,
-                Err(e) => {
-                    failed += 1;
-                    if first_err.is_none() {
-                        first_err = Some(e.to_string());
-                    }
-                }
-            }
+            stats.record(r);
         }
-        Ok((ok, failed, first_err))
+        Ok(stats)
     })();
     match result {
-        Ok((ok, failed, first_err)) => {
-            let err_detail = first_err
-                .map(|e| format!("（首个错误：{e}）"))
-                .unwrap_or_default();
-            let base = match (ok, failed) {
-                (0, 0) => Outcome::Ok("导入完成：文件为空".to_string()),
-                (0, n) => Outcome::Err(format!("导入失败：{n} 项均未成功{err_detail}")),
-                (n, 0) => Outcome::Ok(format!("导入完成：成功 {n} 项")),
-                (n, m) => {
-                    Outcome::Warning(format!("导入完成：成功 {n} 项，失败 {m} 项{err_detail}"))
-                }
-            };
-            finish_with_refresh(id, backend, emit, base);
+        Ok(stats) => {
+            let outcome = stats.into_outcome(
+                "导入完成：文件为空",
+                |n| format!("导入完成：成功 {n} 项"),
+                |n, m| format!("导入完成：成功 {n} 项，失败 {m} 项"),
+                |n| format!("导入失败：{n} 项均未成功"),
+            );
+            finish_with_refresh(id, backend, emit, outcome);
         }
         Err(e) => send_mutation_err(emit, id, e),
     }
@@ -535,26 +554,19 @@ fn revert_exclusions_to_current(
     backend: &mut dyn UwfBackend,
     emit: &dyn Fn(BackendEvent),
 ) {
-    let plan = (|| -> Result<ExclusionRevertPlan> {
-        let files_current = backend.get_file_exclusions(true)?;
-        let files_next = backend.get_file_exclusions(false)?;
-        let regs_current = backend.get_registry_exclusions(true)?;
-        let regs_next = backend.get_registry_exclusions(false)?;
-        Ok(plan_exclusion_revert(
-            &files_current,
-            &files_next,
-            &regs_current,
-            &regs_next,
-        ))
-    })();
-
-    let plan = match plan {
-        Ok(p) => p,
+    let snap = match backend.collect_snapshot() {
+        Ok(s) => s,
         Err(e) => {
             send_mutation_err(emit, id, e);
             return;
         }
     };
+    let plan = plan_exclusion_revert(
+        &snap.file_exclusions_current,
+        &snap.file_exclusions_next,
+        &snap.registry_exclusions_current,
+        &snap.registry_exclusions_next,
+    );
 
     if plan.is_empty() {
         finish_with_refresh(
@@ -566,51 +578,32 @@ fn revert_exclusions_to_current(
         return;
     }
 
-    let mut ok = 0usize;
-    let mut failed = 0usize;
-    let mut first_err: Option<String> = None;
-
-    let mut track = |res: Result<()>| match res {
-        Ok(()) => ok += 1,
-        Err(e) => {
-            failed += 1;
-            if first_err.is_none() {
-                first_err = Some(e.to_string());
-            }
-        }
-    };
-
+    let mut stats = BatchCounter::default();
     for file in &plan.files_to_remove {
-        track(backend.remove_file_exclusion(&file.drive_letter, &file.file_rel_path));
+        stats.record(backend.remove_file_exclusion(&file.drive_letter, &file.file_rel_path));
     }
     for key in &plan.regs_to_remove {
-        track(backend.remove_registry_exclusion(key));
+        stats.record(backend.remove_registry_exclusion(key));
     }
     for file in &plan.files_to_add {
-        track(backend.add_file_exclusion(&file.drive_letter, &file.file_rel_path));
+        stats.record(backend.add_file_exclusion(&file.drive_letter, &file.file_rel_path));
     }
     for key in &plan.regs_to_add {
-        track(backend.add_registry_exclusion(key));
+        stats.record(backend.add_registry_exclusion(key));
     }
 
-    let err_detail = first_err
-        .map(|e| format!("（首个错误：{e}）"))
-        .unwrap_or_default();
-    let outcome = if failed == 0 {
-        Outcome::Ok(format!(
-            "已撤销排除项修改（移除 {} 项，恢复 {} 项），重启后列表已与当前生效一致",
-            plan.remove_count(),
-            plan.add_count()
-        ))
-    } else if ok == 0 {
-        Outcome::Err(format!(
-            "撤销排除项修改失败：{failed} 项均未成功{err_detail}"
-        ))
-    } else {
-        Outcome::Warning(format!(
-            "已部分撤销排除项修改：成功 {ok} 项，失败 {failed} 项{err_detail}"
-        ))
-    };
+    let remove_count = plan.remove_count();
+    let add_count = plan.add_count();
+    let outcome = stats.into_outcome(
+        "重启后排除项已与当前生效一致，无需撤销",
+        |_| {
+            format!(
+                "已撤销排除项修改（移除 {remove_count} 项，恢复 {add_count} 项），重启后列表已与当前生效一致"
+            )
+        },
+        |ok, failed| format!("已部分撤销排除项修改：成功 {ok} 项，失败 {failed} 项"),
+        |failed| format!("撤销排除项修改失败：{failed} 项均未成功"),
+    );
     finish_with_refresh(id, backend, emit, outcome);
 }
 
@@ -653,9 +646,8 @@ pub(super) fn export_exclusions(
 ) {
     let result = (|| -> Result<(usize, PathBuf, Vec<String>)> {
         // 排除列表与配置保持一致，统一导出下次会话（重启后生效）的持久规则
-        let files = backend.get_file_exclusions(false)?;
+        let (files, warnings) = backend.get_file_exclusions(false)?;
         let registry = backend.get_registry_exclusions(false)?;
-        let warnings = backend.take_warnings();
         let mut lines: Vec<String> = files.iter().map(|e| e.display()).collect();
         lines.extend(registry);
         // 空列表导出 0 字节，不写一个只有换行符的文件。

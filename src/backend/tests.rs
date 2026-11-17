@@ -88,9 +88,9 @@ fn import_export_roundtrip_with_mock() {
     }
     assert_eq!((ok, failed), (3, 1));
     // 全部写入 next 侧（R4），current 侧不受影响
-    assert!(mock.get_file_exclusions(true).unwrap().is_empty());
+    assert!(mock.get_file_exclusions(true).unwrap().0.is_empty());
     // 预置 1 条（与导入首行重复被去重）+ 实际新增 1 条 = 2
-    assert_eq!(mock.get_file_exclusions(false).unwrap().len(), 2);
+    assert_eq!(mock.get_file_exclusions(false).unwrap().0.len(), 2);
     // 预置 1 + 导入 1
     assert_eq!(mock.get_registry_exclusions(false).unwrap().len(), 2);
 
@@ -201,6 +201,7 @@ fn import_strips_utf8_bom_and_export_empty_is_zero_bytes() {
         backend
             .get_file_exclusions(false)
             .unwrap()
+            .0
             .iter()
             .any(|e| e.display() == "C:\\Windows\\Bom")
     );
@@ -345,9 +346,6 @@ impl UwfBackend for StubWarningOrNotInstalled {
     fn shutdown_system(&mut self) -> Result<()> {
         Ok(())
     }
-    fn get_overlay_config(&mut self, _: bool) -> Result<OverlayConfig> {
-        Err(UwfError::NotInstalled)
-    }
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
         Err(UwfError::NotInstalled)
     }
@@ -362,9 +360,6 @@ impl UwfBackend for StubWarningOrNotInstalled {
     }
     fn set_critical_threshold(&mut self, _: u32) -> Result<()> {
         Ok(())
-    }
-    fn list_volumes(&mut self) -> Result<Vec<VolumeInfo>> {
-        Ok(vec![])
     }
     fn protect_volume(&mut self, _: &str) -> Result<()> {
         Ok(())
@@ -381,11 +376,11 @@ impl UwfBackend for StubWarningOrNotInstalled {
             message: "wmi err".into(),
         })
     }
-    fn get_file_exclusions(&mut self, _: bool) -> Result<Vec<FileExclusion>> {
+    fn get_file_exclusions(&mut self, _: bool) -> Result<(Vec<FileExclusion>, Vec<String>)> {
         if self.not_installed {
             Err(UwfError::NotInstalled)
         } else {
-            Ok(vec![])
+            Ok((vec![], std::mem::take(&mut self.warnings)))
         }
     }
     fn add_file_exclusion(&mut self, _: &str, _: &str) -> Result<()> {
@@ -406,8 +401,8 @@ impl UwfBackend for StubWarningOrNotInstalled {
     fn commit_registry(&mut self, _: &str, _: &str) -> Result<()> {
         Ok(())
     }
-    fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
+    fn collect_snapshot(&mut self) -> Result<FullSnapshot> {
+        Err(UwfError::NotInstalled)
     }
 }
 
@@ -503,7 +498,7 @@ fn set_overlay_type_and_cache_respect_r1_lock() {
         finished_outcomes(&rx).as_slice(),
         [Outcome::Ok(msg)] if msg.contains("已锁定")
     ));
-    assert_eq!(backend.get_overlay_config(false).unwrap().max_size_mb, 2048);
+    assert_eq!(backend.get_overlay_config(false).max_size_mb, 2048);
     let rt = backend.get_overlay_runtime().unwrap();
     assert_eq!(
         (rt.warning_threshold_mb, rt.critical_threshold_mb),
@@ -813,8 +808,8 @@ fn revert_exclusions_to_current_restores_exact_current_set() {
         .unwrap();
 
     let plan = plan_exclusion_revert(
-        &backend.get_file_exclusions(true).unwrap(),
-        &backend.get_file_exclusions(false).unwrap(),
+        &backend.get_file_exclusions(true).unwrap().0,
+        &backend.get_file_exclusions(false).unwrap().0,
         &backend.get_registry_exclusions(true).unwrap(),
         &backend.get_registry_exclusions(false).unwrap(),
     );
@@ -835,8 +830,8 @@ fn revert_exclusions_to_current_restores_exact_current_set() {
         [Outcome::Ok(msg)] if msg.contains("移除 2 项") && msg.contains("恢复 2 项")
     ));
     assert_eq!(
-        backend.get_file_exclusions(false).unwrap(),
-        backend.get_file_exclusions(true).unwrap()
+        backend.get_file_exclusions(false).unwrap().0,
+        backend.get_file_exclusions(true).unwrap().0
     );
     assert_eq!(
         backend.get_registry_exclusions(false).unwrap(),

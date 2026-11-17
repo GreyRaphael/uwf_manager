@@ -254,13 +254,34 @@ pub fn measure_button_width(ui: &Ui, label: &str) -> f32 {
         + 4.0
 }
 
-/// 语义胶囊标签（状态/徽章/计数）。
-pub fn status_pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
+fn pill_frame(bg: Color32, margin: Margin) -> Frame {
     Frame::NONE
         .fill(bg)
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
+        .inner_margin(margin)
+}
+
+/// 语义胶囊标签（状态/徽章/计数）。
+pub fn status_pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
+    pill_frame(bg, Margin::symmetric(8, 2)).show(ui, |ui| {
+        ui.label(
+            RichText::new(text)
+                .font(FontId::proportional(11.5))
+                .color(fg)
+                .strong(),
+        );
+    });
+}
+
+/// 带矢量圆点的语义状态胶囊（避免依赖字库中的圆点字符）。
+pub fn status_dot_pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
+    pill_frame(bg, Margin::symmetric(8, 2)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                ui.painter().circle_filled(rect.center(), 3.0, fg);
+            }
             ui.label(
                 RichText::new(text)
                     .font(FontId::proportional(11.5))
@@ -268,6 +289,7 @@ pub fn status_pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
                     .strong(),
             );
         });
+    });
 }
 
 /// 双态（当前 / 重启后）布尔状态胶囊：待重启变更时琥珀高亮，否则按激活与否展示绿/灰胶囊。
@@ -394,8 +416,7 @@ pub fn usage_colors(level: UsageLevel) -> (Color32, Color32, &'static str) {
     }
 }
 
-/// 操作日志等级对应颜色。
-pub fn log_level_colors(level: LogLevel) -> (Color32, Color32) {
+fn log_level_colors(level: LogLevel) -> (Color32, Color32) {
     match level {
         LogLevel::Ok => (OK_FG, OK_BG),
         LogLevel::Warn => (WARN_FG, WARN_BG),
@@ -404,7 +425,7 @@ pub fn log_level_colors(level: LogLevel) -> (Color32, Color32) {
 }
 
 /// 用 `Painter` 绘制状态矢量图标（对钩/感叹三角/叉号），避免依赖 Segoe UI Symbol 额外字体。
-pub fn paint_status_icon(
+fn paint_status_icon(
     painter: &egui::Painter,
     center: egui::Pos2,
     size: f32,
@@ -455,39 +476,31 @@ pub fn paint_status_icon(
 /// 纯矢量日志等级徽章（替代字符 `✔`/`⚠`/`✖`）。
 pub fn log_status_badge(ui: &mut Ui, level: LogLevel) {
     let (fg, bg) = log_level_colors(level);
-    Frame::NONE
-        .fill(bg)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(6, 3))
-        .show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
-            if ui.is_rect_visible(rect) {
-                paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
-            }
-        });
+    pill_frame(bg, Margin::symmetric(6, 3)).show(ui, |ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
+        }
+    });
 }
 
 /// 带矢量图标的状态胶囊。
 pub fn icon_status_pill(ui: &mut Ui, level: LogLevel, text: &str, fg: Color32, bg: Color32) {
-    Frame::NONE
-        .fill(bg)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
-                if ui.is_rect_visible(rect) {
-                    paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
-                }
-                ui.label(
-                    RichText::new(text)
-                        .font(FontId::proportional(11.5))
-                        .color(fg)
-                        .strong(),
-                );
-            });
+    pill_frame(bg, Margin::symmetric(8, 2)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
+            }
+            ui.label(
+                RichText::new(text)
+                    .font(FontId::proportional(11.5))
+                    .color(fg)
+                    .strong(),
+            );
         });
+    });
 }
 
 /// 带矢量图标的状态提示文本（无底色胶囊背景）。

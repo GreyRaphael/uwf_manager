@@ -154,7 +154,7 @@ fn render_usage_section(ui: &mut egui::Ui, app: &UwfApp) {
                     .color(theme::TEXT_PRIMARY),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                theme::status_pill(ui, &format!("● {status_text} {percent}%"), fg, bg);
+                theme::status_dot_pill(ui, &format!("{status_text} {percent}%"), fg, bg);
                 ui.label(
                     RichText::new(format!("{} / {} MB", runtime.consumption_mb, max_size))
                         .font(FontId::proportional(12.0))
