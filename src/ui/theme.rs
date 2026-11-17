@@ -85,6 +85,8 @@ pub fn apply_theme(ctx: &egui::Context) {
         visuals.widgets.active.corner_radius = CornerRadius::same(6);
 
         visuals.striped = true;
+        // 关闭亚像素横向分桶，减少字形图集变体数量与内存占用（配合 1024 图集上限）
+        visuals.text_options.subpixel_binning = false;
 
         style.visuals = visuals;
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
@@ -100,7 +102,7 @@ pub fn card_frame() -> Frame {
         .fill(BG_CARD)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::symmetric(14, 11))
 }
 
 /// 弹窗卡片外框：白底、大圆角、柔和边框与内边距。
@@ -198,14 +200,33 @@ pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
     )
 }
 
-/// 统一风格下拉菜单按钮（次级描边风格与内边距）。
+/// 统一风格下拉菜单按钮（次级描边风格与内边距，内置矢量下拉箭头以避免字体缺字）。
 pub fn menu_button<R>(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui) -> R) {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = Vec2::new(11.0, 6.0);
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.weak_bg_fill = BG_SUBTLE;
         w.inactive.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
-        ui.menu_button(label, add_contents);
+        let chevron = egui::Atom::paint(Vec2::new(8.0, 8.0), |ui, args| {
+            let c = args.rect.center();
+            let color = if ui.is_enabled() {
+                TEXT_SECONDARY
+            } else {
+                TEXT_MUTED
+            };
+            let stroke = Stroke::new(1.4, color);
+            ui.painter().line_segment(
+                [egui::pos2(c.x - 3.0, c.y - 1.0), egui::pos2(c.x, c.y + 2.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(c.x, c.y + 2.0), egui::pos2(c.x + 3.0, c.y - 1.0)],
+                stroke,
+            );
+        });
+        let button = Button::new((RichText::new(label).color(TEXT_PRIMARY), chevron))
+            .min_size(Vec2::new(0.0, 28.0));
+        egui::containers::menu::MenuButton::from_button(button).ui(ui, add_contents);
     });
 }
 
@@ -373,13 +394,116 @@ pub fn usage_colors(level: UsageLevel) -> (Color32, Color32, &'static str) {
     }
 }
 
-/// 操作日志等级对应颜色与符号。
-pub fn log_badge(level: LogLevel) -> (&'static str, Color32, Color32) {
+/// 操作日志等级对应颜色。
+pub fn log_level_colors(level: LogLevel) -> (Color32, Color32) {
     match level {
-        LogLevel::Ok => ("✔", OK_FG, OK_BG),
-        LogLevel::Warn => ("⚠", WARN_FG, WARN_BG),
-        LogLevel::Err => ("✖", ERR_FG, ERR_BG),
+        LogLevel::Ok => (OK_FG, OK_BG),
+        LogLevel::Warn => (WARN_FG, WARN_BG),
+        LogLevel::Err => (ERR_FG, ERR_BG),
     }
+}
+
+/// 用 `Painter` 绘制状态矢量图标（对钩/感叹三角/叉号），避免依赖 Segoe UI Symbol 额外字体。
+pub fn paint_status_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    level: LogLevel,
+    color: Color32,
+) {
+    let r = size * 0.42;
+    let stroke = Stroke::new(1.5, color);
+    match level {
+        LogLevel::Ok => {
+            let p1 = center + Vec2::new(-r * 0.68, r * 0.05);
+            let p2 = center + Vec2::new(-r * 0.14, r * 0.58);
+            let p3 = center + Vec2::new(r * 0.72, -r * 0.52);
+            painter.line_segment([p1, p2], stroke);
+            painter.line_segment([p2, p3], stroke);
+        }
+        LogLevel::Warn => {
+            let top = center + Vec2::new(0.0, -r * 0.80);
+            let left = center + Vec2::new(-r * 0.86, r * 0.72);
+            let right = center + Vec2::new(r * 0.86, r * 0.72);
+            let tri_stroke = Stroke::new(1.25, color);
+            painter.line_segment([top, right], tri_stroke);
+            painter.line_segment([right, left], tri_stroke);
+            painter.line_segment([left, top], tri_stroke);
+            painter.line_segment(
+                [
+                    center + Vec2::new(0.0, -r * 0.28),
+                    center + Vec2::new(0.0, r * 0.22),
+                ],
+                tri_stroke,
+            );
+            painter.circle_filled(center + Vec2::new(0.0, r * 0.46), 0.9, color);
+        }
+        LogLevel::Err => {
+            let d = r * 0.58;
+            painter.line_segment(
+                [center + Vec2::new(-d, -d), center + Vec2::new(d, d)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(d, -d), center + Vec2::new(-d, d)],
+                stroke,
+            );
+        }
+    }
+}
+
+/// 纯矢量日志等级徽章（替代字符 `✔`/`⚠`/`✖`）。
+pub fn log_status_badge(ui: &mut Ui, level: LogLevel) {
+    let (fg, bg) = log_level_colors(level);
+    Frame::NONE
+        .fill(bg)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
+            }
+        });
+}
+
+/// 带矢量图标的状态胶囊。
+pub fn icon_status_pill(ui: &mut Ui, level: LogLevel, text: &str, fg: Color32, bg: Color32) {
+    Frame::NONE
+        .fill(bg)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+                if ui.is_rect_visible(rect) {
+                    paint_status_icon(ui.painter(), rect.center(), rect.width(), level, fg);
+                }
+                ui.label(
+                    RichText::new(text)
+                        .font(FontId::proportional(11.5))
+                        .color(fg)
+                        .strong(),
+                );
+            });
+        });
+}
+
+/// 带矢量图标的状态提示文本（无底色胶囊背景）。
+pub fn status_hint_with_icon(ui: &mut Ui, level: LogLevel, text: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            paint_status_icon(ui.painter(), rect.center(), rect.width(), level, color);
+        }
+        ui.label(
+            RichText::new(text)
+                .font(FontId::proportional(12.0))
+                .color(color),
+        );
+    });
 }
 
 /// Fluent 风格细进度条（避免文字压在填充交界处影响对比度）。

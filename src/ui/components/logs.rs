@@ -60,9 +60,8 @@ pub fn render(ctx: &egui::Context, app: &mut UwfApp) -> bool {
                                 return;
                             }
                             for entry in app.logs.iter().rev() {
-                                let (icon, fg, bg) = theme::log_badge(entry.level);
                                 ui.horizontal(|ui| {
-                                    theme::status_pill(ui, icon, fg, bg);
+                                    theme::log_status_badge(ui, entry.level);
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(format!(

@@ -32,6 +32,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
 
         ui.scope(|ui| {
             ui.style_mut().interaction.selectable_labels = false;
+            ui.spacing_mut().item_spacing.y = 4.0;
 
             let table_h = max_table_height.max(120.0);
             TableBuilder::new(ui)
@@ -39,13 +40,13 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 .striped(true)
                 .cell_layout(Layout::left_to_right(Align::Center))
                 .max_scroll_height(table_h)
-                .min_scrolled_height(100.0)
+                .min_scrolled_height(68.0)
                 .column(Column::initial(64.0).at_least(56.0))
                 .column(Column::remainder().at_least(150.0))
                 .column(Column::initial(84.0).at_least(76.0))
                 .column(Column::initial(142.0).at_least(132.0))
                 .column(Column::initial(92.0).at_least(84.0))
-                .header(28.0, |mut header| {
+                .header(24.0, |mut header| {
                     for title in ["分区", "保护效果说明", "当前状态", "开关", "重启后状态"]
                     {
                         header.col(|ui| {
@@ -60,7 +61,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut UwfApp, max_table_height: f32) {
                 })
                 .body(|body| {
                     let row_count = app.snapshot.volumes.len();
-                    body.rows(36.0, row_count, |mut row| {
+                    body.rows(30.0, row_count, |mut row| {
                         let vol = &app.snapshot.volumes[row.index()];
 
                         row.col(|ui| {

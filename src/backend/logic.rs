@@ -257,7 +257,7 @@ pub fn format_memory_gib(bytes: u64) -> Option<String> {
     }
 }
 
-/// 规范化 `Win32_OperatingSystem` 返回的系统版本与物理内存文本，例如 `Windows 10 Enterprise LTSC 2021 16G`。
+/// 规范化系统版本与物理内存文本，例如 `Windows 10 Enterprise LTSC 2021 16G`。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn format_os_version(caption: &str, build: Option<&str>, memory_bytes: Option<u64>) -> String {
     let mut base = caption
@@ -266,6 +266,15 @@ pub fn format_os_version(caption: &str, build: Option<&str>, memory_bytes: Optio
         .unwrap_or(caption.trim())
         .to_string();
     let build = build.map(str::trim).filter(|s| !s.is_empty());
+
+    // 注册表 ProductName 在 Windows 11 上仍常保留 "Windows 10 ..."，结合 Build 号（>= 22000）修正显示
+    if build
+        .and_then(|b| b.parse::<u32>().ok())
+        .is_some_and(|b| b >= 22000)
+        && let Some(rest) = base.strip_prefix("Windows 10")
+    {
+        base = format!("Windows 11{rest}");
+    }
 
     // Windows LTSC 的 Caption 常省略年份，结合 Build 号补齐以便一目了然辨识
     if base.contains("LTSC") {

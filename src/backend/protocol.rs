@@ -115,7 +115,8 @@ pub type RequestId = u64;
 #[derive(Debug)]
 pub enum BackendCommand {
     RefreshAll,
-    RefreshOverlayRuntime,
+    /// 暂停/恢复后台 Overlay 用量轮询（例如窗口最小化时暂停）
+    SetPollingPaused(bool),
     Mutate {
         id: RequestId,
         cmd: BackendCmd,

@@ -3,6 +3,7 @@ use crate::model::{FileExclusion, FilterState, OverlayConfig, OverlayRuntime, Vo
 use egui_kittest::{Harness, kittest::Queryable as _};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 #[derive(Clone, Default)]
 struct StubFileDialog {
@@ -213,25 +214,27 @@ fn power_action_not_armed_when_mutation_is_pending() {
 }
 
 #[test]
-fn not_installed_and_backend_lost_skip_overlay_poll() {
-    let (mut app, cmd_rx) = test_app(BackendKind::Mock);
-    app.send_overlay_refresh();
+fn minimize_restore_edges_toggle_polling_pause() {
+    let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
     assert!(cmd_rx.try_recv().is_err());
 
-    app.apply_event(BackendEvent::NotInstalled(None));
-    app.send_overlay_refresh();
+    app.sync_minimized_state(false);
     assert!(cmd_rx.try_recv().is_err());
 
-    app.apply_event(BackendEvent::Snapshot(demo_snapshot()));
-    app.send_overlay_refresh();
+    app.sync_minimized_state(true);
     assert!(matches!(
         cmd_rx.try_recv(),
-        Ok(BackendCommand::RefreshOverlayRuntime)
+        Ok(BackendCommand::SetPollingPaused(true))
     ));
-
-    app.apply_event(BackendEvent::Disconnected);
-    app.send_overlay_refresh();
+    // 重复最小化状态不重复发命令
+    app.sync_minimized_state(true);
     assert!(cmd_rx.try_recv().is_err());
+
+    app.sync_minimized_state(false);
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(BackendCommand::SetPollingPaused(false))
+    ));
 }
 
 #[test]
@@ -770,7 +773,7 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
     );
 
     assert!(harness.query_by_label("当前设置已全部生效").is_none());
-    assert!(harness.query_by_label("⚠ 待重启生效").is_some());
+    assert!(harness.query_by_label("需重启生效").is_some());
     assert!(harness.query_by_label("立即重启生效…").is_some());
 
     // 4. 保护缓存细进度条上方显示用量与阈值百分比提示，总开关与分区表均显示 3 列状态，每行支持直觉移除排除项
@@ -834,8 +837,8 @@ fn gui_top_bar_os_panel_exclusions_and_revert() {
         outcome: Outcome::Ok("已撤销排除项修改".into()),
     });
     harness.run();
-    assert!(harness.query_by_label("⚠ 待重启生效").is_none());
-    assert!(harness.query_by_label("✔ 当前设置已全部生效").is_some());
+    assert!(harness.query_by_label("需重启生效").is_none());
+    assert!(harness.query_by_label("当前设置已全部生效").is_some());
     assert_eq!(harness.query_all_by_label("待重启生效").count(), 0);
 
     // 5. 测试总开关其余三种状态组合及点击「立即重启生效…」弹出重启确认对话框
@@ -927,11 +930,11 @@ fn raw_input_hook_clamps_max_texture_side() {
     assert_eq!(large.max_texture_side, Some(MAX_FONT_ATLAS_SIDE));
 
     let mut small = egui::RawInput {
-        max_texture_side: Some(1024),
+        max_texture_side: Some(512),
         ..Default::default()
     };
     app.raw_input_hook(&ctx, &mut small);
-    assert_eq!(small.max_texture_side, Some(1024));
+    assert_eq!(small.max_texture_side, Some(512));
 
     let mut none = egui::RawInput::default();
     app.raw_input_hook(&ctx, &mut none);
@@ -957,18 +960,19 @@ fn snapshot_cache_updates_rows_plan_and_reasons() {
 }
 
 #[test]
-fn minimized_window_skips_overlay_poll_and_idle_repaint() {
+fn idle_ready_ui_requests_no_periodic_repaints() {
     let (mut app, cmd_rx) = ready_app(BackendKind::Mock);
     let ctx = egui::Context::default();
     // 消耗 egui Context 初始化的默认首帧重绘配额
     for _ in 0..2 {
-        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.sync_minimized_state(ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false)));
+        });
         out.textures_delta.clear();
     }
 
-    app.last_overlay_tick = Instant::now() - Duration::from_secs(3);
     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-        app.tick_overlay_poll(ui.ctx(), true);
+        app.sync_minimized_state(ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false)));
     });
     out.textures_delta.clear();
     assert!(cmd_rx.try_recv().is_err());
@@ -976,27 +980,44 @@ fn minimized_window_skips_overlay_poll_and_idle_repaint() {
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
         Duration::MAX
     );
+}
 
-    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-        app.tick_overlay_poll(ui.ctx(), false);
-    });
-    out.textures_delta.clear();
-    assert!(matches!(
-        cmd_rx.try_recv(),
-        Ok(BackendCommand::RefreshOverlayRuntime)
-    ));
-    assert_eq!(
-        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
-        OVERLAY_POLL
+#[test]
+fn gui_left_rail_and_six_volumes_fit_without_vertical_overflow() {
+    let mut snap = demo_snapshot();
+    snap.volumes = ['C', 'D', 'E', 'F', 'G', 'H']
+        .into_iter()
+        .map(|letter| VolumeInfo {
+            drive_letter: format!("{letter}:"),
+            current_protected: letter == 'C',
+            next_protected: letter == 'C',
+        })
+        .collect();
+    snap.os_version = Some("Windows 10 Enterprise LTSC 2021 16G".into());
+
+    let (harness, _event_tx, _cmd_rx) =
+        build_gui_harness(BackendKind::Mock, StubFileDialog::default(), Some(snap));
+
+    // 左栏所有卡片内容在 780px 高度下应完整容纳于 OS 卡片上方，不应出现裁剪溢出
+    let apply_btn_rect = harness.get_by_label("应用缓存设置").rect();
+    let os_heading_rect = harness.get_by_label("系统环境").rect();
+    assert!(
+        apply_btn_rect.max.y + 11.0 <= os_heading_rect.min.y - 19.0,
+        "左栏卡片底部应完全位于 OS 卡片上方而无需滚动条: apply_btn={apply_btn_rect:?}, os_heading={os_heading_rect:?}"
     );
 
-    // 紧接着同一周期内不再以 500ms 空转，而是等待剩余 ~2s
-    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-        app.tick_overlay_poll(ui.ctx(), false);
-    });
-    out.textures_delta.clear();
-    assert!(cmd_rx.try_recv().is_err());
+    // 6 个磁盘分区在「受保护磁盘分区」表格内紧凑排布，均可见且行距约 34px
+    let c_rect = harness.get_by_label("C:").rect();
+    let d_rect = harness.get_by_label("D:").rect();
+    let h_rect = harness.get_by_label("H:").rect();
+    let excl_heading_rect = harness.get_by_label("排除项规则").rect();
+    let row_step = d_rect.center().y - c_rect.center().y;
     assert!(
-        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::from_millis(1500)
+        row_step > 26.0 && row_step < 40.0,
+        "分区行高应保持紧凑（约 34px）: step={row_step}, c={c_rect:?}, d={d_rect:?}"
+    );
+    assert!(
+        h_rect.max.y < excl_heading_rect.min.y,
+        "第 6 个分区行 H: 应完整展示在「排除项规则」卡片上方: h={h_rect:?}, excl={excl_heading_rect:?}"
     );
 }

@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align, FontId, Key, Layout, Margin, Modifiers, Panel, RichText, ScrollArea, Stroke,
 };
 
-use crate::app::{Phase, UwfApp};
+use crate::app::{LogLevel, Phase, UwfApp};
 use crate::ui::components::commit_menu::{self, CommitMenuOutcome};
 use crate::ui::components::confirm::{self, ConfirmOutcome};
 use crate::ui::components::help;
@@ -42,7 +42,7 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
                 .inner_margin(Margin {
                     left: 14,
                     right: 14,
-                    top: 14,
+                    top: 10,
                     bottom: 0,
                 }),
         )
@@ -58,15 +58,17 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                         if app.phase == Phase::Ready {
                             if app.pending_reboot_reasons().is_empty() {
-                                ui.label(
-                                    RichText::new("✔ 当前设置已全部生效")
-                                        .font(FontId::proportional(12.0))
-                                        .color(theme::TEXT_MUTED),
+                                theme::status_hint_with_icon(
+                                    ui,
+                                    LogLevel::Ok,
+                                    "当前设置已全部生效",
+                                    theme::TEXT_MUTED,
                                 );
                             } else {
-                                theme::status_pill(
+                                theme::icon_status_pill(
                                     ui,
-                                    "⚠ 待重启生效",
+                                    LogLevel::Warn,
+                                    "需重启生效",
                                     theme::WARN_FG,
                                     theme::WARN_BG,
                                 );
@@ -101,7 +103,7 @@ fn render_top_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
 
                             let ready = app.phase == Phase::Ready && !app.is_busy();
                             ui.add_enabled_ui(ready, |ui| {
-                                theme::menu_button(ui, "电源 ▾", |ui| {
+                                theme::menu_button(ui, "电源", |ui| {
                                     if ui.button("重启计算机…").clicked() {
                                         ui.close();
                                         app.open_restart_confirm();
@@ -134,8 +136,8 @@ fn render_left_rail(ui: &mut egui::Ui, app: &mut UwfApp) {
                 .inner_margin(Margin {
                     left: 14,
                     right: 0,
-                    top: 14,
-                    bottom: 14,
+                    top: 10,
+                    bottom: 10,
                 }),
         )
         .show(ui, |ui| {
@@ -146,7 +148,7 @@ fn render_left_rail(ui: &mut egui::Ui, app: &mut UwfApp) {
                     egui::Frame::NONE
                         .fill(theme::BG_CANVAS)
                         .inner_margin(Margin {
-                            top: 10,
+                            top: 8,
                             ..Margin::ZERO
                         }),
                 )
@@ -178,8 +180,7 @@ fn render_footer_bar(ui: &mut egui::Ui, app: &mut UwfApp) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(entry) = app.last_log().cloned() {
-                    let (icon, fg, bg) = theme::log_badge(entry.level);
-                    theme::status_pill(ui, icon, fg, bg);
+                    theme::log_status_badge(ui, entry.level);
                     ui.label(
                         RichText::new(format!("[{}] {}", entry.time, entry.text))
                             .font(FontId::proportional(12.0))
@@ -282,9 +283,10 @@ fn render_status_card(ui: &mut egui::Ui, app: &mut UwfApp) {
 
 fn render_ready_dashboard(ui: &mut egui::Ui, app: &mut UwfApp) {
     let total_h = ui.available_height();
-    let vol_max_h = (total_h * 0.34).clamp(130.0, 220.0);
+    // 为下方「排除项规则」保留至少 ~270px，其余上方预算优先让给分区表，避免多分区出现纵向滚动条
+    let vol_max_h = (total_h - 270.0).clamp(160.0, 360.0);
     views::volumes::render(ui, app, vol_max_h);
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     views::exclusions::render(ui, app);
 }
 

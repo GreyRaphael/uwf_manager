@@ -12,7 +12,6 @@ use forms::{CachePendingAction, PowerAction, format_revert_confirm_message};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -30,10 +29,8 @@ use crate::ui::file_dialog::{
 };
 use crate::ui::theme;
 
-/// Overlay 运行时用量后台刷新周期（2 秒）
-const OVERLAY_POLL: Duration = Duration::from_secs(2);
 /// 钳位字形纹理图集单边最大尺寸，避免显卡驱动返回的 16384/32768 上限导致图集占满数 MB 甚至十数 MB
-const MAX_FONT_ATLAS_SIDE: usize = 2048;
+const MAX_FONT_ATLAS_SIDE: usize = 1024;
 /// 操作日志弹窗最大保留条数
 const MAX_LOG_ENTRIES: usize = 50;
 
@@ -50,7 +47,6 @@ pub struct UwfApp {
     pending_cache_action: Option<CachePendingAction>,
     power_action: Option<(RequestId, PowerAction)>,
     next_request_id: RequestId,
-    last_overlay_tick: Instant,
     pub should_quit: bool,
     force_close_confirmed: bool,
     cmd_tx: Sender<BackendCommand>,
@@ -60,7 +56,6 @@ pub struct UwfApp {
     cached_exclusion_rows: Vec<ExclusionRow>,
     cached_revert_plan: ExclusionRevertPlan,
     cached_reboot_reasons: Vec<&'static str>,
-    #[cfg(windows)]
     was_minimized: bool,
     #[cfg(windows)]
     initial_trim_done: bool,
@@ -100,7 +95,6 @@ impl UwfApp {
             pending_cache_action: None,
             power_action: None,
             next_request_id: 1,
-            last_overlay_tick: Instant::now(),
             should_quit: false,
             force_close_confirmed: false,
             cmd_tx,
@@ -110,7 +104,6 @@ impl UwfApp {
             cached_exclusion_rows: Vec::new(),
             cached_revert_plan: ExclusionRevertPlan::default(),
             cached_reboot_reasons: Vec::new(),
-            #[cfg(windows)]
             was_minimized: false,
             #[cfg(windows)]
             initial_trim_done: false,
@@ -167,15 +160,6 @@ impl UwfApp {
         }
         if !self.send(BackendCommand::RefreshAll) {
             self.mark_backend_lost("后端线程已退出，无法刷新");
-        }
-    }
-
-    pub fn send_overlay_refresh(&mut self) {
-        if self.phase != Phase::Ready || self.is_pending() {
-            return;
-        }
-        if !self.send(BackendCommand::RefreshOverlayRuntime) {
-            self.mark_backend_lost("后端线程已退出，无法刷新缓存监控");
         }
     }
 
@@ -831,17 +815,15 @@ impl UwfApp {
             }
         }
     }
-    pub(crate) fn tick_overlay_poll(&mut self, ctx: &egui::Context, minimized: bool) {
-        if self.phase != Phase::Ready || minimized {
+    pub(crate) fn sync_minimized_state(&mut self, minimized: bool) {
+        if minimized == self.was_minimized {
             return;
         }
-        let elapsed = self.last_overlay_tick.elapsed();
-        if elapsed >= OVERLAY_POLL {
-            self.last_overlay_tick = Instant::now();
-            self.send_overlay_refresh();
-            ctx.request_repaint_after(OVERLAY_POLL);
-        } else {
-            ctx.request_repaint_after(OVERLAY_POLL - elapsed);
+        self.was_minimized = minimized;
+        let _ = self.send(BackendCommand::SetPollingPaused(minimized));
+        #[cfg(windows)]
+        if minimized {
+            crate::win_platform::trim_working_set();
         }
     }
 }
@@ -862,26 +844,18 @@ impl eframe::App for UwfApp {
         self.poll_file_dialog();
 
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        self.sync_minimized_state(minimized);
 
         #[cfg(windows)]
-        {
-            if minimized && !self.was_minimized {
+        if let Some(rem) = self.startup_trim_countdown.as_mut() {
+            if *rem == 0 {
+                self.startup_trim_countdown = None;
                 crate::win_platform::trim_working_set();
-            }
-            self.was_minimized = minimized;
-
-            if let Some(rem) = self.startup_trim_countdown.as_mut() {
-                if *rem == 0 {
-                    self.startup_trim_countdown = None;
-                    crate::win_platform::trim_working_set();
-                } else {
-                    *rem -= 1;
-                    ctx.request_repaint();
-                }
+            } else {
+                *rem -= 1;
+                ctx.request_repaint();
             }
         }
-
-        self.tick_overlay_poll(ctx, minimized);
 
         if ctx.input(|i| i.viewport().close_requested())
             && self.is_pending()

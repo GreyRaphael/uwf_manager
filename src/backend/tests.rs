@@ -1,4 +1,7 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 use crate::error::{Result, UwfError};
 use crate::model::*;
@@ -6,7 +9,7 @@ use crate::model::*;
 use super::logic::{extract_volume_guid_name, format_memory_gib};
 use super::worker::{
     create_unique_export_file, export_exclusions, handle_command, import_exclusions,
-    mutate_without_refresh,
+    mutate_without_refresh, run_worker_loop,
 };
 use super::*;
 
@@ -757,6 +760,14 @@ fn os_version_formatting_and_edition_detection() {
         "Windows 11 Enterprise 32G"
     );
     assert_eq!(
+        format_os_version(
+            "Microsoft Windows 10 Enterprise",
+            Some("22631"),
+            Some(16 * gib)
+        ),
+        "Windows 11 Enterprise 16G"
+    );
+    assert_eq!(
         format_os_version("Microsoft Windows 10 教育版", None, None),
         "Windows 10 教育版"
     );
@@ -831,4 +842,83 @@ fn revert_exclusions_to_current_restores_exact_current_set() {
         backend.get_registry_exclusions(false).unwrap(),
         backend.get_registry_exclusions(true).unwrap()
     );
+}
+
+#[test]
+fn worker_overlay_polling_only_wakes_on_change_and_honors_pause() {
+    let consumption = Arc::new(AtomicU32::new(512));
+    let mut backend = MockUwfBackend::demo().with_consumption_hook(Arc::clone(&consumption));
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<BackendEvent>();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let wake_fn: Arc<dyn Fn() + Send + Sync> = {
+        let wakes = Arc::clone(&wakes);
+        Arc::new(move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    let join = std::thread::spawn(move || {
+        run_worker_loop(
+            &mut backend,
+            &cmd_rx,
+            &event_tx,
+            &wake_fn,
+            Duration::from_millis(20),
+        )
+    });
+
+    let wait_for_wakes = |expected: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while wakes.load(Ordering::SeqCst) < expected && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(wakes.load(Ordering::SeqCst), expected);
+    };
+
+    // 1. RefreshAll 推送快照（启动时可能先发 OsVersion，共唤醒 2 次）
+    cmd_tx.send(BackendCommand::RefreshAll).unwrap();
+    loop {
+        match event_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            BackendEvent::OsVersion(_) => continue,
+            BackendEvent::Snapshot(_) => break,
+            other => panic!("预期 OsVersion 或 Snapshot，实际 {other:?}"),
+        }
+    }
+    wait_for_wakes(2);
+
+    // 2. 用量未变化时，等待多个轮询周期不应触发新事件或 UI 唤醒
+    std::thread::sleep(Duration::from_millis(90));
+    assert!(event_rx.try_recv().is_err(), "用量不变不应重复唤醒 UI");
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+
+    // 3. 用量变化后应在下一个轮询周期收到 OverlayRuntime 并唤醒 UI
+    consumption.store(640, Ordering::Relaxed);
+    let updated = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        updated,
+        BackendEvent::OverlayRuntime(rt) if rt.consumption_mb == 640
+    ));
+    wait_for_wakes(3);
+
+    // 4. 最小化暂停轮询期间即使数值变化也不应唤醒 UI；恢复后立即感知变化
+    cmd_tx.send(BackendCommand::SetPollingPaused(true)).unwrap();
+    std::thread::sleep(Duration::from_millis(40));
+    consumption.store(768, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(event_rx.try_recv().is_err(), "暂停轮询期间不应唤醒 UI");
+    assert_eq!(wakes.load(Ordering::SeqCst), 3);
+
+    cmd_tx
+        .send(BackendCommand::SetPollingPaused(false))
+        .unwrap();
+    let resumed = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        resumed,
+        BackendEvent::OverlayRuntime(rt) if rt.consumption_mb == 768
+    ));
+    wait_for_wakes(4);
+
+    cmd_tx.send(BackendCommand::Quit).unwrap();
+    assert!(join.join().unwrap());
 }

@@ -1,13 +1,16 @@
 //! 后端工作线程与命令执行循环。
 
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Result, UwfError};
+use crate::model::OverlayRuntime;
 
 use super::logic::{
     ExclusionRevertPlan, plan_exclusion_revert, split_absolute_path, split_registry_path,
@@ -49,9 +52,59 @@ impl<E: From<BackendEvent>> Drop for DisconnectGuard<E> {
     }
 }
 
+/// Overlay 运行时用量后台轮询周期（2 秒）
+const OVERLAY_POLL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct PollState {
+    ready: bool,
+    filter_enabled: bool,
+    paused: bool,
+    last_runtime: Option<OverlayRuntime>,
+    next_poll_at: Option<Instant>,
+}
+
+impl PollState {
+    fn should_poll(&self) -> bool {
+        self.ready && self.filter_enabled && !self.paused
+    }
+
+    fn observe_event(&mut self, evt: &BackendEvent, poll_interval: Duration) {
+        match evt {
+            BackendEvent::Snapshot(snap) => {
+                self.ready = true;
+                self.filter_enabled = snap.filter_state.is_some_and(|fs| fs.current_enabled);
+                self.last_runtime = snap.overlay_runtime;
+                self.next_poll_at = self.should_poll().then(|| Instant::now() + poll_interval);
+            }
+            BackendEvent::OverlayRuntime(runtime) => {
+                self.last_runtime = Some(*runtime);
+            }
+            BackendEvent::NotInstalled(_) => {
+                self.ready = false;
+                self.filter_enabled = false;
+                self.last_runtime = None;
+                self.next_poll_at = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        let was_paused = self.paused;
+        self.paused = paused;
+        if !self.should_poll() {
+            self.next_poll_at = None;
+        } else if was_paused && !paused {
+            // 恢复窗口后立即校准一次，仅在数值变化时唤醒 UI
+            self.next_poll_at = Some(Instant::now());
+        }
+    }
+}
+
 /// 启动带唤醒回调的后端线程（actor）：工厂在本线程内构造 backend（WMI 连接随之在
-/// 本线程建立），顺序执行命令，`Quit` 退出；每次向 UI 通道投递事件后触发 `wake`
-/// （如 `egui::Context::request_repaint`）。若意外退出（如 panic），`Drop` 哨兵立即发送
+/// 本线程建立），顺序执行命令并在筛选器开启且窗口未最小化时在后台执行 2 秒轮询，
+/// 仅当用量变化时推送事件并唤醒 UI，`Quit` 退出。若意外退出（如 panic），`Drop` 哨兵立即发送
 /// [`BackendEvent::Disconnected`] 并唤醒 UI。
 pub fn spawn_backend_thread_with_wake<E, W>(
     factory: BackendFactory,
@@ -63,36 +116,97 @@ where
     E: From<BackendEvent> + Send + 'static,
     W: Fn() + Send + Sync + 'static,
 {
-    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(wake);
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let join = thread::spawn(move || {
         let mut guard = DisconnectGuard {
             tx: tx.clone(),
-            wake: std::sync::Arc::clone(&wake),
+            wake: Arc::clone(&wake),
             clean_quit: false,
         };
-        let emit = |evt| {
-            let _ = tx.send(E::from(evt));
-            (wake)();
-        };
         let mut backend = factory();
-        if let Some(ver) = backend.get_os_version() {
-            emit(BackendEvent::OsVersion(ver));
-        }
-        while let Ok(command) = rx.recv() {
-            match command {
-                BackendCommand::Quit => {
-                    guard.clean_quit = true;
-                    let _ = stop_tx.send(());
-                    break;
-                }
-                other => handle_command(&mut *backend, other, &emit),
-            }
+        let clean_quit = run_worker_loop(&mut *backend, &rx, &tx, &wake, OVERLAY_POLL);
+        if clean_quit {
+            guard.clean_quit = true;
+            let _ = stop_tx.send(());
         }
     });
     BackendHandle {
         join,
         stopped: stop_rx,
+    }
+}
+
+pub(super) fn run_worker_loop<E>(
+    backend: &mut dyn UwfBackend,
+    rx: &Receiver<BackendCommand>,
+    tx: &Sender<E>,
+    wake: &Arc<dyn Fn() + Send + Sync>,
+    poll_interval: Duration,
+) -> bool
+where
+    E: From<BackendEvent>,
+{
+    let state = RefCell::new(PollState::default());
+    let emit = |evt: BackendEvent| {
+        state.borrow_mut().observe_event(&evt, poll_interval);
+        let _ = tx.send(E::from(evt));
+        (wake)();
+    };
+    if let Some(ver) = backend.get_os_version() {
+        emit(BackendEvent::OsVersion(ver));
+    }
+
+    loop {
+        let next_poll_at = state.borrow().next_poll_at;
+        let command = match next_poll_at {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(wait) {
+                    Ok(cmd) => cmd,
+                    Err(RecvTimeoutError::Timeout) => {
+                        poll_overlay_once(backend, &state, &emit);
+                        let mut st = state.borrow_mut();
+                        st.next_poll_at = st.should_poll().then(|| Instant::now() + poll_interval);
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return false,
+                }
+            }
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => return false,
+            },
+        };
+
+        match command {
+            BackendCommand::Quit => return true,
+            BackendCommand::SetPollingPaused(paused) => {
+                state.borrow_mut().set_paused(paused);
+            }
+            other => handle_command(backend, other, &emit),
+        }
+    }
+}
+
+fn poll_overlay_once(
+    backend: &mut dyn UwfBackend,
+    state: &RefCell<PollState>,
+    emit: &dyn Fn(BackendEvent),
+) {
+    if !state.borrow().should_poll() {
+        return;
+    }
+    match backend.get_overlay_runtime() {
+        Ok(runtime) => {
+            let changed = state.borrow().last_runtime != Some(runtime);
+            if changed {
+                emit(BackendEvent::OverlayRuntime(runtime));
+            }
+        }
+        Err(UwfError::NotInstalled) => emit(BackendEvent::NotInstalled(None)),
+        // 后台 2 秒轮询偶发失败静默跳过，避免覆盖底部操作反馈；用户可用 [F5] 显式诊断。
+        Err(_) => {}
     }
 }
 
@@ -107,14 +221,10 @@ pub(super) fn handle_command(
             Err(UwfError::NotInstalled) => emit(BackendEvent::NotInstalled(None)),
             Err(e) => emit(BackendEvent::RefreshFailed(e.to_string())),
         },
-        BackendCommand::RefreshOverlayRuntime => match backend.get_overlay_runtime() {
-            Ok(runtime) => emit(BackendEvent::OverlayRuntime(runtime)),
-            Err(UwfError::NotInstalled) => emit(BackendEvent::NotInstalled(None)),
-            // 后台 2 秒轮询偶发失败静默跳过，避免覆盖底部操作反馈；用户可用 [F5] 显式诊断。
-            Err(_) => {}
-        },
         BackendCommand::Mutate { id, cmd } => handle_mutation(id, backend, cmd, emit),
-        BackendCommand::Quit => unreachable!("Quit 由线程循环拦截"),
+        BackendCommand::SetPollingPaused(_) | BackendCommand::Quit => {
+            unreachable!("SetPollingPaused 与 Quit 由线程循环拦截")
+        }
     }
 }
 

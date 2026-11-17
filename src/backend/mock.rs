@@ -3,6 +3,11 @@
 //! 完整实现"下次会话"状态机：enable/protect 等只改 next 侧，
 //! `restart_system` 将 next 快照应用为 current（模拟重启生效）。
 
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::error::{Result, UwfError};
 use crate::model::*;
 
@@ -29,9 +34,18 @@ pub struct MockUwfBackend {
     file_excl_next: Vec<FileExclusion>,
     reg_excl_current: Vec<String>,
     reg_excl_next: Vec<String>,
+    #[cfg(test)]
+    consumption_hook: Option<Arc<AtomicU32>>,
 }
 
 impl MockUwfBackend {
+    /// 测试辅助：注入外部可控的 Overlay 用量原子值，用于验证后台轮询去重。
+    #[cfg(test)]
+    pub fn with_consumption_hook(mut self, hook: Arc<AtomicU32>) -> Self {
+        self.consumption_hook = Some(hook);
+        self
+    }
+
     /// 空数据：用于导出空列表等边界测试。
     #[cfg(test)]
     pub fn empty() -> Self {
@@ -50,6 +64,7 @@ impl MockUwfBackend {
             file_excl_next: Vec::new(),
             reg_excl_current: Vec::new(),
             reg_excl_next: Vec::new(),
+            consumption_hook: None,
         }
     }
 
@@ -82,6 +97,8 @@ impl MockUwfBackend {
             file_excl_next: vec![FileExclusion::new("C:".into(), "\\Windows\\Temp".into())],
             reg_excl_current: vec![],
             reg_excl_next: vec!["HKLM\\SOFTWARE\\UwfManagerDemo".into()],
+            #[cfg(test)]
+            consumption_hook: None,
         }
     }
 
@@ -184,9 +201,16 @@ impl UwfBackend for MockUwfBackend {
     }
 
     fn get_overlay_runtime(&mut self) -> Result<OverlayRuntime> {
+        #[cfg(test)]
+        let consumption_mb = self
+            .consumption_hook
+            .as_ref()
+            .map_or(self.consumption_mb, |h| h.load(Ordering::Relaxed));
+        #[cfg(not(test))]
+        let consumption_mb = self.consumption_mb;
         // 查询必须无副作用：保持稳定值，避免每次刷新都改变用量。
         Ok(OverlayRuntime {
-            consumption_mb: self.consumption_mb,
+            consumption_mb,
             warning_threshold_mb: self.warning_mb,
             critical_threshold_mb: self.critical_mb,
         })

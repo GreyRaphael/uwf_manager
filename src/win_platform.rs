@@ -25,48 +25,32 @@ use windows::core::PCWSTR;
 /// `uwf_manager.rc` 中嵌入的应用图标资源编号（`2 ICON "icon.ico"`）。
 const PE_ICON_RESOURCE_ID: usize = 2;
 
+// 优先使用 Microsoft YaHei UI（msyh.ttc 第 1 号字面，行高更紧凑贴合 Windows UI），
+// 若字库仅含单字面则由 ttc_preferred_index 自动回退到 0。
 const CJK_CANDIDATES: &[(&str, u32)] = &[
-    ("msyh.ttc", 0),
+    ("msyh.ttc", 1),
     ("simhei.ttf", 0),
     ("simsun.ttc", 0),
     ("segoeui.ttf", 0),
 ];
-const MONO_CANDIDATES: &[(&str, u32)] = &[("consola.ttf", 0), ("lucon.ttf", 0)];
-const SYMBOL_CANDIDATES: &[(&str, u32)] = &[("seguisym.ttf", 0), ("seguiemj.ttf", 0)];
 
-/// 仅内存映射必要系统字体（微软雅黑 / Consolas / Segoe UI Symbol），避免 `DirectWrite` 全量枚举与多字体私有堆拷贝。
+/// 仅内存映射单一系统 UI 字体（优先微软雅黑 UI），等宽与正文字族复用同一字面并配合矢量图标，
+/// 避免额外挂载 Consolas / Segoe UI Symbol 及 `DirectWrite` 全量枚举带来的私有内存占用。
 pub fn configure_fonts(ctx: &egui::Context) {
     let fonts_dir = windows_fonts_dir();
     let mut fonts = FontDefinitions::empty();
 
-    let has_cjk = insert_first_font(&mut fonts, "win_cjk", &fonts_dir, CJK_CANDIDATES);
-    let has_mono = insert_first_font(&mut fonts, "win_mono", &fonts_dir, MONO_CANDIDATES);
-    let has_symbol = insert_first_font(&mut fonts, "win_symbol", &fonts_dir, SYMBOL_CANDIDATES);
+    if !insert_first_font(&mut fonts, "win_cjk", &fonts_dir, CJK_CANDIDATES) {
+        return;
+    }
 
-    if let Some(prop) = fonts.families.get_mut(&FontFamily::Proportional) {
-        if has_cjk {
-            prop.push("win_cjk".to_owned());
-        }
-        if has_symbol {
-            prop.push("win_symbol".to_owned());
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.push("win_cjk".to_owned());
         }
     }
 
-    if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
-        if has_mono {
-            mono.push("win_mono".to_owned());
-        }
-        if has_cjk {
-            mono.push("win_cjk".to_owned());
-        }
-        if has_symbol {
-            mono.push("win_symbol".to_owned());
-        }
-    }
-
-    if !fonts.font_data.is_empty() {
-        ctx.set_fonts(fonts);
-    }
+    ctx.set_fonts(fonts);
 }
 
 /// 从 PE 资源直接加载多尺寸 `.ico` 并设置窗口大/小图标（与 `IconData::default()` 配合跳过 `eframe` 图标解码/重编码）。
@@ -129,27 +113,37 @@ fn windows_fonts_dir() -> PathBuf {
         .join("Fonts")
 }
 
+fn ttc_preferred_index(bytes: &[u8], preferred: u32) -> u32 {
+    if preferred == 0 || bytes.len() < 12 || &bytes[..4] != b"ttcf" {
+        return 0;
+    }
+    let num_fonts = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if preferred < num_fonts { preferred } else { 0 }
+}
+
 fn insert_first_font(
     fonts: &mut FontDefinitions,
     key: &str,
     fonts_dir: &Path,
     candidates: &[(&str, u32)],
 ) -> bool {
-    for &(file_name, index) in candidates {
+    for &(file_name, preferred_index) in candidates {
         let path = fonts_dir.join(file_name);
-        if let Some(blob) = mmap_font_file(&path) {
-            fonts
-                .font_data
-                .insert(key.to_owned(), Arc::new(FontData::from_blob(blob, index)));
+        if let Some(mapped) = mmap_font_file(&path) {
+            let face_index = ttc_preferred_index(&mapped, preferred_index);
+            let blob: Blob = Arc::new(mapped);
+            fonts.font_data.insert(
+                key.to_owned(),
+                Arc::new(FontData::from_blob(blob, face_index)),
+            );
             return true;
         }
     }
     false
 }
 
-fn mmap_font_file(path: &Path) -> Option<Blob> {
+fn mmap_font_file(path: &Path) -> Option<memmap2::Mmap> {
     let file = std::fs::File::open(path).ok()?;
     // SAFETY: Windows Fonts 目录下的系统字体在只读映射期内不会发生外部截断；仅以只读共享切片形式提供给字体解析器。
-    let mapped = unsafe { memmap2::Mmap::map(&file).ok()? };
-    Some(Arc::new(mapped))
+    unsafe { memmap2::Mmap::map(&file).ok() }
 }

@@ -9,7 +9,7 @@ use crate::ui::{text, theme};
 
 pub fn render(ui: &mut egui::Ui, app: &mut UwfApp) {
     render_filter_card(ui, app);
-    ui.add_space(12.0);
+    ui.add_space(10.0);
     render_overlay_card(ui, app);
 }
 
@@ -42,7 +42,7 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
                 });
             },
         );
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         let Some(fs) = app.snapshot.filter_state else {
             ui.label(
@@ -82,7 +82,7 @@ fn render_filter_card(ui: &mut egui::Ui, app: &mut UwfApp) {
         });
 
         // 固定预留开关下方提示槽位高度，避免切换时导致下方「保护缓存」卡片上下跳动
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 22.0),
             Layout::top_down(Align::Center),
@@ -120,12 +120,12 @@ fn render_overlay_card(ui: &mut egui::Ui, app: &mut UwfApp) {
                 }
             },
         );
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         render_usage_section(ui, app);
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         render_overlay_config_section(ui, app);
     });
 }
@@ -294,7 +294,7 @@ fn render_overlay_config_section(ui: &mut egui::Ui, app: &mut UwfApp) {
         );
     }
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(!busy && app.cache.dirty, |ui| {
             if theme::primary_button(ui, "应用缓存设置")

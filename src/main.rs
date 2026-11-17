@@ -3,7 +3,7 @@
 //! 架构：UI 线程运行 `eframe` / `egui` 渲染与交互；后端线程以 actor 模式独占 `dyn UwfBackend`
 //! （Windows 下 WMI 连接为 `!Send`），两者通过 `std::sync::mpsc` 通信，后端回包后主动触发窗口重绘。
 //!
-//! unsafe 政策：crate 级 deny；例外仅限 `backend::windows::elevate` 提权只读检测与 `win_platform` 的 Win32 内存/字体/图标边界。
+//! unsafe 政策：crate 级 deny；例外仅限 `backend::windows::{elevate, os_info}` 只读查询与 `win_platform` 的 Win32 内存/字体/图标边界。
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(ui::text::app_title())
-        .with_inner_size([1240.0, 780.0])
+        .with_inner_size([1240.0, 840.0])
         .with_min_inner_size([1080.0, 640.0]);
     #[cfg(windows)]
     {

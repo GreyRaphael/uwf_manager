@@ -15,6 +15,7 @@
 
 mod classes;
 mod elevate;
+mod os_info;
 
 pub(crate) use elevate::is_elevated;
 
@@ -222,55 +223,6 @@ impl WindowsWmiBackend {
             }
         }
         Ok(map)
-    }
-
-    /// 查询 `ROOT\CIMV2` 中的系统版本与物理内存信息，格式化为如 `Windows 10 Enterprise LTSC 2021 16G`。
-    fn query_os_version() -> Option<String> {
-        let cimv2 = WMIConnection::new().ok()?;
-        let rows: Vec<Win32_OperatingSystem> = cimv2
-            .raw_query(
-                "SELECT Caption, BuildNumber, TotalVisibleMemorySize FROM Win32_OperatingSystem",
-            )
-            .ok()?;
-        let os = rows.into_iter().next()?;
-        let caption = os.Caption.as_deref().unwrap_or("").trim();
-        if caption.is_empty() {
-            return None;
-        }
-        let memory_bytes = Self::query_total_memory_bytes(&cimv2, &os);
-        Some(super::format_os_version(
-            caption,
-            os.BuildNumber.as_deref(),
-            memory_bytes,
-        ))
-    }
-
-    /// 优先累加 `Win32_PhysicalMemory.Capacity` 获取标称物理内存字节数，
-    /// 若为空依次回退 `Win32_ComputerSystem.TotalPhysicalMemory` 与 `Win32_OperatingSystem.TotalVisibleMemorySize`。
-    fn query_total_memory_bytes(cimv2: &WMIConnection, os: &Win32_OperatingSystem) -> Option<u64> {
-        let dimm_total: u64 = cimv2
-            .raw_query::<Win32_PhysicalMemory>("SELECT Capacity FROM Win32_PhysicalMemory")
-            .map(|rows| rows.into_iter().filter_map(|d| d.Capacity).sum())
-            .unwrap_or(0);
-        if dimm_total > 0 {
-            return Some(dimm_total);
-        }
-        if let Some(sys_total) = cimv2
-            .raw_query::<Win32_ComputerSystem>(
-                "SELECT TotalPhysicalMemory FROM Win32_ComputerSystem",
-            )
-            .ok()
-            .and_then(|rows| {
-                rows.into_iter()
-                    .filter_map(|s| s.TotalPhysicalMemory)
-                    .find(|&bytes| bytes > 0)
-            })
-        {
-            return Some(sys_total);
-        }
-        os.TotalVisibleMemorySize
-            .filter(|&kb| kb > 0)
-            .map(|kb| kb.saturating_mul(1024))
     }
 
     fn merge_resolved_volumes(volumes: &[ResolvedVolume]) -> Vec<VolumeInfo> {
@@ -729,7 +681,7 @@ impl UwfBackend for WindowsWmiBackend {
         if let Some(cached) = &self.cached_os_version {
             return Some(cached.clone());
         }
-        let queried = Self::query_os_version();
+        let queried = os_info::query_os_version();
         if let Some(ver) = &queried {
             self.cached_os_version = Some(ver.clone());
         }
